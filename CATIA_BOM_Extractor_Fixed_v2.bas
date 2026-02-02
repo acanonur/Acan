@@ -271,20 +271,25 @@ End Sub
 ' ==============================================================================
 ' HELPER: CLOSE EXTRA WINDOWS USING COMMAND (More Reliable)
 ' Uses CATIA.StartCommand "Close" which is like File > Close
-' Uses DisplayFileAlerts = False to prevent save prompts
+' Uses CATIA.Interactive = False to suppress ALL dialogs including save prompts
 ' ==============================================================================
 Sub CloseExtraWindowsUsingCommand(mainCaption As String)
     Dim maxAttempts As Integer
     Dim attempt As Integer
     Dim i As Integer
     Dim closedAny As Boolean
-    Dim originalAlerts As Boolean
+    Dim originalInteractive As Boolean
+    Dim originalRefresh As Boolean
 
     On Error Resume Next
 
-    ' Store original setting and disable file alerts (save prompts)
-    originalAlerts = CATIA.DisplayFileAlerts
-    CATIA.DisplayFileAlerts = False
+    ' Store original settings
+    originalInteractive = CATIA.Interactive
+    originalRefresh = CATIA.RefreshDisplay
+
+    ' Disable ALL user interaction (suppresses save dialogs completely)
+    CATIA.Interactive = False
+    CATIA.RefreshDisplay = False
 
     maxAttempts = 10  ' Safety limit
 
@@ -323,8 +328,9 @@ Sub CloseExtraWindowsUsingCommand(mainCaption As String)
         DoEvents
     Next attempt
 
-    ' Restore original alert setting
-    CATIA.DisplayFileAlerts = originalAlerts
+    ' Restore original settings
+    CATIA.Interactive = originalInteractive
+    CATIA.RefreshDisplay = originalRefresh
 
     Err.Clear
 End Sub

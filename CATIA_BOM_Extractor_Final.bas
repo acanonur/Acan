@@ -239,6 +239,7 @@ End Sub
 
 ' ==============================================================================
 ' Hide all products recursively (each one individually)
+' In CATIA: SetShow(1) = catVisPropertyNoShowAttr = HIDE
 ' ==============================================================================
 Sub HideAllProductsRecursive(oProd As Product, sel As Selection)
     On Error Resume Next
@@ -258,7 +259,7 @@ Sub HideAllProductsRecursive(oProd As Product, sel As Selection)
             ' Hide this child
             sel.Clear
             sel.Add childProd
-            sel.VisProperties.SetShow 0  ' 0 = Hide
+            sel.VisProperties.SetShow 1  ' 1 = HIDE (catVisPropertyNoShowAttr)
         Next i
     End If
 
@@ -267,6 +268,7 @@ End Sub
 
 ' ==============================================================================
 ' Show all products recursively (restore visibility)
+' In CATIA: SetShow(0) = catVisPropertyShowAttr = SHOW
 ' ==============================================================================
 Sub ShowAllProductsRecursive(oProd As Product, sel As Selection)
     On Error Resume Next
@@ -283,7 +285,7 @@ Sub ShowAllProductsRecursive(oProd As Product, sel As Selection)
             ' Show this child
             sel.Clear
             sel.Add childProd
-            sel.VisProperties.SetShow 1  ' 1 = Show
+            sel.VisProperties.SetShow 0  ' 0 = SHOW (catVisPropertyShowAttr)
 
             ' Recursively show children of this child
             Call ShowAllProductsRecursive(childProd, sel)
@@ -295,6 +297,7 @@ End Sub
 
 ' ==============================================================================
 ' Show only a single product (and its parent chain)
+' In CATIA: SetShow(0) = catVisPropertyShowAttr = SHOW
 ' ==============================================================================
 Sub ShowSingleProduct(oProd As Product, sel As Selection)
     On Error Resume Next
@@ -304,7 +307,7 @@ Sub ShowSingleProduct(oProd As Product, sel As Selection)
     ' Show the target product
     sel.Clear
     sel.Add oProd
-    sel.VisProperties.SetShow 1  ' 1 = Show
+    sel.VisProperties.SetShow 0  ' 0 = SHOW (catVisPropertyShowAttr)
 
     ' Also show parent chain so the part is visible in context
     Dim parentProd As Product
@@ -313,7 +316,7 @@ Sub ShowSingleProduct(oProd As Product, sel As Selection)
     Do While Not parentProd Is Nothing
         sel.Clear
         sel.Add parentProd
-        sel.VisProperties.SetShow 1
+        sel.VisProperties.SetShow 0  ' 0 = SHOW
         Set parentProd = GetParentProduct(parentProd)
     Loop
 

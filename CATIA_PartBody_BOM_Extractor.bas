@@ -214,7 +214,7 @@ NextBody:
 
         ' Status update every 10 bodies
         If i Mod 10 = 0 Then
-            Application.StatusBar = "Processing body " & i & " of " & totalBodies
+            xlApp.StatusBar = "Processing body " & i & " of " & totalBodies
             DoEvents
         End If
     Next i

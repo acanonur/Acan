@@ -3,15 +3,9 @@ Option Explicit
 ' ==============================================================================
 ' MACRO: PART BODY BOM EXTRACTOR (For CATPart with multiple Bodies)
 ' Extracts info from each Body in a CATPart, takes individual screenshots
-' OPTIMIZED FOR SPEED
 ' ==============================================================================
 
 Public Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
-
-' Global variables for speed optimization
-Private g_ScreenUpdatesDisabled As Boolean
-Private g_SpecTreeHidden As Boolean
-Private g_CompassHidden As Boolean
 
 Sub ExtractPartBodyBOM()
 
@@ -78,7 +72,7 @@ Sub ExtractPartBodyBOM()
     On Error GoTo 0
 
     xlApp.Visible = True
-    xlApp.ScreenUpdating = False  ' Speed: disable Excel screen updates
+    xlApp.ScreenUpdating = False
     Set xlBook = xlApp.Workbooks.Add
     Set xlSheet = xlBook.Sheets(1)
 
@@ -101,19 +95,18 @@ Sub ExtractPartBodyBOM()
     End With
     r = 2
 
-    ' --- PREPARE VIEW (once, not per body) ---
+    ' --- PREPARE VIEW ---
     Set oViewer = CATIA.ActiveWindow.ActiveViewer
 
-    ' Hide spec tree and compass once at start
+    ' Hide compass
     On Error Resume Next
     CATIA.StartCommand "Compass"
     Sleep 50
-    g_CompassHidden = True
     On Error GoTo 0
 
-    ' --- HIDE ALL BODIES FIRST (faster than hiding/showing each iteration) ---
+    ' --- HIDE ALL BODIES FIRST ---
     Call HideAllBodies(oPart, sel)
-    Sleep 50
+    Sleep 100
 
     ' --- PROCESS EACH BODY ---
     Dim i As Integer
@@ -136,10 +129,12 @@ Sub ExtractPartBodyBOM()
         sel.Clear
         sel.Add oBody
         sel.VisProperties.SetShow 0  ' 0 = SHOW
+        Sleep 50
 
-        ' Quick update
+        ' Update and reframe
+        oPart.Update
         oViewer.Reframe
-        Sleep 100  ' Reduced sleep time
+        Sleep 150
 
         ' --- TAKE SCREENSHOT ---
         On Error Resume Next
@@ -159,11 +154,15 @@ Sub ExtractPartBodyBOM()
         End If
         On Error GoTo 0
 
-        ' --- GET MEASUREMENTS USING SPAWorkbench (FAST) ---
+        ' --- GET MEASUREMENTS ---
         dMass = 0: dVol = 0: dArea = 0
         dims(0) = 0: dims(1) = 0: dims(2) = 0
 
-        Call GetBodyMeasurements(oPart, oBody, dMass, dVol, dArea, dims)
+        ' Get Mass, Volume, Area using Inertia
+        Call GetBodyInertiaData(oPart, oBody, dMass, dVol, dArea)
+
+        ' Get Dimensions using Bounding Box
+        Call GetBodyBoundingBox(oPart, oBody, dims)
 
         ' --- GET MATERIAL ---
         strMatName = "N/A"
@@ -208,15 +207,10 @@ Sub ExtractPartBodyBOM()
         sel.VisProperties.SetShow 1  ' 1 = HIDE
 
         r = r + 1
+        DoEvents
 
 NextBody:
         Set oBody = Nothing
-
-        ' Status update every 10 bodies
-        If i Mod 10 = 0 Then
-            xlApp.StatusBar = "Processing body " & i & " of " & totalBodies
-            DoEvents
-        End If
     Next i
 
     ' --- RESTORE ALL BODIES ---
@@ -224,13 +218,13 @@ NextBody:
 
     ' --- RESTORE VIEW ---
     On Error Resume Next
-    If g_CompassHidden Then CATIA.StartCommand "Compass"
+    CATIA.StartCommand "Compass"
     On Error GoTo 0
 
     ' --- FINALIZE EXCEL ---
     xlApp.ScreenUpdating = True
     xlSheet.Columns("A:J").AutoFit
-    xlSheet.Columns("A:A").ColumnWidth = 15  ' Keep thumbnail column width
+    xlSheet.Columns("A:A").ColumnWidth = 15
 
     ' --- COMPLETION MESSAGE ---
     Dim elapsed As Double
@@ -282,69 +276,96 @@ Sub ShowAllBodies(oPart As Part, sel As Selection)
 End Sub
 
 ' ==============================================================================
-' GET BODY MEASUREMENTS (Using SPAWorkbench - FAST)
+' GET BODY INERTIA DATA (Mass, Volume, Area)
 ' ==============================================================================
-Sub GetBodyMeasurements(oPart As Part, oBody As Body, ByRef dMass As Double, _
-                        ByRef dVol As Double, ByRef dArea As Double, ByRef dims() As Double)
+Sub GetBodyInertiaData(oPart As Part, oBody As Body, ByRef dMass As Double, _
+                       ByRef dVol As Double, ByRef dArea As Double)
     On Error Resume Next
 
-    ' Method 1: Use SPAWorkbench Measurable (fastest)
-    Dim oSPAWB As Object
-    Dim oMeasurable As Object
+    Dim oInertia As Object
+    Dim sel As Selection
+
+    ' Select the body to measure
+    Set sel = CATIA.ActiveDocument.Selection
+    sel.Clear
+    sel.Add oBody
+
+    ' Get Inertia from the Part
+    Set oInertia = oPart.GetTechnologicalObject("Inertia")
+
+    If Not oInertia Is Nothing Then
+        dMass = oInertia.Mass
+        dVol = oInertia.Volume      ' in mm3
+        dArea = oInertia.WetArea    ' in mm2
+        Set oInertia = Nothing
+    End If
+
+    sel.Clear
+    Err.Clear
+End Sub
+
+' ==============================================================================
+' GET BODY BOUNDING BOX DIMENSIONS
+' ==============================================================================
+Sub GetBodyBoundingBox(oPart As Part, oBody As Body, ByRef dims() As Double)
+    On Error Resume Next
+
+    Dim oHSF As Object
     Dim oRef As Reference
+    Dim oBox As Object
+    Dim sel As Selection
+    Dim d1 As Double, d2 As Double, d3 As Double
 
-    Set oSPAWB = CATIA.ActiveDocument.GetWorkbench("SPAWorkbench")
-    If Not oSPAWB Is Nothing Then
-        Set oRef = oPart.CreateReferenceFromObject(oBody)
-        Set oMeasurable = oSPAWB.GetMeasurable(oRef)
+    Set oHSF = oPart.HybridShapeFactory
+    If oHSF Is Nothing Then Exit Sub
 
-        If Not oMeasurable Is Nothing Then
-            dVol = oMeasurable.Volume  ' in mm3
-            dArea = oMeasurable.Area   ' in mm2
+    Set oRef = oPart.CreateReferenceFromObject(oBody)
+    If oRef Is Nothing Then Exit Sub
 
-            ' Get bounding box for dimensions
-            Dim bbox(5) As Variant
-            oMeasurable.GetMinimumBoundingBox bbox
-
-            Dim d1 As Double, d2 As Double, d3 As Double
-            d1 = Abs(bbox(3) - bbox(0))  ' X dimension
-            d2 = Abs(bbox(4) - bbox(1))  ' Y dimension
-            d3 = Abs(bbox(5) - bbox(2))  ' Z dimension
-
-            Call SortThree(d1, d2, d3, dims)
-
-            Set oMeasurable = Nothing
-        End If
+    Set oBox = oHSF.AddNewBoundingBox(oRef)
+    If oBox Is Nothing Then
         Set oRef = Nothing
-        Set oSPAWB = Nothing
+        Set oHSF = Nothing
+        Exit Sub
     End If
 
-    ' Method 2: Use Inertia for mass (if SPAWorkbench didn't work)
-    If dMass <= 0 Then
-        Dim oInertia As Object
-        Set oInertia = oPart.GetTechnologicalObject("Inertia")
-        If Not oInertia Is Nothing Then
-            ' Need to temporarily show this body for inertia calculation
-            Dim sel As Selection
-            Set sel = CATIA.ActiveDocument.Selection
-            sel.Clear
-            sel.Add oBody
+    oBox.Type = 1  ' Aligned bounding box
+    oPart.UpdateObject oBox
 
-            ' Get inertia data
-            dMass = oInertia.Mass
-
-            Set oInertia = Nothing
-            Set sel = Nothing
-        End If
+    If Err.Number <> 0 Then
+        ' Delete failed bounding box
+        Set sel = CATIA.ActiveDocument.Selection
+        sel.Clear
+        sel.Add oBox
+        sel.Delete
+        Set sel = Nothing
+        Set oBox = Nothing
+        Set oRef = Nothing
+        Set oHSF = Nothing
+        Err.Clear
+        Exit Sub
     End If
 
-    ' If still no volume, try calculating from inertia
-    If dVol <= 0 And dMass > 0 Then
-        ' Estimate volume from mass (assuming density ~7800 kg/m3 for steel)
-        ' This is a rough estimate only
-        dVol = (dMass / 7800) * 1000000000  ' Convert m3 to mm3
+    ' Get dimensions
+    d1 = oBox.GetLength.Value
+    d2 = oBox.GetWidth.Value
+    d3 = oBox.GetHeight.Value
+
+    ' Delete the temporary bounding box
+    Set sel = CATIA.ActiveDocument.Selection
+    sel.Clear
+    sel.Add oBox
+    sel.Delete
+    Set sel = Nothing
+
+    ' Sort dimensions (largest to smallest)
+    If (d1 + d2 + d3) > 0.1 Then
+        Call SortThree(d1, d2, d3, dims)
     End If
 
+    Set oBox = Nothing
+    Set oRef = Nothing
+    Set oHSF = Nothing
     Err.Clear
 End Sub
 

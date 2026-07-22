@@ -235,15 +235,14 @@ Sub GenerateMasterBOM()
                     xlSheet.Cells(r, 4).Value = "Body of " & strPartNum
                     xlSheet.Cells(r, 5).Value = dictQty(strPartNum)
 
-                    ' Show ONLY this body, capture, hide it again
+                    ' Show ONLY this body and capture it
+                    ' (it stays visible until measurements are done - the
+                    '  bounding box cannot be built on a hidden body)
                     partSel.Clear
                     partSel.Add oBody
                     partSel.VisProperties.SetShow 0   ' 0 = SHOW
                     Sleep 50
                     Call CaptureViewToExcel(oViewer, xlSheet, r, tempPicPath, fso)
-                    partSel.Clear
-                    partSel.Add oBody
-                    partSel.VisProperties.SetShow 1   ' 1 = HIDE
 
                     ' --- BODY MEASUREMENTS ---
                     bMass = 0: bVol = 0: bArea = 0
@@ -261,15 +260,14 @@ Sub GenerateMasterBOM()
                     If bArea > 0 Then xlSheet.Cells(r, 8).Value = bArea Else xlSheet.Cells(r, 8).Value = "N/A"
 
                     dims(0) = 0: dims(1) = 0: dims(2) = 0
-                    If MeasureTarget(oPart, oBody, dims) Then
-                        xlSheet.Cells(r, 9).Value = Format(dims(0), "0.0")
-                        xlSheet.Cells(r, 10).Value = Format(dims(1), "0.0")
-                        xlSheet.Cells(r, 11).Value = Format(dims(2), "0.0")
-                    Else
-                        xlSheet.Cells(r, 9).Value = "N/A"
-                        xlSheet.Cells(r, 10).Value = "N/A"
-                        xlSheet.Cells(r, 11).Value = "N/A"
+                    If Not MeasureTarget(oPart, oBody, dims) Then
+                        ' Fallback: equivalent box from the body's own inertia
+                        Call GetBodyInertiaDims(oBody, dims)
                     End If
+
+                    If dims(0) > 0 Then xlSheet.Cells(r, 9).Value = Format(dims(0), "0.0") Else xlSheet.Cells(r, 9).Value = "N/A"
+                    If dims(1) > 0 Then xlSheet.Cells(r, 10).Value = Format(dims(1), "0.0") Else xlSheet.Cells(r, 10).Value = "N/A"
+                    If dims(2) > 0 Then xlSheet.Cells(r, 11).Value = Format(dims(2), "0.0") Else xlSheet.Cells(r, 11).Value = "N/A"
 
                     xlSheet.Cells(r, 12).Value = bMat
                     If bDens > 0 Then
@@ -277,6 +275,11 @@ Sub GenerateMasterBOM()
                     Else
                         xlSheet.Cells(r, 13).Value = "N/A"
                     End If
+
+                    ' Hide this body again before moving to the next one
+                    partSel.Clear
+                    partSel.Add oBody
+                    partSel.VisProperties.SetShow 1   ' 1 = HIDE
                 End If
                 Set oBody = Nothing
             Next bi
@@ -716,46 +719,92 @@ End Sub
 ' ==============================================================================
 Function MeasureTarget(oPart As Part, oTargetObj As Object, ByRef dDims() As Double) As Boolean
     On Error Resume Next
+    Err.Clear
     MeasureTarget = False
+
     Dim oHSF As Object: Set oHSF = oPart.HybridShapeFactory
     Dim oRef As Reference: Set oRef = oPart.CreateReferenceFromObject(oTargetObj)
     Dim oBox As Object: Set oBox = oHSF.AddNewBoundingBox(oRef)
     Dim oPartSel As Selection: Set oPartSel = oPart.Parent.Selection
+    Dim oTmpSet As HybridBody
+    Dim d1 As Double, d2 As Double, d3 As Double
 
-    If oBox Is Nothing Then
-        Set oRef = Nothing
-        Set oHSF = Nothing
-        Exit Function
-    End If
+    If oBox Is Nothing Then GoTo Cleanup
 
     oBox.Type = 1
+
+    ' Aggregate the box into a temporary geometrical set and make it the
+    ' in-work object. Without this, UpdateObject only succeeds when the
+    ' target is the in-work (main) body - other bodies returned N/A dims.
+    Err.Clear
+    Set oTmpSet = oPart.HybridBodies.Add()
+    If Not oTmpSet Is Nothing Then
+        oTmpSet.AppendHybridShape oBox
+        oPart.InWorkObject = oBox
+    End If
+
+    Err.Clear
     oPart.UpdateObject oBox
 
-    If Err.Number <> 0 Then
-        oPartSel.Clear: oPartSel.Add oBox: oPartSel.Delete
-        Set oPartSel = Nothing
-        Set oBox = Nothing
-        Set oRef = Nothing
-        Set oHSF = Nothing
-        Err.Clear
-        Exit Function
+    If Err.Number = 0 Then
+        d1 = oBox.GetLength.Value: d2 = oBox.GetWidth.Value: d3 = oBox.GetHeight.Value
+        If (d1 + d2 + d3) > 0.1 Then
+            Call SortThree(d1, d2, d3, dDims)
+            MeasureTarget = True
+        End If
     End If
 
-    Dim d1 As Double, d2 As Double, d3 As Double
-    d1 = oBox.GetLength.Value: d2 = oBox.GetWidth.Value: d3 = oBox.GetHeight.Value
+    ' Delete the temporary geometrical set (takes the box with it),
+    ' or just the bare box if the set could not be created
+    Err.Clear
+    oPartSel.Clear
+    If Not oTmpSet Is Nothing Then
+        oPartSel.Add oTmpSet
+    Else
+        oPartSel.Add oBox
+    End If
+    oPartSel.Delete
+    oPartSel.Clear
 
-    oPartSel.Clear: oPartSel.Add oBox: oPartSel.Delete
+    ' Restore a sane in-work object
+    Err.Clear
+    oPart.InWorkObject = oPart.MainBody
+
+Cleanup:
     Set oPartSel = Nothing
-
-    If (d1 + d2 + d3) > 0.1 Then
-        Call SortThree(d1, d2, d3, dDims)
-        MeasureTarget = True
-    End If
-
+    Set oTmpSet = Nothing
     Set oBox = Nothing
     Set oRef = Nothing
     Set oHSF = Nothing
+    Err.Clear
 End Function
+
+' ==============================================================================
+' HELPER: BODY DIMENSIONS FROM ITS OWN INERTIA (fallback when box fails)
+' Gives the equivalent-box dimensions computed from the principal moments
+' ==============================================================================
+Sub GetBodyInertiaDims(oBody As Body, ByRef dDims() As Double)
+    On Error Resume Next
+    Dim oInertia As Object: Set oInertia = oBody.GetTechnologicalObject("Inertia")
+    If oInertia Is Nothing Then Exit Sub
+    Dim dMass As Double: dMass = oInertia.Mass
+    If dMass <= 0 Then
+        Set oInertia = Nothing
+        Exit Sub
+    End If
+    Dim Matrix(8)
+    oInertia.GetPrincipalMoments Matrix
+    Dim A As Double, B As Double, C As Double
+    A = (6 * (Matrix(1) + Matrix(2) - Matrix(0)) / dMass)
+    B = (6 * (Matrix(0) + Matrix(2) - Matrix(1)) / dMass)
+    C = (6 * (Matrix(0) + Matrix(1) - Matrix(2)) / dMass)
+    If A < 0 Then A = 0
+    If B < 0 Then B = 0
+    If C < 0 Then C = 0
+    Call SortThree(Sqr(A) * 1000, Sqr(B) * 1000, Sqr(C) * 1000, dDims)
+    Set oInertia = Nothing
+    Err.Clear
+End Sub
 
 ' ==============================================================================
 ' HELPER: DIMENSIONS FROM INERTIA (fallback when bounding box fails)

@@ -250,7 +250,7 @@ Sub GenerateMasterBOM()
                     bMat = "N/A"
 
                     Call GetBodyMaterial(oPart, oBody, bMat, bDens)
-                    Call GetBodyMassAndDensity(oBody, bMass, bDensInertia)
+                    Call GetBodyMassAndDensity(oPartDoc, oBody, bMass, bDensInertia)
                     If bDens <= 0 Then bDens = bDensInertia
                     Call GetBodyVolumeArea(oPartDoc, oPart, oBody, bVol, bArea)
                     If bMass <= 0 And bDens > 0 And bVol > 0 Then bMass = bVol * bDens
@@ -261,8 +261,12 @@ Sub GenerateMasterBOM()
 
                     dims(0) = 0: dims(1) = 0: dims(2) = 0
                     If Not MeasureTarget(oPart, oBody, dims) Then
-                        ' Fallback: equivalent box from the body's own inertia
-                        Call GetBodyInertiaDims(oBody, dims)
+                        ' Fallback 1: true axis-aligned box from extremum points
+                        ' (works on releases without AddNewBoundingBox)
+                        If Not MeasureAABBExtremum(oPart, oPartDoc, oBody, dims) Then
+                            ' Fallback 2: equivalent box from the body inertia
+                            Call GetBodyInertiaDims(oPartDoc, oBody, dims)
+                        End If
                     End If
 
                     If dims(0) > 0 Then xlSheet.Cells(r, 9).Value = Format(dims(0), "0.0") Else xlSheet.Cells(r, 9).Value = "N/A"
@@ -542,18 +546,27 @@ Function GetBodyByName(oPart As Part, sName As String) As Body
 End Function
 
 ' ==============================================================================
-' HELPER: BODY MASS & DENSITY (Inertia measured on the single body)
+' HELPER: BODY MASS & DENSITY via SPAWorkbench Inertias
+' (GetTechnologicalObject("Inertia") only exists on Products, not on Bodies -
+'  Inertias.Add(body) is the documented way and works on all V5 releases)
 ' ==============================================================================
-Sub GetBodyMassAndDensity(oBody As Body, ByRef dMass As Double, ByRef dDens As Double)
+Sub GetBodyMassAndDensity(oPartDoc As PartDocument, oBody As Body, _
+                          ByRef dMass As Double, ByRef dDens As Double)
     On Error Resume Next
+    Dim oSPA As Object
     Dim oInertia As Object
 
-    Set oInertia = oBody.GetTechnologicalObject("Inertia")
-    If Not oInertia Is Nothing Then
+    Set oSPA = oPartDoc.GetWorkbench("SPAWorkbench")
+    If oSPA Is Nothing Then Exit Sub
+
+    Err.Clear
+    Set oInertia = oSPA.Inertias.Add(oBody)
+    If Err.Number = 0 And Not oInertia Is Nothing Then
         dMass = oInertia.Mass
         dDens = oInertia.Density
         Set oInertia = Nothing
     End If
+    Set oSPA = Nothing
     Err.Clear
 End Sub
 
@@ -698,6 +711,7 @@ End Sub
 Sub GetBoundingBoxDims(oPart As Part, ByRef dDims() As Double)
     On Error Resume Next
     Dim foundValidBox As Boolean: foundValidBox = False
+    Dim oDocP As PartDocument
 
     If Not oPart.MainBody Is Nothing Then
         foundValidBox = MeasureTarget(oPart, oPart.MainBody, dDims)
@@ -709,6 +723,14 @@ Sub GetBoundingBoxDims(oPart As Part, ByRef dDims() As Double)
             If foundValidBox = True Then Exit For
         Next
         Set hb = Nothing
+    End If
+
+    ' Version-proof fallback: extremum-based box on the main body
+    If foundValidBox = False Then
+        Set oDocP = oPart.Parent
+        If Not oPart.MainBody Is Nothing Then
+            foundValidBox = MeasureAABBExtremum(oPart, oDocP, oPart.MainBody, dDims)
+        End If
     End If
     Err.Clear
 End Sub
@@ -780,13 +802,141 @@ Cleanup:
 End Function
 
 ' ==============================================================================
-' HELPER: BODY DIMENSIONS FROM ITS OWN INERTIA (fallback when box fails)
-' Gives the equivalent-box dimensions computed from the principal moments
+' HELPER: TRUE AXIS-ALIGNED BOUNDING DIMS VIA EXTREMUM FEATURES
+' Works on ALL V5 releases (AddNewBoundingBox only exists on newer ones).
+' Creates temporary min/max Extremum points along X, Y, Z in a temporary
+' geometrical set, reads their coordinates, then deletes everything.
 ' ==============================================================================
-Sub GetBodyInertiaDims(oBody As Body, ByRef dDims() As Double)
+Function MeasureAABBExtremum(oPart As Part, oPartDoc As PartDocument, _
+                             oTargetObj As Object, ByRef dDims() As Double) As Boolean
     On Error Resume Next
-    Dim oInertia As Object: Set oInertia = oBody.GetTechnologicalObject("Inertia")
-    If oInertia Is Nothing Then Exit Sub
+    Err.Clear
+    MeasureAABBExtremum = False
+
+    Dim oHSF As Object: Set oHSF = oPart.HybridShapeFactory
+    Dim oSPA As Object: Set oSPA = oPartDoc.GetWorkbench("SPAWorkbench")
+    Dim oRef As Reference: Set oRef = oPart.CreateReferenceFromObject(oTargetObj)
+    If oHSF Is Nothing Or oSPA Is Nothing Or oRef Is Nothing Then GoTo CleanupE
+
+    Dim oTmpSet As HybridBody
+    Err.Clear
+    Set oTmpSet = oPart.HybridBodies.Add()
+    If oTmpSet Is Nothing Then GoTo CleanupE
+
+    Dim spans(2) As Double
+    Dim k As Integer
+    Dim okAll As Boolean: okAll = True
+    Dim vMin As Double, vMax As Double
+    Dim oDir As Object
+    Dim dx As Double, dy As Double, dz As Double
+
+    For k = 0 To 2
+        dx = 0#: dy = 0#: dz = 0#
+        If k = 0 Then dx = 1#
+        If k = 1 Then dy = 1#
+        If k = 2 Then dz = 1#
+
+        Set oDir = oHSF.AddNewDirectionByCoord(dx, dy, dz)
+
+        If GetExtremumCoord(oPart, oSPA, oTmpSet, oHSF, oRef, oDir, 1, k, vMax) And _
+           GetExtremumCoord(oPart, oSPA, oTmpSet, oHSF, oRef, oDir, 0, k, vMin) Then
+            spans(k) = vMax - vMin
+        Else
+            okAll = False
+        End If
+
+        Set oDir = Nothing
+        If okAll = False Then Exit For
+    Next k
+
+    ' Delete the temporary set together with all extremum points
+    Dim oPartSel As Selection
+    Err.Clear
+    Set oPartSel = oPartDoc.Selection
+    oPartSel.Clear
+    oPartSel.Add oTmpSet
+    oPartSel.Delete
+    oPartSel.Clear
+    Set oPartSel = Nothing
+
+    Err.Clear
+    oPart.InWorkObject = oPart.MainBody
+
+    If okAll Then
+        If (spans(0) + spans(1) + spans(2)) > 0.1 Then
+            Call SortThree(spans(0), spans(1), spans(2), dDims)
+            MeasureAABBExtremum = True
+        End If
+    End If
+
+CleanupE:
+    Set oTmpSet = Nothing
+    Set oRef = Nothing
+    Set oSPA = Nothing
+    Set oHSF = Nothing
+    Err.Clear
+End Function
+
+' ==============================================================================
+' HELPER: BUILD ONE EXTREMUM POINT AND READ ITS COORDINATE ON ONE AXIS
+' minMax: 1 = maximum, 0 = minimum ; axisIndex: 0 = X, 1 = Y, 2 = Z
+' ==============================================================================
+Private Function GetExtremumCoord(oPart As Part, oSPA As Object, oTmpSet As HybridBody, _
+                                  oHSF As Object, oRef As Reference, oDir As Object, _
+                                  ByVal minMax As Long, ByVal axisIndex As Integer, _
+                                  ByRef outCoord As Double) As Boolean
+    On Error Resume Next
+    GetExtremumCoord = False
+
+    Dim oExt As Object
+    Err.Clear
+    Set oExt = oHSF.AddNewExtremum(oRef, oDir, minMax)
+    If oExt Is Nothing Then Err.Clear: Exit Function
+
+    oTmpSet.AppendHybridShape oExt
+    oPart.InWorkObject = oExt
+
+    Err.Clear
+    oPart.UpdateObject oExt
+    If Err.Number <> 0 Then Err.Clear: Exit Function
+
+    Dim oMeas As Object
+    Dim oExtRef As Reference
+    Set oExtRef = oPart.CreateReferenceFromObject(oExt)
+    Set oMeas = oSPA.GetMeasurable(oExtRef)
+    If oMeas Is Nothing Then Err.Clear: Exit Function
+
+    Dim coords(2)
+    Err.Clear
+    oMeas.GetPoint coords
+    If Err.Number <> 0 Then Err.Clear: Exit Function
+
+    outCoord = CDbl(coords(axisIndex))
+    GetExtremumCoord = True
+
+    Set oMeas = Nothing
+    Set oExtRef = Nothing
+    Set oExt = Nothing
+    Err.Clear
+End Function
+
+' ==============================================================================
+' HELPER: BODY DIMENSIONS FROM ITS OWN INERTIA (last fallback)
+' Gives the equivalent-box dimensions computed from the principal moments,
+' using SPAWorkbench Inertias on the single body
+' ==============================================================================
+Sub GetBodyInertiaDims(oPartDoc As PartDocument, oBody As Body, ByRef dDims() As Double)
+    On Error Resume Next
+    Dim oSPA As Object
+    Dim oInertia As Object
+
+    Set oSPA = oPartDoc.GetWorkbench("SPAWorkbench")
+    If oSPA Is Nothing Then Exit Sub
+
+    Err.Clear
+    Set oInertia = oSPA.Inertias.Add(oBody)
+    If Err.Number <> 0 Or oInertia Is Nothing Then Err.Clear: Exit Sub
+
     Dim dMass As Double: dMass = oInertia.Mass
     If dMass <= 0 Then
         Set oInertia = Nothing

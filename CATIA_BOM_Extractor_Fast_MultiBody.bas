@@ -82,6 +82,11 @@ Sub GenerateMasterBOM()
     Set rootProd = catDoc.Product
     Set sel = catDoc.Selection
 
+    ' Suppress CATIA alert dialogs during the run (restored at the end)
+    On Error Resume Next
+    CATIA.DisplayFileAlerts = False
+    On Error GoTo 0
+
     Set fso = CreateObject("Scripting.FileSystemObject")
     tempPicPath = "C:\Temp\catia_bom_shot.jpg"
     If Not fso.FolderExists("C:\Temp") Then fso.CreateFolder ("C:\Temp")
@@ -308,6 +313,7 @@ Sub GenerateMasterBOM()
     CATIA.StartCommand "Specification Tree Display"  ' Toggle on
     CATIA.StartCommand "Compass"                     ' Toggle on
     If Not oViewer Is Nothing Then oViewer.Reframe
+    CATIA.DisplayFileAlerts = True
     On Error GoTo 0
     sel.Clear
 
@@ -755,14 +761,14 @@ Function MeasureTarget(oPart As Part, oTargetObj As Object, ByRef dDims() As Dou
 
     oBox.Type = 1
 
-    ' Aggregate the box into a temporary geometrical set and make it the
-    ' in-work object. Without this, UpdateObject only succeeds when the
-    ' target is the in-work (main) body - other bodies returned N/A dims.
+    ' Aggregate the box into a temporary geometrical set. Without this,
+    ' UpdateObject only succeeds when the target is the in-work body.
     Err.Clear
     Set oTmpSet = oPart.HybridBodies.Add()
     If Not oTmpSet Is Nothing Then
+        oTmpSet.Name = "TMP_BOM_MEASURE"
         oTmpSet.AppendHybridShape oBox
-        oPart.InWorkObject = oBox
+        oPart.InWorkObject = oTmpSet
     End If
 
     Err.Clear
@@ -776,6 +782,13 @@ Function MeasureTarget(oPart As Part, oTargetObj As Object, ByRef dDims() As Dou
         End If
     End If
 
+    ' Restore the in-work object BEFORE deleting - deleting the set while
+    ' it is (or contains) the in-work object makes CATIA raise a modal
+    ' "Selected element(s) not allowed for this operation" dialog that
+    ' blocks the whole macro
+    Err.Clear
+    oPart.InWorkObject = oPart.MainBody
+
     ' Delete the temporary geometrical set (takes the box with it),
     ' or just the bare box if the set could not be created
     Err.Clear
@@ -786,11 +799,14 @@ Function MeasureTarget(oPart As Part, oTargetObj As Object, ByRef dDims() As Dou
         oPartSel.Add oBox
     End If
     oPartSel.Delete
+    If Err.Number <> 0 Then
+        ' Could not delete: hide the leftovers so they do not pollute the view
+        Err.Clear
+        oPartSel.Clear
+        If Not oTmpSet Is Nothing Then oPartSel.Add oTmpSet Else oPartSel.Add oBox
+        oPartSel.VisProperties.SetShow 1
+    End If
     oPartSel.Clear
-
-    ' Restore a sane in-work object
-    Err.Clear
-    oPart.InWorkObject = oPart.MainBody
 
 Cleanup:
     Set oPartSel = Nothing
@@ -822,6 +838,8 @@ Function MeasureAABBExtremum(oPart As Part, oPartDoc As PartDocument, _
     Err.Clear
     Set oTmpSet = oPart.HybridBodies.Add()
     If oTmpSet Is Nothing Then GoTo CleanupE
+    oTmpSet.Name = "TMP_BOM_MEASURE"
+    oPart.InWorkObject = oTmpSet
 
     Dim spans(2) As Double
     Dim k As Integer
@@ -849,6 +867,12 @@ Function MeasureAABBExtremum(oPart As Part, oPartDoc As PartDocument, _
         If okAll = False Then Exit For
     Next k
 
+    ' Restore the in-work object BEFORE deleting - deleting the set while
+    ' it is the in-work object raises a modal CATIA error dialog that
+    ' blocks the whole macro
+    Err.Clear
+    oPart.InWorkObject = oPart.MainBody
+
     ' Delete the temporary set together with all extremum points
     Dim oPartSel As Selection
     Err.Clear
@@ -856,11 +880,15 @@ Function MeasureAABBExtremum(oPart As Part, oPartDoc As PartDocument, _
     oPartSel.Clear
     oPartSel.Add oTmpSet
     oPartSel.Delete
+    If Err.Number <> 0 Then
+        ' Could not delete: hide the leftovers so they do not pollute the view
+        Err.Clear
+        oPartSel.Clear
+        oPartSel.Add oTmpSet
+        oPartSel.VisProperties.SetShow 1
+    End If
     oPartSel.Clear
     Set oPartSel = Nothing
-
-    Err.Clear
-    oPart.InWorkObject = oPart.MainBody
 
     If okAll Then
         If (spans(0) + spans(1) + spans(2)) > 0.1 Then
@@ -894,7 +922,6 @@ Private Function GetExtremumCoord(oPart As Part, oSPA As Object, oTmpSet As Hybr
     If oExt Is Nothing Then Err.Clear: Exit Function
 
     oTmpSet.AppendHybridShape oExt
-    oPart.InWorkObject = oExt
 
     Err.Clear
     oPart.UpdateObject oExt

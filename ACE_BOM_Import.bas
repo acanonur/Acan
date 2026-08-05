@@ -1,0 +1,820 @@
+Attribute VB_Name = "ACE_BOM_Import"
+'==============================================================================
+' ACE_BOM_Import
+'------------------------------------------------------------------------------
+' Imports a CATIA BOM extraction workbook (e.g. "flint bom 2.xlsx", produced by
+' the CATIA_BOM_Extractor_* macros) into the ACE cost model workbook.
+'
+' The macro does two things in one run:
+'
+'   1) It copies the complete extraction - all columns, all formatting and all
+'      thumbnails - into a NEW sheet of the ACE workbook ("BOM Extract"), so the
+'      raw extraction stays available inside the cost model.
+'
+'   2) It fills the "Input" sheet of the ACE workbook from that extraction:
+'
+'          BOM extraction column      ->   Input sheet column
+'          ------------------------------------------------------
+'          Level                      ->   A  Level
+'          Part Number                ->   C  Part Number
+'          Description                ->   D  Name
+'          Thumbnail (picture)        ->   F  Picture
+'          Qty                        ->   G  Qty System
+'
+'      Every other column of the Input sheet (Lookup Key, costs, factory,
+'      material, process, all formulas) is left untouched.
+'
+' Entry points (Alt+F8):
+'
+'      ImportBOM                - does both steps (normal use)
+'      ImportBOM_SheetOnly      - only creates the "BOM Extract" copy sheet
+'      ImportBOM_InputOnly      - only fills the Input sheet
+'      ClearBOMImport           - removes imported values + pictures from Input
+'
+' Installation:
+'      Excel -> Alt+F11 -> File -> Import File... -> ACE_BOM_Import.bas
+'      Save the ACE workbook as .xlsm.
+'
+'==============================================================================
+Option Explicit
+
+'--- ACE "Input" sheet layout -------------------------------------------------
+Private Const INPUT_SHEET As String = "Input"
+Private Const INPUT_HEADER_ROW As Long = 14
+Private Const INPUT_FIRST_DATA_ROW As Long = 15
+
+Private Const COL_LEVEL As Long = 1          ' A - Level
+Private Const COL_PARTNUM As Long = 3        ' C - Part Number
+Private Const COL_NAME As Long = 4           ' D - Name
+Private Const COL_PICTURE As Long = 6        ' F - Picture
+Private Const COL_QTY As Long = 7            ' G - Qty System
+
+' Column that carries a formula on every prepared template row. Used to find out
+' how many prepared rows the Input sheet has (column I = "Total Cost").
+Private Const TEMPLATE_PROBE_COL As String = "I"
+
+'--- Behaviour ----------------------------------------------------------------
+Private Const BOM_SHEET_NAME As String = "BOM Extract"
+Private Const WRITE_LEVEL As Boolean = True  ' False = keep the template levels
+Private Const COPY_PICTURES As Boolean = True
+Private Const PIC_TAG As String = "BOMPIC_"  ' name prefix of imported pictures
+Private Const PIC_MARGIN As Double = 2#      ' points of free space inside cell
+Private Const MIN_PIC_ROW_HEIGHT As Double = 45#
+
+'--- Shape type constants (avoids a hard reference to the Office library) ------
+Private Const SHP_PICTURE As Long = 13
+Private Const SHP_LINKED_PICTURE As Long = 11
+
+'--- Custom errors ------------------------------------------------------------
+Private Const ERR_NO_PARTNUM As Long = vbObjectError + 1
+Private Const ERR_USER_CANCEL As Long = vbObjectError + 2
+
+'--- Saved application state ---------------------------------------------------
+Private mScreen As Boolean
+Private mEvents As Boolean
+Private mCalc As XlCalculation
+Private mAlerts As Boolean
+Private mStateSaved As Boolean
+
+
+'==============================================================================
+' ENTRY POINT: full import (copy sheet + fill Input sheet)
+'==============================================================================
+Public Sub ImportBOM()
+    RunImport True, True
+End Sub
+
+'==============================================================================
+' ENTRY POINT: only create the separate copy of the extraction
+'==============================================================================
+Public Sub ImportBOM_SheetOnly()
+    RunImport True, False
+End Sub
+
+'==============================================================================
+' ENTRY POINT: only fill the Input sheet
+'==============================================================================
+Public Sub ImportBOM_InputOnly()
+    RunImport False, True
+End Sub
+
+
+'==============================================================================
+' MAIN WORKER
+'
+'   makeCopySheet : create the "BOM Extract" sheet holding the raw extraction
+'   fillInput     : write Level / Part Number / Name / Picture / Qty to "Input"
+'
+' The extraction is always copied into this workbook first; the Input sheet is
+' then filled from that local copy. That way the source workbook can be closed
+' immediately and the thumbnails are copied inside a single workbook, which is
+' considerably faster and more reliable than a cross-workbook copy.
+'==============================================================================
+Private Sub RunImport(ByVal makeCopySheet As Boolean, ByVal fillInput As Boolean)
+    Dim srcPath As String
+    Dim srcWb As Workbook, srcWs As Worksheet
+    Dim bomWs As Worksheet
+    Dim inputWs As Worksheet
+    Dim srcWasOpen As Boolean
+    Dim keepCopySheet As Boolean
+    Dim hdrRow As Long, lastRow As Long
+    Dim nRows As Long, nPics As Long, nSkipped As Long
+    Dim wasProtected As Boolean
+    Dim startedAt As Double
+    Dim copySheetName As String
+
+    On Error GoTo CleanFail
+
+    If Not SheetExists(INPUT_SHEET) Then
+        MsgBox "This workbook has no sheet named '" & INPUT_SHEET & "'." & vbCrLf & _
+               "Run the macro from the ACE cost model workbook.", vbExclamation, "BOM Import"
+        Exit Sub
+    End If
+
+    srcPath = PickBOMFile()
+    If Len(srcPath) = 0 Then Exit Sub                 ' user cancelled
+
+    startedAt = Timer
+    SaveAppState
+
+    '--- 1. open (or reuse) the extraction workbook ----------------------------
+    Set srcWb = GetWorkbook(srcPath, srcWasOpen)
+    If srcWb Is Nothing Then
+        MsgBox "Could not open:" & vbCrLf & srcPath, vbCritical, "BOM Import"
+        GoTo CleanExit
+    End If
+
+    Set srcWs = FindBOMSheet(srcWb)
+    If srcWs Is Nothing Then
+        MsgBox "No BOM data found in:" & vbCrLf & srcWb.Name & vbCrLf & vbCrLf & _
+               "Expected a sheet with a 'Part Number' column header.", _
+               vbExclamation, "BOM Import"
+        GoTo CleanExit
+    End If
+
+    '--- 2. copy the whole extraction into this workbook ----------------------
+    Application.StatusBar = "BOM import: copying extraction sheet ..."
+    keepCopySheet = makeCopySheet
+    Set bomWs = CreateCopySheet(srcWs, keepCopySheet)
+    If bomWs Is Nothing Then GoTo CleanExit          ' user cancelled
+    copySheetName = bomWs.Name
+
+    If Not srcWasOpen Then srcWb.Close SaveChanges:=False
+    Set srcWb = Nothing
+
+    '--- 3. locate the data inside the copy -----------------------------------
+    hdrRow = FindHeaderRow(bomWs)
+    lastRow = LastDataRow(bomWs, hdrRow)
+    nRows = lastRow - hdrRow
+
+    If nRows <= 0 Then
+        MsgBox "The extraction sheet contains no data rows.", vbExclamation, "BOM Import"
+        If Not keepCopySheet Then DeleteSheet bomWs
+        GoTo CleanExit
+    End If
+
+    '--- 4. fill the Input sheet ----------------------------------------------
+    If fillInput Then
+        Set inputWs = ThisWorkbook.Worksheets(INPUT_SHEET)
+        wasProtected = UnprotectSheet(inputWs)
+        If inputWs.ProtectContents Then
+            MsgBox "The '" & INPUT_SHEET & "' sheet is protected with a password " & _
+                   "and could not be unlocked." & vbCrLf & _
+                   "Unprotect it manually and run the macro again.", _
+                   vbExclamation, "BOM Import"
+            If Not keepCopySheet Then DeleteSheet bomWs
+            GoTo CleanExit
+        End If
+
+        FillInputSheet bomWs, hdrRow, inputWs, nRows, nPics, nSkipped
+
+        If wasProtected Then ProtectSheet inputWs
+    End If
+
+    '--- 5. drop the working copy if it was not requested ----------------------
+    If Not keepCopySheet Then DeleteSheet bomWs
+
+    RestoreAppState
+    Application.Calculate
+
+    MsgBox BuildReport(makeCopySheet, fillInput, copySheetName, keepCopySheet, _
+                       nRows, nPics, nSkipped, Timer - startedAt), _
+           vbInformation, "BOM Import"
+    Exit Sub
+
+CleanExit:
+    If Not srcWb Is Nothing Then
+        If Not srcWasOpen Then srcWb.Close SaveChanges:=False
+    End If
+    RestoreAppState
+    Exit Sub
+
+CleanFail:
+    Dim errNo As Long, msg As String
+    errNo = Err.Number
+    msg = "BOM import failed:" & vbCrLf & vbCrLf & _
+          "Error " & Err.Number & " - " & Err.Description
+
+    On Error Resume Next
+    If Not srcWb Is Nothing Then
+        If Not srcWasOpen Then srcWb.Close SaveChanges:=False
+    End If
+    If Not keepCopySheet Then DeleteSheet bomWs      ' remove the temporary copy
+    On Error GoTo 0
+
+    RestoreAppState
+    If errNo = ERR_USER_CANCEL Then
+        MsgBox "BOM import cancelled - nothing was changed.", vbInformation, "BOM Import"
+    Else
+        MsgBox msg, vbCritical, "BOM Import"
+    End If
+End Sub
+
+
+'==============================================================================
+' Writes Level / Part Number / Name / Qty and the thumbnails into "Input".
+'==============================================================================
+Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As Worksheet, _
+                           ByRef nRows As Long, ByRef nPics As Long, ByRef nSkipped As Long)
+    Dim cLevel As Long, cPart As Long, cDesc As Long, cQty As Long
+    Dim lastTemplateRow As Long, capacity As Long
+    Dim levels As Variant, parts As Variant, descs As Variant, qtys As Variant
+    Dim pics As Object
+    Dim i As Long, srcRow As Long, tgtRow As Long
+    Dim answer As VbMsgBoxResult
+    Dim prevActive As Object
+
+    cPart = FindColumn(bomWs, hdrRow, "part number", "partnumber", "part no", "part-number")
+    cLevel = FindColumn(bomWs, hdrRow, "level")
+    cDesc = FindColumn(bomWs, hdrRow, "description", "name", "designation")
+    cQty = FindColumn(bomWs, hdrRow, "qty", "quantity", "qty system", "quantity total")
+
+    If cPart = 0 Then Err.Raise ERR_NO_PARTNUM, , "No 'Part Number' column found in the extraction."
+
+    '--- how many prepared rows does the template offer? ----------------------
+    lastTemplateRow = LastTemplateRow(inputWs)
+    capacity = lastTemplateRow - INPUT_FIRST_DATA_ROW + 1
+
+    If nRows > capacity Then
+        answer = MsgBox("The extraction has " & nRows & " rows but the Input sheet only has " & _
+                        capacity & " prepared rows (" & INPUT_FIRST_DATA_ROW & ":" & lastTemplateRow & ")." & vbCrLf & vbCrLf & _
+                        "Yes  = extend the sheet by copying the last prepared row down" & vbCrLf & _
+                        "No   = import the first " & capacity & " rows only" & vbCrLf & _
+                        "Cancel = abort", vbQuestion + vbYesNoCancel, "BOM Import")
+        Select Case answer
+            Case vbCancel
+                Err.Raise ERR_USER_CANCEL, , "Import cancelled by the user."
+            Case vbYes
+                If ExtendTemplate(inputWs, lastTemplateRow, INPUT_FIRST_DATA_ROW + nRows - 1) Then
+                    lastTemplateRow = INPUT_FIRST_DATA_ROW + nRows - 1
+                    capacity = nRows
+                End If
+        End Select
+        If nRows > capacity Then
+            nSkipped = nRows - capacity
+            nRows = capacity
+        End If
+    End If
+
+    '--- read the extraction into arrays --------------------------------------
+    parts = ReadColumn(bomWs, cPart, hdrRow + 1, hdrRow + nRows, False)
+    If cLevel > 0 Then levels = ReadColumn(bomWs, cLevel, hdrRow + 1, hdrRow + nRows, True)
+    If cDesc > 0 Then descs = ReadColumn(bomWs, cDesc, hdrRow + 1, hdrRow + nRows, False)
+    If cQty > 0 Then qtys = ReadColumn(bomWs, cQty, hdrRow + 1, hdrRow + nRows, True)
+
+    '--- clear the previous import --------------------------------------------
+    Application.StatusBar = "BOM import: clearing previous import ..."
+    ClearInputRange inputWs, INPUT_FIRST_DATA_ROW, lastTemplateRow
+
+    '--- write the values (one shot per column) -------------------------------
+    Application.StatusBar = "BOM import: writing " & nRows & " rows ..."
+    inputWs.Cells(INPUT_FIRST_DATA_ROW, COL_PARTNUM).Resize(nRows, 1).Value = parts
+    If WRITE_LEVEL And cLevel > 0 Then _
+        inputWs.Cells(INPUT_FIRST_DATA_ROW, COL_LEVEL).Resize(nRows, 1).Value = levels
+    If cDesc > 0 Then _
+        inputWs.Cells(INPUT_FIRST_DATA_ROW, COL_NAME).Resize(nRows, 1).Value = descs
+    If cQty > 0 Then _
+        inputWs.Cells(INPUT_FIRST_DATA_ROW, COL_QTY).Resize(nRows, 1).Value = qtys
+
+    '--- thumbnails ------------------------------------------------------------
+    If Not COPY_PICTURES Then Exit Sub
+
+    Set pics = PictureMap(bomWs)
+    If pics.Count = 0 Then Exit Sub
+
+    Set prevActive = ActiveSheet
+    ThisWorkbook.Activate
+    inputWs.Activate
+
+    For i = 1 To nRows
+        srcRow = hdrRow + i
+        tgtRow = INPUT_FIRST_DATA_ROW + i - 1
+        If pics.Exists(srcRow) Then
+            If i Mod 20 = 0 Then
+                Application.StatusBar = "BOM import: copying picture " & i & " of " & nRows & " ..."
+                DoEvents
+            End If
+            If CopyPictureToCell(pics(srcRow), inputWs, tgtRow, COL_PICTURE) Then nPics = nPics + 1
+        End If
+    Next i
+
+    On Error Resume Next
+    inputWs.Range("A" & INPUT_FIRST_DATA_ROW).Select
+    If Not prevActive Is Nothing Then prevActive.Activate
+    On Error GoTo 0
+End Sub
+
+
+'==============================================================================
+' Copies one thumbnail into the Picture column and fits it into the cell.
+'==============================================================================
+Private Function CopyPictureToCell(srcShape As Object, tgtWs As Worksheet, _
+                                   ByVal r As Long, ByVal c As Long) As Boolean
+    Dim newShp As Object
+    Dim cel As Range
+    Dim before As Long, tries As Long
+    Dim maxW As Double, maxH As Double, f As Double
+
+    On Error GoTo Failed
+
+    Set cel = tgtWs.Cells(r, c)
+    If tgtWs.Rows(r).RowHeight < MIN_PIC_ROW_HEIGHT Then
+        tgtWs.Rows(r).RowHeight = MIN_PIC_ROW_HEIGHT
+    End If
+
+    before = tgtWs.Shapes.Count
+    For tries = 1 To 3
+        srcShape.Copy
+        DoEvents
+        tgtWs.Paste
+        If tgtWs.Shapes.Count > before Then Exit For
+        DoEvents
+    Next tries
+    Application.CutCopyMode = False
+    If tgtWs.Shapes.Count <= before Then GoTo Failed
+
+    Set newShp = tgtWs.Shapes(tgtWs.Shapes.Count)
+    newShp.Name = PIC_TAG & r
+    newShp.LockAspectRatio = False
+
+    maxW = cel.Width - 2 * PIC_MARGIN
+    maxH = cel.Height - 2 * PIC_MARGIN
+    If maxW < 5 Then maxW = 5
+    If maxH < 5 Then maxH = 5
+
+    If newShp.Width > 0 And newShp.Height > 0 Then
+        f = maxW / newShp.Width
+        If maxH / newShp.Height < f Then f = maxH / newShp.Height
+        newShp.Width = newShp.Width * f
+        newShp.Height = newShp.Height * f
+    End If
+
+    newShp.Left = cel.Left + (cel.Width - newShp.Width) / 2
+    newShp.Top = cel.Top + (cel.Height - newShp.Height) / 2
+    newShp.Placement = xlMove                       ' move but don't size with cells
+
+    CopyPictureToCell = True
+    Exit Function
+
+Failed:
+    Application.CutCopyMode = False
+    CopyPictureToCell = False
+    Err.Clear
+End Function
+
+
+'==============================================================================
+' Builds a dictionary  source row -> picture shape  for the extraction sheet.
+' The extractor anchors one thumbnail per row in the first column.
+'==============================================================================
+Private Function PictureMap(ws As Worksheet) As Object
+    Dim d As Object, shp As Object, r As Long
+
+    Set d = CreateObject("Scripting.Dictionary")
+    On Error Resume Next
+    For Each shp In ws.Shapes
+        If shp.Type = SHP_PICTURE Or shp.Type = SHP_LINKED_PICTURE Then
+            r = 0
+            r = shp.TopLeftCell.Row
+            If r > 0 Then
+                If Not d.Exists(r) Then d.Add r, shp
+            End If
+        End If
+    Next shp
+    Err.Clear
+    On Error GoTo 0
+    Set PictureMap = d
+End Function
+
+
+'==============================================================================
+' ENTRY POINT: remove everything a previous import wrote into "Input".
+'==============================================================================
+Public Sub ClearBOMImport()
+    Dim ws As Worksheet
+    Dim wasProtected As Boolean
+
+    If Not SheetExists(INPUT_SHEET) Then Exit Sub
+    If MsgBox("Clear Level / Part Number / Name / Qty and all imported pictures " & _
+              "from the '" & INPUT_SHEET & "' sheet?", vbQuestion + vbYesNo, "BOM Import") <> vbYes Then Exit Sub
+
+    Set ws = ThisWorkbook.Worksheets(INPUT_SHEET)
+    SaveAppState
+    wasProtected = UnprotectSheet(ws)
+    ClearInputRange ws, INPUT_FIRST_DATA_ROW, LastTemplateRow(ws)
+    If wasProtected Then ProtectSheet ws
+    RestoreAppState
+End Sub
+
+
+'==============================================================================
+' Clears the imported columns and the imported pictures of the given row range.
+' Formulas and all other columns are untouched.
+'==============================================================================
+Private Sub ClearInputRange(ws As Worksheet, ByVal firstRow As Long, ByVal lastRow As Long)
+    Dim shp As Object, i As Long
+    Dim doomed As Collection
+    Dim r As Long, c As Long
+
+    If lastRow < firstRow Then Exit Sub
+
+    ws.Cells(firstRow, COL_PARTNUM).Resize(lastRow - firstRow + 1, 1).ClearContents
+    ws.Cells(firstRow, COL_NAME).Resize(lastRow - firstRow + 1, 1).ClearContents
+    ws.Cells(firstRow, COL_QTY).Resize(lastRow - firstRow + 1, 1).ClearContents
+    If WRITE_LEVEL Then ws.Cells(firstRow, COL_LEVEL).Resize(lastRow - firstRow + 1, 1).ClearContents
+
+    ' pictures: everything tagged by this macro plus any picture sitting in the
+    ' Picture column of the data area
+    Set doomed = New Collection
+    On Error Resume Next
+    For Each shp In ws.Shapes
+        r = 0: c = 0
+        r = shp.TopLeftCell.Row
+        c = shp.TopLeftCell.Column
+        If InStr(1, shp.Name, PIC_TAG, vbTextCompare) = 1 Then
+            doomed.Add shp
+        ElseIf (shp.Type = SHP_PICTURE Or shp.Type = SHP_LINKED_PICTURE) Then
+            If c = COL_PICTURE And r >= firstRow And r <= lastRow Then doomed.Add shp
+        End If
+    Next shp
+    For i = 1 To doomed.Count
+        doomed(i).Delete
+    Next i
+    Err.Clear
+    On Error GoTo 0
+End Sub
+
+
+'==============================================================================
+' Creates the separate sheet holding the complete extraction (same format).
+' Returns the new sheet. keepIt=False means the sheet is only a temporary
+' working copy and will be deleted by the caller.
+'==============================================================================
+Private Function CreateCopySheet(srcWs As Worksheet, ByVal keepIt As Boolean) As Worksheet
+    Dim newWs As Worksheet
+    Dim targetName As String
+    Dim answer As VbMsgBoxResult
+    Dim after As Worksheet
+
+    If keepIt Then
+        targetName = BOM_SHEET_NAME
+        If SheetExists(targetName) Then
+            answer = MsgBox("A sheet named '" & targetName & "' already exists." & vbCrLf & vbCrLf & _
+                            "Yes  = replace it" & vbCrLf & _
+                            "No   = keep it and create a new numbered sheet" & vbCrLf & _
+                            "Cancel = abort", vbQuestion + vbYesNoCancel, "BOM Import")
+            Select Case answer
+                Case vbCancel: Exit Function
+                Case vbYes: DeleteSheet ThisWorkbook.Worksheets(targetName)
+                Case vbNo: targetName = UniqueSheetName(BOM_SHEET_NAME)
+            End Select
+        End If
+    Else
+        targetName = UniqueSheetName("~BOM_tmp")
+    End If
+
+    If SheetExists(INPUT_SHEET) Then
+        Set after = ThisWorkbook.Worksheets(INPUT_SHEET)
+    Else
+        Set after = ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count)
+    End If
+
+    srcWs.Copy After:=after
+    ' the copy is always placed directly behind the reference sheet
+    Set newWs = ThisWorkbook.Sheets(after.Index + 1)
+
+    On Error Resume Next
+    newWs.Name = targetName
+    Err.Clear
+    On Error GoTo 0
+
+    FlattenFormulas newWs
+    Set CreateCopySheet = newWs
+End Function
+
+
+'==============================================================================
+' The extraction is static data. Any formula in the copy would now point back at
+' the source workbook, so every formula is replaced by its result.
+'==============================================================================
+Private Sub FlattenFormulas(ws As Worksheet)
+    Dim fRange As Range, area As Range
+
+    On Error Resume Next
+    Set fRange = ws.Cells.SpecialCells(xlCellTypeFormulas)
+    Err.Clear
+    On Error GoTo 0
+    If fRange Is Nothing Then Exit Sub
+
+    On Error Resume Next
+    For Each area In fRange.Areas          ' a multi area range cannot be set at once
+        area.Value = area.Value
+    Next area
+    Err.Clear
+    On Error GoTo 0
+End Sub
+
+
+'==============================================================================
+' Copies the last prepared template row down so that more BOM rows fit.
+'==============================================================================
+Private Function ExtendTemplate(ws As Worksheet, ByVal lastTemplateRow As Long, _
+                                ByVal neededLastRow As Long) As Boolean
+    On Error GoTo Failed
+    If neededLastRow <= lastTemplateRow Then
+        ExtendTemplate = True
+        Exit Function
+    End If
+
+    ws.Rows(lastTemplateRow).Copy _
+        Destination:=ws.Rows(lastTemplateRow + 1 & ":" & neededLastRow)
+    Application.CutCopyMode = False
+
+    ' the copied rows must not carry the values of the source row
+    ClearInputRange ws, lastTemplateRow + 1, neededLastRow
+
+    ExtendTemplate = True
+    Exit Function
+
+Failed:
+    Application.CutCopyMode = False
+    ExtendTemplate = False
+    Err.Clear
+End Function
+
+
+'==============================================================================
+' HELPERS
+'==============================================================================
+
+'--- file / workbook ----------------------------------------------------------
+Private Function PickBOMFile() As String
+    Dim f As Variant
+    Dim startDir As String
+
+    startDir = ThisWorkbook.Path
+    On Error Resume Next
+    If Len(startDir) > 0 Then ChDir startDir
+    On Error GoTo 0
+
+    f = Application.GetOpenFilename( _
+            FileFilter:="BOM extraction (*.xlsx;*.xlsm;*.xls),*.xlsx;*.xlsm;*.xls", _
+            Title:="Select the CATIA BOM extraction file")
+    If VarType(f) = vbBoolean Then Exit Function      ' cancelled
+    PickBOMFile = CStr(f)
+End Function
+
+Private Function GetWorkbook(ByVal fullPath As String, ByRef alreadyOpen As Boolean) As Workbook
+    Dim wb As Workbook
+
+    alreadyOpen = False
+    For Each wb In Application.Workbooks
+        If StrComp(wb.FullName, fullPath, vbTextCompare) = 0 Then
+            alreadyOpen = True
+            Set GetWorkbook = wb
+            Exit Function
+        End If
+    Next wb
+
+    On Error Resume Next
+    Set GetWorkbook = Application.Workbooks.Open(Filename:=fullPath, _
+                                                 UpdateLinks:=0, ReadOnly:=True)
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+'--- extraction layout --------------------------------------------------------
+Private Function FindBOMSheet(wb As Workbook) As Worksheet
+    Dim ws As Worksheet
+
+    For Each ws In wb.Worksheets
+        If FindHeaderRow(ws) > 0 Then
+            Set FindBOMSheet = ws
+            Exit Function
+        End If
+    Next ws
+End Function
+
+' The header row is the first row (within the first 20) that carries a
+' "Part Number" column header.
+Private Function FindHeaderRow(ws As Worksheet) As Long
+    Dim r As Long, c As Long, txt As String
+    Dim maxC As Long
+
+    maxC = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    If maxC < 5 Then maxC = 30
+
+    For r = 1 To 20
+        For c = 1 To maxC
+            txt = LCase$(Trim$(CStr(ws.Cells(r, c).Value)))
+            txt = Replace(txt, "_", " ")
+            If txt = "part number" Or txt = "partnumber" Or txt = "part no" Or txt = "part-number" Then
+                FindHeaderRow = r
+                Exit Function
+            End If
+        Next c
+    Next r
+End Function
+
+Private Function FindColumn(ws As Worksheet, ByVal hdrRow As Long, ParamArray names() As Variant) As Long
+    Dim c As Long, i As Long, txt As String, maxC As Long
+
+    If hdrRow <= 0 Then Exit Function
+    maxC = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+    If maxC < 1 Then maxC = 30
+
+    For c = 1 To maxC
+        txt = LCase$(Trim$(CStr(ws.Cells(hdrRow, c).Value)))
+        txt = Replace(Replace(txt, vbLf, " "), "_", " ")
+        Do While InStr(txt, "  ") > 0
+            txt = Replace(txt, "  ", " ")
+        Loop
+        For i = LBound(names) To UBound(names)
+            If txt = LCase$(CStr(names(i))) Then
+                FindColumn = c
+                Exit Function
+            End If
+        Next i
+    Next c
+End Function
+
+Private Function LastDataRow(ws As Worksheet, ByVal hdrRow As Long) As Long
+    Dim cPart As Long, r As Long
+
+    cPart = FindColumn(ws, hdrRow, "part number", "partnumber", "part no", "part-number")
+    If cPart = 0 Then Exit Function
+
+    r = ws.Cells(ws.Rows.Count, cPart).End(xlUp).Row
+    If r < hdrRow Then r = hdrRow
+    LastDataRow = r
+End Function
+
+' Last row of the Input sheet that is prepared with the model formulas.
+Private Function LastTemplateRow(ws As Worksheet) As Long
+    Dim r As Long
+
+    r = ws.Cells(ws.Rows.Count, TEMPLATE_PROBE_COL).End(xlUp).Row
+    If r < INPUT_FIRST_DATA_ROW Then r = ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1
+    If r < INPUT_FIRST_DATA_ROW Then r = INPUT_FIRST_DATA_ROW
+    LastTemplateRow = r
+End Function
+
+' Reads one column into a 2D array; text stays text, numeric text becomes a number.
+Private Function ReadColumn(ws As Worksheet, ByVal col As Long, ByVal firstRow As Long, _
+                            ByVal lastRow As Long, ByVal asNumber As Boolean) As Variant
+    Dim raw As Variant, out() As Variant
+    Dim n As Long, i As Long, v As Variant
+
+    n = lastRow - firstRow + 1
+    ReDim out(1 To n, 1 To 1)
+
+    If n = 1 Then
+        ReDim raw(1 To 1, 1 To 1)
+        raw(1, 1) = ws.Cells(firstRow, col).Value
+    Else
+        raw = ws.Range(ws.Cells(firstRow, col), ws.Cells(lastRow, col)).Value
+    End If
+
+    For i = 1 To n
+        v = raw(i, 1)
+        If IsEmpty(v) Then
+            out(i, 1) = vbNullString
+        ElseIf asNumber Then
+            If IsNumeric(v) Then
+                out(i, 1) = CDbl(v)
+            Else
+                out(i, 1) = v
+            End If
+        Else
+            out(i, 1) = v
+        End If
+    Next i
+
+    ReadColumn = out
+End Function
+
+'--- sheets -------------------------------------------------------------------
+Private Function SheetExists(ByVal nm As String) As Boolean
+    Dim ws As Worksheet
+    For Each ws In ThisWorkbook.Worksheets
+        If StrComp(ws.Name, nm, vbTextCompare) = 0 Then
+            SheetExists = True
+            Exit Function
+        End If
+    Next ws
+End Function
+
+Private Function UniqueSheetName(ByVal baseName As String) As String
+    Dim i As Long, nm As String
+
+    nm = baseName
+    i = 1
+    Do While SheetExists(nm)
+        i = i + 1
+        nm = baseName & " " & i
+    Loop
+    UniqueSheetName = nm
+End Function
+
+Private Sub DeleteSheet(ws As Worksheet)
+    Dim prev As Boolean
+    If ws Is Nothing Then Exit Sub
+    prev = Application.DisplayAlerts
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    ws.Delete
+    Err.Clear
+    On Error GoTo 0
+    Application.DisplayAlerts = prev
+End Sub
+
+'--- protection ---------------------------------------------------------------
+Private Function UnprotectSheet(ws As Worksheet) As Boolean
+    If Not ws.ProtectContents Then Exit Function
+    On Error Resume Next
+    ws.Unprotect
+    Err.Clear
+    On Error GoTo 0
+    UnprotectSheet = Not ws.ProtectContents
+End Function
+
+Private Sub ProtectSheet(ws As Worksheet)
+    On Error Resume Next
+    ws.Protect DrawingObjects:=False, Contents:=True, Scenarios:=False, _
+               AllowFormattingCells:=True, AllowFormattingRows:=True
+    Err.Clear
+    On Error GoTo 0
+End Sub
+
+'--- application state --------------------------------------------------------
+Private Sub SaveAppState()
+    If mStateSaved Then Exit Sub
+    mScreen = Application.ScreenUpdating
+    mEvents = Application.EnableEvents
+    mCalc = Application.Calculation
+    mAlerts = Application.DisplayAlerts
+    mStateSaved = True
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+End Sub
+
+Private Sub RestoreAppState()
+    If Not mStateSaved Then Exit Sub
+    On Error Resume Next
+    Application.CutCopyMode = False
+    Application.Calculation = mCalc
+    Application.DisplayAlerts = mAlerts
+    Application.EnableEvents = mEvents
+    Application.ScreenUpdating = mScreen
+    Application.StatusBar = False
+    Err.Clear
+    On Error GoTo 0
+    mStateSaved = False
+End Sub
+
+'--- reporting ----------------------------------------------------------------
+Private Function BuildReport(ByVal madeCopy As Boolean, ByVal filledInput As Boolean, _
+                             ByVal copySheetName As String, ByVal keptCopySheet As Boolean, _
+                             ByVal nRows As Long, ByVal nPics As Long, _
+                             ByVal nSkipped As Long, ByVal secs As Double) As String
+    Dim s As String
+
+    s = "BOM import finished." & vbCrLf & vbCrLf
+    If madeCopy And keptCopySheet Then
+        s = s & "Extraction copied to sheet:  " & copySheetName & vbCrLf
+    End If
+    If filledInput Then
+        s = s & "Rows written to '" & INPUT_SHEET & "':  " & nRows & _
+                "  (rows " & INPUT_FIRST_DATA_ROW & "-" & INPUT_FIRST_DATA_ROW + nRows - 1 & ")" & vbCrLf
+        s = s & "Pictures copied:  " & nPics & vbCrLf
+        If nSkipped > 0 Then
+            s = s & vbCrLf & "NOT imported: " & nSkipped & " row(s) - the Input sheet " & _
+                    "had no prepared rows left." & vbCrLf
+        End If
+    End If
+    s = s & vbCrLf & "Duration: " & Format$(secs, "0.0") & " s"
+
+    BuildReport = s
+End Function

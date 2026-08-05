@@ -52,6 +52,50 @@ assign the macro `ImportBOM`.
 | `ImportBOM_SheetOnly`  | Only creates the `BOM Extract` copy sheet                        |
 | `ImportBOM_InputOnly`  | Only fills the `Input` sheet                                     |
 | `ClearBOMImport`       | Removes imported values and pictures from `Input` again          |
+| `ResetInputSheet`      | Empties the **whole** `Input` sheet for a new estimate — formulas stay |
+| `NewInputSheet`        | Creates a new, empty copy of the `Input` sheet                   |
+
+## Starting a new estimate
+
+Two macros clear the entered data without ever touching a formula:
+
+### `ResetInputSheet` — empty the existing sheet
+
+Deletes every **typed-in value** in the data area of `Input` (rows 15–287) and
+all pictures of that area. Cells containing a **formula are never touched** — the
+macro clears constants only, so the complete cost model keeps working and simply
+calculates on empty inputs. On the current workbook this clears ~1 200 entered
+cells while all ~15 400 formulas stay in place.
+
+Cleared: Level, Part Number, Name, Other Reference, Picture, Qty, Reference
+Cost, supply option, material, material reference, comments, manually entered
+material consumption / units / process category / process reference /
+description, rank & learning parameter, and the Product / subproducts /
+Manufacturing labels.
+
+**Kept on purpose** (columns `K, L, AA, AE, AH, AI, AN, AO, AP, BC`): Company,
+Country, Process Type, Lot Size, Process Time, Direct Operator, Qty Operators,
+Set Up Time, Other Setup Cost and Valuation Method. These are entered values
+too, but they carry the template defaults — emptying `AE` (Lot Size) would give
+`#DIV/0!` in the setup cost, emptying `K` (Company) would set every factory rate
+to 0. Change the list in the constant `RESET_KEEP_COLUMNS` at the top of the
+module if you want a different behaviour.
+
+A confirmation dialog appears first (the default button is "No"); the action
+cannot be undone, so save a copy beforehand if in doubt.
+
+### `NewInputSheet` — start on a fresh sheet
+
+Duplicates the `Input` sheet with **all formulas, formatting, dropdowns and
+column widths**, then empties the copy in exactly the same way. The original
+`Input` sheet is not changed, so the previous estimate stays intact. The new
+sheet is named `Input (new)` (`Input (new) 2`, … if it already exists).
+
+Note: the evaluation sheets (`Overview_1`, `System`, `CBS`, `Parametric Cost`, …)
+keep reading from the original `Input` sheet — the new sheet is a self-contained
+working copy, e.g. for a variant or a second BOM.
+
+A typical "new project" run is therefore: `ResetInputSheet` → `ImportBOM`.
 
 A file dialog asks for the extraction file (it starts in the folder of the ACE
 workbook). If that file is already open in Excel it is reused and left open;
@@ -95,3 +139,12 @@ Constants at the top of the module:
 | `COPY_PICTURES`         | `True`         | `False` imports data only (much faster)       |
 | `MIN_PIC_ROW_HEIGHT`    | `45`           | Minimum row height for rows with a picture    |
 | `INPUT_FIRST_DATA_ROW`  | `15`           | First data row of the `Input` sheet           |
+| `RESET_KEEP_COLUMNS`    | `K,L,AA,AE,AH,AI,AN,AO,AP,BC` | Columns whose defaults a reset keeps |
+
+## Good to know about the reset
+
+A column such as `R` (Material Consumption) or `AB` (Process Category) contains a
+formula in most rows and a manually entered override in a few. The reset removes
+those overrides, so the cells stay **empty** afterwards — the formula rows keep
+their formulas, but a cleared override is not replaced by one. That is intended:
+the macro deletes inputs, it never writes formulas.

@@ -30,6 +30,10 @@ Attribute VB_Name = "ACE_BOM_Import"
 '      ImportBOM_SheetOnly      - only creates the "BOM Extract" copy sheet
 '      ImportBOM_InputOnly      - only fills the Input sheet
 '      ClearBOMImport           - removes imported values + pictures from Input
+'      ResetInputSheet          - empties the whole Input sheet for a new
+'                                 estimate; all formulas stay untouched
+'      NewInputSheet            - creates a new, empty copy of the Input sheet
+'                                 (formulas + formatting kept, values removed)
 '
 ' Installation:
 '      Excel -> Alt+F11 -> File -> Import File... -> ACE_BOM_Import.bas
@@ -60,6 +64,16 @@ Private Const COPY_PICTURES As Boolean = True
 Private Const PIC_TAG As String = "BOMPIC_"  ' name prefix of imported pictures
 Private Const PIC_MARGIN As Double = 2#      ' points of free space inside cell
 Private Const MIN_PIC_ROW_HEIGHT As Double = 45#
+
+' Columns that keep their template defaults when the Input sheet is emptied.
+' They are entered values as well, but the model needs them to stay valid:
+'   K  Company (AGG)    L  Country (DEU)     AA Process Type (None)
+'   AE Lot Size (1)     AH Process Time      AI Direct Operator
+'   AN Qty Operators    AO Set Up Time       AP Other Setup Cost
+'   BC Valuation Method (Industrial)
+' Emptying AE would produce #DIV/0! in the setup cost, emptying K would set all
+' factory rates to 0. Add or remove letters here to change what a reset keeps.
+Private Const RESET_KEEP_COLUMNS As String = "K,L,AA,AE,AH,AI,AN,AO,AP,BC"
 
 '--- Shape type constants (avoids a hard reference to the Office library) ------
 Private Const SHP_PICTURE As Long = 13
@@ -432,10 +446,6 @@ End Sub
 ' Formulas and all other columns are untouched.
 '==============================================================================
 Private Sub ClearInputRange(ws As Worksheet, ByVal firstRow As Long, ByVal lastRow As Long)
-    Dim shp As Object, i As Long
-    Dim doomed As Collection
-    Dim r As Long, c As Long
-
     If lastRow < firstRow Then Exit Sub
 
     ws.Cells(firstRow, COL_PARTNUM).Resize(lastRow - firstRow + 1, 1).ClearContents
@@ -443,8 +453,20 @@ Private Sub ClearInputRange(ws As Worksheet, ByVal firstRow As Long, ByVal lastR
     ws.Cells(firstRow, COL_QTY).Resize(lastRow - firstRow + 1, 1).ClearContents
     If WRITE_LEVEL Then ws.Cells(firstRow, COL_LEVEL).Resize(lastRow - firstRow + 1, 1).ClearContents
 
-    ' pictures: everything tagged by this macro plus any picture sitting in the
-    ' Picture column of the data area
+    DeleteRowPictures ws, firstRow, lastRow
+End Sub
+
+
+'==============================================================================
+' Deletes the pictures of the data area: everything tagged by this macro plus
+' any picture sitting in the Picture column between firstRow and lastRow.
+' The sheet logo and anything outside that area is kept.
+'==============================================================================
+Private Sub DeleteRowPictures(ws As Worksheet, ByVal firstRow As Long, ByVal lastRow As Long)
+    Dim shp As Object, i As Long
+    Dim doomed As Collection
+    Dim r As Long, c As Long
+
     Set doomed = New Collection
     On Error Resume Next
     For Each shp In ws.Shapes
@@ -463,6 +485,197 @@ Private Sub ClearInputRange(ws As Worksheet, ByVal firstRow As Long, ByVal lastR
     Err.Clear
     On Error GoTo 0
 End Sub
+
+
+'==============================================================================
+' ENTRY POINT: empty the whole "Input" sheet for a new estimate.
+'
+' Every entered value of the data area is deleted, but NO formula is touched -
+' the cost model stays completely intact and simply calculates on empty inputs.
+' Pictures of the data area are removed as well.
+'
+' The columns listed in RESET_KEEP_COLUMNS keep their template defaults
+' (factory, process type, lot size, ...), otherwise the sheet would fill up
+' with #DIV/0! and #N/A after the reset.
+'==============================================================================
+Public Sub ResetInputSheet()
+    Dim ws As Worksheet
+    Dim wasProtected As Boolean
+    Dim lastRow As Long, nCleared As Long
+
+    If Not SheetExists(INPUT_SHEET) Then
+        MsgBox "This workbook has no sheet named '" & INPUT_SHEET & "'.", vbExclamation, "Reset Input"
+        Exit Sub
+    End If
+
+    Set ws = ThisWorkbook.Worksheets(INPUT_SHEET)
+    lastRow = LastTemplateRow(ws)
+
+    If MsgBox("Delete ALL entered values of the '" & INPUT_SHEET & "' sheet " & _
+              "(rows " & INPUT_FIRST_DATA_ROW & "-" & lastRow & ") and start a new estimate?" & vbCrLf & vbCrLf & _
+              "Formulas are NOT touched - only typed-in values and pictures are removed." & vbCrLf & _
+              "Defaults of the columns " & RESET_KEEP_COLUMNS & " are kept." & vbCrLf & vbCrLf & _
+              "This cannot be undone.", _
+              vbExclamation + vbYesNo + vbDefaultButton2, "Reset Input") <> vbYes Then Exit Sub
+
+    SaveAppState
+    On Error GoTo Failed
+
+    wasProtected = UnprotectSheet(ws)
+    If ws.ProtectContents Then
+        RestoreAppState
+        MsgBox "The '" & INPUT_SHEET & "' sheet is password protected and could not be unlocked.", _
+               vbExclamation, "Reset Input"
+        Exit Sub
+    End If
+
+    nCleared = ClearEnteredValues(ws, INPUT_FIRST_DATA_ROW, lastRow)
+    If wasProtected Then ProtectSheet ws
+
+    RestoreAppState
+    Application.Calculate
+
+    MsgBox "The '" & INPUT_SHEET & "' sheet is ready for a new estimate." & vbCrLf & vbCrLf & _
+           "Cleared cells: " & nCleared & vbCrLf & _
+           "Rows: " & INPUT_FIRST_DATA_ROW & "-" & lastRow & vbCrLf & _
+           "All formulas are unchanged.", vbInformation, "Reset Input"
+    Exit Sub
+
+Failed:
+    Dim msg As String
+    msg = "Reset failed:" & vbCrLf & vbCrLf & "Error " & Err.Number & " - " & Err.Description
+    RestoreAppState
+    MsgBox msg, vbCritical, "Reset Input"
+End Sub
+
+
+'==============================================================================
+' ENTRY POINT: create a NEW, empty input worksheet.
+'
+' The "Input" sheet is duplicated with all its formulas and formatting, the copy
+' is emptied the same way as ResetInputSheet does, and the original sheet stays
+' exactly as it is.
+'
+' Note: the evaluation sheets (Overview, System, CBS, ...) keep referring to the
+' original "Input" sheet - the new sheet is a self contained working copy.
+'==============================================================================
+Public Sub NewInputSheet()
+    Dim srcWs As Worksheet, newWs As Worksheet
+    Dim lastRow As Long, nCleared As Long
+    Dim newName As String
+
+    If Not SheetExists(INPUT_SHEET) Then
+        MsgBox "This workbook has no sheet named '" & INPUT_SHEET & "'.", vbExclamation, "New Input Sheet"
+        Exit Sub
+    End If
+
+    Set srcWs = ThisWorkbook.Worksheets(INPUT_SHEET)
+    newName = UniqueSheetName(INPUT_SHEET & " (new)")
+
+    If MsgBox("Create the empty sheet '" & newName & "' as a copy of '" & INPUT_SHEET & "'?" & vbCrLf & vbCrLf & _
+              "All formulas and the formatting are taken over, all entered values " & _
+              "are removed. The existing '" & INPUT_SHEET & "' sheet is not changed." & vbCrLf & vbCrLf & _
+              "Note: Overview / System / CBS keep calculating from the original '" & _
+              INPUT_SHEET & "' sheet.", vbQuestion + vbYesNo, "New Input Sheet") <> vbYes Then Exit Sub
+
+    SaveAppState
+    On Error GoTo Failed
+
+    srcWs.Copy After:=srcWs
+    Set newWs = ThisWorkbook.Sheets(srcWs.Index + 1)
+    On Error Resume Next
+    newWs.Name = newName
+    Err.Clear
+    On Error GoTo Failed
+
+    UnprotectSheet newWs
+    lastRow = LastTemplateRow(newWs)
+    nCleared = ClearEnteredValues(newWs, INPUT_FIRST_DATA_ROW, lastRow)
+
+    RestoreAppState
+    Application.Calculate
+    newWs.Activate
+    newWs.Range("A" & INPUT_FIRST_DATA_ROW).Select
+
+    MsgBox "New input sheet created:  " & newWs.Name & vbCrLf & vbCrLf & _
+           "Cleared cells: " & nCleared & vbCrLf & _
+           "All formulas are unchanged.", vbInformation, "New Input Sheet"
+    Exit Sub
+
+Failed:
+    Dim msg As String
+    msg = "Could not create the new input sheet:" & vbCrLf & vbCrLf & _
+          "Error " & Err.Number & " - " & Err.Description
+    RestoreAppState
+    MsgBox msg, vbCritical, "New Input Sheet"
+End Sub
+
+
+'==============================================================================
+' Deletes every entered (non formula) value of the data area and returns how
+' many cells were cleared. Cells containing a formula are never touched, the
+' columns of RESET_KEEP_COLUMNS are skipped completely.
+'==============================================================================
+Private Function ClearEnteredValues(ws As Worksheet, ByVal firstRow As Long, _
+                                    ByVal lastRow As Long) As Long
+    Dim keep As Object
+    Dim lastCol As Long, c As Long, n As Long
+    Dim colRange As Range, consts As Range
+
+    If lastRow < firstRow Then Exit Function
+
+    Set keep = KeepColumnSet(ws)
+
+    lastCol = ws.Cells(INPUT_HEADER_ROW, ws.Columns.Count).End(xlToLeft).Column
+    If lastCol < COL_QTY Then lastCol = ws.UsedRange.Column + ws.UsedRange.Columns.Count - 1
+
+    ' one column at a time - constants are cleared, formulas stay untouched
+    For c = 1 To lastCol
+        If Not keep.Exists(c) Then
+            Set colRange = ws.Range(ws.Cells(firstRow, c), ws.Cells(lastRow, c))
+            Set consts = Nothing
+            On Error Resume Next
+            Set consts = colRange.SpecialCells(xlCellTypeConstants)
+            Err.Clear
+            On Error GoTo 0
+            If Not consts Is Nothing Then
+                n = n + consts.Count
+                consts.ClearContents
+            End If
+        End If
+    Next c
+
+    DeleteRowPictures ws, firstRow, lastRow
+    ClearEnteredValues = n
+End Function
+
+
+'==============================================================================
+' Column letters of RESET_KEEP_COLUMNS as a set of column numbers.
+'==============================================================================
+Private Function KeepColumnSet(ws As Worksheet) As Object
+    Dim d As Object
+    Dim parts As Variant, i As Long, s As String, c As Long
+
+    Set d = CreateObject("Scripting.Dictionary")
+    parts = Split(RESET_KEEP_COLUMNS, ",")
+
+    For i = LBound(parts) To UBound(parts)
+        s = Trim$(CStr(parts(i)))
+        If Len(s) > 0 Then
+            c = 0
+            On Error Resume Next
+            c = ws.Range(s & "1").Column
+            Err.Clear
+            On Error GoTo 0
+            If c > 0 Then
+                If Not d.Exists(c) Then d.Add c, True
+            End If
+        End If
+    Next i
+
+    Set KeepColumnSet = d
+End Function
 
 
 '==============================================================================

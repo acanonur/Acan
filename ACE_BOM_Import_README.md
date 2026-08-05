@@ -56,6 +56,7 @@ assign the macro `ImportBOM`.
 | `ImportBOM_SheetOnly`  | Only creates the `BOM Extract` copy sheet                        |
 | `ImportBOM_InputOnly`  | Only fills the `Input` sheet                                     |
 | `ClearBOMImport`       | Empties the part columns A–G of `Input` (values + pictures)      |
+| `FitPicturesToCells`   | Re-fits all thumbnails into their `Picture` cells                |
 | `ResetInputSheet`      | Empties the **whole** `Input` sheet for a new estimate — formulas stay |
 | `NewInputSheet`        | Creates a new, empty copy of the `Input` sheet                   |
 
@@ -119,10 +120,21 @@ A typical "new project" run is therefore: `ResetInputSheet` → `ImportBOM`.
   Note that emptying `B` (Lookup Key) makes the VLOOKUPs of column `R` (Material
   Consumption) show `#N/A` until new keys are entered — exactly as if you deleted
   the keys by hand. Take `B` out of `CLEAR_COLUMNS` if you want to keep them.
-* **Pictures.** Each thumbnail is copied into the `Picture` cell of its row,
-  scaled to fit the cell while keeping its aspect ratio, and centred. Row height
-  is raised to at least 45 pt where a picture is placed. Imported pictures are
-  named `BOMPIC_<row>` so `ClearBOMImport` can find them again.
+* **Pictures.** Each thumbnail is scaled into the `Picture` cell of its row —
+  aspect ratio kept, centred in the cell, row height raised to at least 45 pt —
+  and set to **Move and size with cells**, so it follows when you change the row
+  height or column width. Imported pictures are named `BOMPIC_<row>`; that name
+  is what `ClearBOMImport` and `FitPicturesToCells` use to find them again, even
+  if a picture was dragged somewhere else.
+  After all thumbnails are pasted the macro fits every one of them a second time,
+  so a hiccup during a single paste cannot leave a picture oversized.
+* **`FitPicturesToCells`** re-fits every thumbnail of the `Input` sheet into its
+  cell. Run it after changing row heights or column widths, or to repair
+  pictures that ended up at the wrong place.
+* **Cleaning up pictures.** `ClearBOMImport` and every new import delete all
+  imported pictures plus any picture sitting inside the data rows — including
+  ones that landed at the wrong position. The sheet logo above the data area is
+  kept.
 * **More BOM rows than prepared template rows.** The `Input` sheet ships with
   prepared rows 15–287. If the extraction is longer, the macro asks whether to
   extend the sheet by copying the last prepared row (with all its formulas) down,

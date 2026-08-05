@@ -21,8 +21,10 @@ Attribute VB_Name = "ACE_BOM_Import"
 '          Thumbnail (picture)        ->   F  Picture
 '          Qty                        ->   G  Qty System
 '
-'      Every other column of the Input sheet (Lookup Key, costs, factory,
-'      material, process, all formulas) is left untouched.
+'      The other part columns - B Lookup Key and E Other Reference - are
+'      emptied, because the extraction has nothing to fill them with.
+'      Everything else (costs, factory, material, process, all formulas) is
+'      left untouched.
 '
 ' Entry points (Alt+F8):
 '
@@ -56,6 +58,16 @@ Private Const COL_QTY As Long = 7            ' G - Qty System
 ' Column that carries a formula on every prepared template row. Used to find out
 ' how many prepared rows the Input sheet has (column I = "Total Cost").
 Private Const TEMPLATE_PROBE_COL As String = "I"
+
+' Part related entry columns. They are emptied before every import and by
+' ClearBOMImport, so that nothing of the previous BOM stays behind:
+'   A Level   B Lookup Key   C Part Number   D Name
+'   E Other Reference        F Picture       G Qty System
+' Cells containing a formula are never removed, only entered values.
+' Note: emptying B (Lookup Key) makes the VLOOKUPs of column R (Material
+' Consumption) show #N/A until new keys are entered - that is the same as
+' deleting the keys by hand. Remove "B" here if you want to keep them.
+Private Const CLEAR_COLUMNS As String = "A,B,C,D,E,F,G"
 
 '--- Behaviour ----------------------------------------------------------------
 Private Const BOM_SHEET_NAME As String = "BOM Extract"
@@ -251,7 +263,7 @@ End Sub
 Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As Worksheet, _
                            ByRef nRows As Long, ByRef nPics As Long, ByRef nSkipped As Long)
     Dim cLevel As Long, cPart As Long, cDesc As Long, cQty As Long
-    Dim lastTemplateRow As Long, capacity As Long
+    Dim preparedLastRow As Long, capacity As Long
     Dim levels As Variant, parts As Variant, descs As Variant, qtys As Variant
     Dim pics As Object
     Dim i As Long, srcRow As Long, tgtRow As Long
@@ -266,12 +278,12 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
     If cPart = 0 Then Err.Raise ERR_NO_PARTNUM, , "No 'Part Number' column found in the extraction."
 
     '--- how many prepared rows does the template offer? ----------------------
-    lastTemplateRow = LastTemplateRow(inputWs)
-    capacity = lastTemplateRow - INPUT_FIRST_DATA_ROW + 1
+    preparedLastRow = LastTemplateRow(inputWs)
+    capacity = preparedLastRow - INPUT_FIRST_DATA_ROW + 1
 
     If nRows > capacity Then
         answer = MsgBox("The extraction has " & nRows & " rows but the Input sheet only has " & _
-                        capacity & " prepared rows (" & INPUT_FIRST_DATA_ROW & ":" & lastTemplateRow & ")." & vbCrLf & vbCrLf & _
+                        capacity & " prepared rows (" & INPUT_FIRST_DATA_ROW & ":" & preparedLastRow & ")." & vbCrLf & vbCrLf & _
                         "Yes  = extend the sheet by copying the last prepared row down" & vbCrLf & _
                         "No   = import the first " & capacity & " rows only" & vbCrLf & _
                         "Cancel = abort", vbQuestion + vbYesNoCancel, "BOM Import")
@@ -279,8 +291,8 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
             Case vbCancel
                 Err.Raise ERR_USER_CANCEL, , "Import cancelled by the user."
             Case vbYes
-                If ExtendTemplate(inputWs, lastTemplateRow, INPUT_FIRST_DATA_ROW + nRows - 1) Then
-                    lastTemplateRow = INPUT_FIRST_DATA_ROW + nRows - 1
+                If ExtendTemplate(inputWs, preparedLastRow, INPUT_FIRST_DATA_ROW + nRows - 1) Then
+                    preparedLastRow = INPUT_FIRST_DATA_ROW + nRows - 1
                     capacity = nRows
                 End If
         End Select
@@ -298,7 +310,7 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
 
     '--- clear the previous import --------------------------------------------
     Application.StatusBar = "BOM import: clearing previous import ..."
-    ClearInputRange inputWs, INPUT_FIRST_DATA_ROW, lastTemplateRow
+    ClearInputRange inputWs, INPUT_FIRST_DATA_ROW, preparedLastRow
 
     '--- write the values (one shot per column) -------------------------------
     Application.StatusBar = "BOM import: writing " & nRows & " rows ..."
@@ -429,8 +441,11 @@ Public Sub ClearBOMImport()
     Dim wasProtected As Boolean
 
     If Not SheetExists(INPUT_SHEET) Then Exit Sub
-    If MsgBox("Clear Level / Part Number / Name / Qty and all imported pictures " & _
-              "from the '" & INPUT_SHEET & "' sheet?", vbQuestion + vbYesNo, "BOM Import") <> vbYes Then Exit Sub
+    If MsgBox("Clear the part columns " & CLEAR_COLUMNS & vbCrLf & _
+              "(Level, Lookup Key, Part Number, Name, Other Reference, Picture, Qty) " & _
+              "of the '" & INPUT_SHEET & "' sheet?" & vbCrLf & vbCrLf & _
+              "Formulas and all other columns stay untouched.", _
+              vbQuestion + vbYesNo, "BOM Import") <> vbYes Then Exit Sub
 
     Set ws = ThisWorkbook.Worksheets(INPUT_SHEET)
     SaveAppState
@@ -446,12 +461,26 @@ End Sub
 ' Formulas and all other columns are untouched.
 '==============================================================================
 Private Sub ClearInputRange(ws As Worksheet, ByVal firstRow As Long, ByVal lastRow As Long)
+    Dim cols As Object, key As Variant, c As Long
+    Dim colRange As Range, consts As Range
+
     If lastRow < firstRow Then Exit Sub
 
-    ws.Cells(firstRow, COL_PARTNUM).Resize(lastRow - firstRow + 1, 1).ClearContents
-    ws.Cells(firstRow, COL_NAME).Resize(lastRow - firstRow + 1, 1).ClearContents
-    ws.Cells(firstRow, COL_QTY).Resize(lastRow - firstRow + 1, 1).ClearContents
-    If WRITE_LEVEL Then ws.Cells(firstRow, COL_LEVEL).Resize(lastRow - firstRow + 1, 1).ClearContents
+    Set cols = ColumnSet(ws, CLEAR_COLUMNS)
+
+    For Each key In cols.Keys
+        c = CLng(key)
+        ' the level column is only cleared if the import writes it again
+        If c <> COL_LEVEL Or WRITE_LEVEL Then
+            Set colRange = ws.Range(ws.Cells(firstRow, c), ws.Cells(lastRow, c))
+            Set consts = Nothing
+            On Error Resume Next
+            Set consts = colRange.SpecialCells(xlCellTypeConstants)
+            Err.Clear
+            On Error GoTo 0
+            If Not consts Is Nothing Then consts.ClearContents
+        End If
+    Next key
 
     DeleteRowPictures ws, firstRow, lastRow
 End Sub
@@ -624,7 +653,7 @@ Private Function ClearEnteredValues(ws As Worksheet, ByVal firstRow As Long, _
 
     If lastRow < firstRow Then Exit Function
 
-    Set keep = KeepColumnSet(ws)
+    Set keep = ColumnSet(ws, RESET_KEEP_COLUMNS)
 
     lastCol = ws.Cells(INPUT_HEADER_ROW, ws.Columns.Count).End(xlToLeft).Column
     If lastCol < COL_QTY Then lastCol = ws.UsedRange.Column + ws.UsedRange.Columns.Count - 1
@@ -651,14 +680,14 @@ End Function
 
 
 '==============================================================================
-' Column letters of RESET_KEEP_COLUMNS as a set of column numbers.
+' Turns a list of column letters ("A,B,AA") into a set of column numbers.
 '==============================================================================
-Private Function KeepColumnSet(ws As Worksheet) As Object
+Private Function ColumnSet(ws As Worksheet, ByVal letters As String) As Object
     Dim d As Object
     Dim parts As Variant, i As Long, s As String, c As Long
 
     Set d = CreateObject("Scripting.Dictionary")
-    parts = Split(RESET_KEEP_COLUMNS, ",")
+    parts = Split(letters, ",")
 
     For i = LBound(parts) To UBound(parts)
         s = Trim$(CStr(parts(i)))
@@ -674,7 +703,7 @@ Private Function KeepColumnSet(ws As Worksheet) As Object
         End If
     Next i
 
-    Set KeepColumnSet = d
+    Set ColumnSet = d
 End Function
 
 
@@ -751,20 +780,20 @@ End Sub
 '==============================================================================
 ' Copies the last prepared template row down so that more BOM rows fit.
 '==============================================================================
-Private Function ExtendTemplate(ws As Worksheet, ByVal lastTemplateRow As Long, _
+Private Function ExtendTemplate(ws As Worksheet, ByVal preparedLastRow As Long, _
                                 ByVal neededLastRow As Long) As Boolean
     On Error GoTo Failed
-    If neededLastRow <= lastTemplateRow Then
+    If neededLastRow <= preparedLastRow Then
         ExtendTemplate = True
         Exit Function
     End If
 
-    ws.Rows(lastTemplateRow).Copy _
-        Destination:=ws.Rows(lastTemplateRow + 1 & ":" & neededLastRow)
+    ws.Rows(preparedLastRow).Copy _
+        Destination:=ws.Rows(preparedLastRow + 1 & ":" & neededLastRow)
     Application.CutCopyMode = False
 
     ' the copied rows must not carry the values of the source row
-    ClearInputRange ws, lastTemplateRow + 1, neededLastRow
+    ClearInputRange ws, preparedLastRow + 1, neededLastRow
 
     ExtendTemplate = True
     Exit Function

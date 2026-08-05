@@ -24,9 +24,13 @@ One run does two things:
 
 Data is written from row 15 downwards (row 14 is the header row).
 
-Everything else on the `Input` sheet is left untouched — `B` Lookup Key, the
-cost columns, factory/country, material, process and every formula stay exactly
-as they are, so the cost model keeps working after an import.
+`B` Lookup Key and `E` Other Reference are **emptied** as well — the extraction
+has nothing to fill them with, and stale keys of the previous BOM would be worse
+than empty ones.
+
+Everything else on the `Input` sheet is left untouched — the cost columns,
+factory/country, material, process and every formula stay exactly as they are,
+so the cost model keeps working after an import.
 
 Headers are matched by name, not by position, so the extraction columns may sit
 anywhere and the header row may be any of the first 20 rows. Accepted synonyms:
@@ -51,9 +55,16 @@ assign the macro `ImportBOM`.
 | `ImportBOM`            | Normal use — creates the `BOM Extract` sheet **and** fills `Input` |
 | `ImportBOM_SheetOnly`  | Only creates the `BOM Extract` copy sheet                        |
 | `ImportBOM_InputOnly`  | Only fills the `Input` sheet                                     |
-| `ClearBOMImport`       | Removes imported values and pictures from `Input` again          |
+| `ClearBOMImport`       | Empties the part columns A–G of `Input` (values + pictures)      |
 | `ResetInputSheet`      | Empties the **whole** `Input` sheet for a new estimate — formulas stay |
 | `NewInputSheet`        | Creates a new, empty copy of the `Input` sheet                   |
+
+A file dialog asks for the extraction file (it starts in the folder of the ACE
+workbook). If that file is already open in Excel it is reused and left open;
+otherwise it is opened read-only and closed again straight away.
+
+At the end a summary reports how many rows and pictures were imported and how
+long it took.
 
 ## Starting a new estimate
 
@@ -97,18 +108,17 @@ working copy, e.g. for a variant or a second BOM.
 
 A typical "new project" run is therefore: `ResetInputSheet` → `ImportBOM`.
 
-A file dialog asks for the extraction file (it starts in the folder of the ACE
-workbook). If that file is already open in Excel it is reused and left open;
-otherwise it is opened read-only and closed again straight away.
-
-At the end a summary reports how many rows and pictures were imported and how
-long it took.
-
 ## Behaviour details
 
-* **Re-importable.** Every run first clears the previously imported values
-  (columns A, C, D, G) and all pictures in column F of the data area, so
-  importing a second BOM never leaves leftovers of the first one.
+* **Re-importable.** Every run first empties the part columns
+  `A` Level, `B` Lookup Key, `C` Part Number, `D` Name, `E` Other Reference,
+  `F` Picture and `G` Qty System (constant `CLEAR_COLUMNS`) including all
+  pictures of the data area, so nothing of the previous BOM stays behind.
+  `B` and `E` are cleared but not refilled — the extraction has nothing to put
+  there. Cells containing a **formula are never removed**, only entered values.
+  Note that emptying `B` (Lookup Key) makes the VLOOKUPs of column `R` (Material
+  Consumption) show `#N/A` until new keys are entered — exactly as if you deleted
+  the keys by hand. Take `B` out of `CLEAR_COLUMNS` if you want to keep them.
 * **Pictures.** Each thumbnail is copied into the `Picture` cell of its row,
   scaled to fit the cell while keeping its aspect ratio, and centred. Row height
   is raised to at least 45 pt where a picture is placed. Imported pictures are
@@ -140,6 +150,7 @@ Constants at the top of the module:
 | `MIN_PIC_ROW_HEIGHT`    | `45`           | Minimum row height for rows with a picture    |
 | `INPUT_FIRST_DATA_ROW`  | `15`           | First data row of the `Input` sheet           |
 | `RESET_KEEP_COLUMNS`    | `K,L,AA,AE,AH,AI,AN,AO,AP,BC` | Columns whose defaults a reset keeps |
+| `CLEAR_COLUMNS`         | `A,B,C,D,E,F,G` | Part columns emptied before every import |
 
 ## Good to know about the reset
 

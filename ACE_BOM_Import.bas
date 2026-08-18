@@ -32,6 +32,8 @@ Attribute VB_Name = "ACE_BOM_Import"
 '      ImportBOM_SheetOnly      - only creates the "BOM Extract" copy sheet
 '      ImportBOM_InputOnly      - only fills the Input sheet
 '      ClearBOMImport           - removes imported values + pictures from Input
+'      FitPicturesToCells       - re-fits all thumbnails into their Picture
+'                                 cells (after changing row heights e.g.)
 '      ResetInputSheet          - empties the whole Input sheet for a new
 '                                 estimate; all formulas stay untouched
 '      NewInputSheet            - creates a new, empty copy of the Input sheet
@@ -265,7 +267,8 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
     Dim cLevel As Long, cPart As Long, cDesc As Long, cQty As Long
     Dim preparedLastRow As Long, capacity As Long
     Dim levels As Variant, parts As Variant, descs As Variant, qtys As Variant
-    Dim pics As Object
+    Dim pics As Object, knownNames As Object
+    Dim shp As Object
     Dim i As Long, srcRow As Long, tgtRow As Long
     Dim answer As VbMsgBoxResult
     Dim prevActive As Object
@@ -332,6 +335,15 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
     ThisWorkbook.Activate
     inputWs.Activate
 
+    ' names of the shapes that are already there - used to identify each paste
+    Set knownNames = CreateObject("Scripting.Dictionary")
+    On Error Resume Next
+    For Each shp In inputWs.Shapes
+        If Not knownNames.Exists(shp.Name) Then knownNames.Add shp.Name, True
+    Next shp
+    Err.Clear
+    On Error GoTo 0
+
     For i = 1 To nRows
         srcRow = hdrRow + i
         tgtRow = INPUT_FIRST_DATA_ROW + i - 1
@@ -340,71 +352,186 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
                 Application.StatusBar = "BOM import: copying picture " & i & " of " & nRows & " ..."
                 DoEvents
             End If
-            If CopyPictureToCell(pics(srcRow), inputWs, tgtRow, COL_PICTURE) Then nPics = nPics + 1
+            If CopyPictureToCell(pics(srcRow), inputWs, tgtRow, COL_PICTURE, knownNames) Then nPics = nPics + 1
         End If
     Next i
 
+    ' safety net: fit everything once more, whatever happened during the pasting
+    Application.StatusBar = "BOM import: fitting pictures into their cells ..."
     On Error Resume Next
+    For Each shp In inputWs.Shapes
+        tgtRow = PictureRowOf(shp)
+        If tgtRow >= INPUT_FIRST_DATA_ROW Then FitShapeToCell shp, inputWs, tgtRow, COL_PICTURE
+    Next shp
+
     inputWs.Range("A" & INPUT_FIRST_DATA_ROW).Select
     If Not prevActive Is Nothing Then prevActive.Activate
+    Err.Clear
     On Error GoTo 0
 End Sub
 
 
 '==============================================================================
 ' Copies one thumbnail into the Picture column and fits it into the cell.
+'
+' knownNames holds the names of all shapes that were already on the sheet, so
+' the pasted shape can be identified reliably (the paste itself lands wherever
+' Excel wants - the fit afterwards puts it into its cell).
 '==============================================================================
 Private Function CopyPictureToCell(srcShape As Object, tgtWs As Worksheet, _
-                                   ByVal r As Long, ByVal c As Long) As Boolean
+                                   ByVal r As Long, ByVal c As Long, _
+                                   knownNames As Object) As Boolean
     Dim newShp As Object
-    Dim cel As Range
-    Dim before As Long, tries As Long
-    Dim maxW As Double, maxH As Double, f As Double
+    Dim i As Long, before As Long, tries As Long
 
-    On Error GoTo Failed
-
-    Set cel = tgtWs.Cells(r, c)
-    If tgtWs.Rows(r).RowHeight < MIN_PIC_ROW_HEIGHT Then
-        tgtWs.Rows(r).RowHeight = MIN_PIC_ROW_HEIGHT
-    End If
+    On Error Resume Next
 
     before = tgtWs.Shapes.Count
+
+    ' paste next to the target cell - if anything below fails, the picture is at
+    ' least in the right region of the sheet
+    tgtWs.Cells(r, c).Select
+
     For tries = 1 To 3
+        Err.Clear
         srcShape.Copy
         DoEvents
         tgtWs.Paste
-        If tgtWs.Shapes.Count > before Then Exit For
         DoEvents
+        If tgtWs.Shapes.Count > before Then Exit For
     Next tries
     Application.CutCopyMode = False
-    If tgtWs.Shapes.Count <= before Then GoTo Failed
+    If tgtWs.Shapes.Count <= before Then
+        Err.Clear
+        Exit Function                                   ' nothing was pasted
+    End If
 
-    Set newShp = tgtWs.Shapes(tgtWs.Shapes.Count)
+    ' the new shape is the one whose name was not there before
+    For i = tgtWs.Shapes.Count To 1 Step -1
+        If Not knownNames.Exists(tgtWs.Shapes(i).Name) Then
+            Set newShp = tgtWs.Shapes(i)
+            Exit For
+        End If
+    Next i
+    If newShp Is Nothing Then Set newShp = tgtWs.Shapes(tgtWs.Shapes.Count)
+
     newShp.Name = PIC_TAG & r
-    newShp.LockAspectRatio = False
+    If Not knownNames.Exists(newShp.Name) Then knownNames.Add newShp.Name, True
+
+    CopyPictureToCell = FitShapeToCell(newShp, tgtWs, r, c)
+    Err.Clear
+End Function
+
+
+'==============================================================================
+' Scales a picture into its cell (keeping the aspect ratio), centres it there
+' and lets it move AND size with the cell afterwards.
+'
+' Every step has its own error trap, so one failing property can never stop the
+' whole fit - that is what left the thumbnails at their paste position before.
+'==============================================================================
+Private Function FitShapeToCell(shp As Object, ws As Worksheet, _
+                                ByVal r As Long, ByVal c As Long) As Boolean
+    Dim cel As Range
+    Dim w As Double, h As Double
+    Dim maxW As Double, maxH As Double, f As Double
+
+    On Error Resume Next
+
+    Set cel = ws.Cells(r, c)
+    If cel Is Nothing Then Exit Function
+
+    If ws.Rows(r).RowHeight < MIN_PIC_ROW_HEIGHT Then ws.Rows(r).RowHeight = MIN_PIC_ROW_HEIGHT
+
+    ' size the picture freely while it is being fitted
+    shp.Placement = xlFreeFloating
+    shp.LockAspectRatio = False
+
+    w = 0: h = 0
+    w = shp.Width
+    h = shp.Height
+    If w <= 0 Or h <= 0 Then
+        Err.Clear
+        Exit Function
+    End If
 
     maxW = cel.Width - 2 * PIC_MARGIN
     maxH = cel.Height - 2 * PIC_MARGIN
     If maxW < 5 Then maxW = 5
     If maxH < 5 Then maxH = 5
 
-    If newShp.Width > 0 And newShp.Height > 0 Then
-        f = maxW / newShp.Width
-        If maxH / newShp.Height < f Then f = maxH / newShp.Height
-        newShp.Width = newShp.Width * f
-        newShp.Height = newShp.Height * f
+    f = maxW / w
+    If maxH / h < f Then f = maxH / h
+
+    shp.Width = w * f
+    shp.Height = h * f
+    shp.Left = cel.Left + (cel.Width - shp.Width) / 2
+    shp.Top = cel.Top + (cel.Height - shp.Height) / 2
+    shp.Placement = xlMoveAndSize                  ' move and size with the cell
+
+    FitShapeToCell = (Err.Number = 0)
+    Err.Clear
+End Function
+
+
+'==============================================================================
+' ENTRY POINT: re-fit all imported thumbnails into their Picture cells.
+'
+' Run this after changing row heights or column widths, or to repair pictures
+' that ended up at the wrong place.
+'==============================================================================
+Public Sub FitPicturesToCells()
+    Dim ws As Worksheet
+    Dim shp As Object
+    Dim wasProtected As Boolean
+    Dim r As Long, n As Long
+
+    If Not SheetExists(INPUT_SHEET) Then Exit Sub
+    Set ws = ThisWorkbook.Worksheets(INPUT_SHEET)
+
+    SaveAppState
+    wasProtected = UnprotectSheet(ws)
+
+    On Error Resume Next
+    For Each shp In ws.Shapes
+        r = PictureRowOf(shp)
+        If r >= INPUT_FIRST_DATA_ROW Then
+            If FitShapeToCell(shp, ws, r, COL_PICTURE) Then n = n + 1
+        End If
+    Next shp
+    Err.Clear
+    On Error GoTo 0
+
+    If wasProtected Then ProtectSheet ws
+    RestoreAppState
+
+    MsgBox n & " picture(s) fitted into the Picture column.", vbInformation, "BOM Import"
+End Sub
+
+
+'==============================================================================
+' Row a picture of the Input sheet belongs to, 0 if it is not a data picture.
+' Imported pictures carry their row in the name (BOMPIC_<row>), which also works
+' when the picture has been dragged somewhere else.
+'==============================================================================
+Private Function PictureRowOf(shp As Object) As Long
+    Dim s As String, r As Long
+
+    On Error Resume Next
+
+    s = shp.Name
+    If InStr(1, s, PIC_TAG, vbTextCompare) = 1 Then
+        s = Mid$(s, Len(PIC_TAG) + 1)
+        If IsNumeric(s) Then PictureRowOf = CLng(s)
+        Err.Clear
+        Exit Function
     End If
 
-    newShp.Left = cel.Left + (cel.Width - newShp.Width) / 2
-    newShp.Top = cel.Top + (cel.Height - newShp.Height) / 2
-    newShp.Placement = xlMove                       ' move but don't size with cells
-
-    CopyPictureToCell = True
-    Exit Function
-
-Failed:
-    Application.CutCopyMode = False
-    CopyPictureToCell = False
+    If shp.Type = SHP_PICTURE Or shp.Type = SHP_LINKED_PICTURE Then
+        r = 0
+        r = shp.TopLeftCell.Row
+        If r >= INPUT_FIRST_DATA_ROW Then PictureRowOf = r
+    End If
     Err.Clear
 End Function
 
@@ -494,18 +621,19 @@ End Sub
 Private Sub DeleteRowPictures(ws As Worksheet, ByVal firstRow As Long, ByVal lastRow As Long)
     Dim shp As Object, i As Long
     Dim doomed As Collection
-    Dim r As Long, c As Long
+    Dim r As Long
 
     Set doomed = New Collection
     On Error Resume Next
     For Each shp In ws.Shapes
-        r = 0: c = 0
+        r = 0
         r = shp.TopLeftCell.Row
-        c = shp.TopLeftCell.Column
         If InStr(1, shp.Name, PIC_TAG, vbTextCompare) = 1 Then
-            doomed.Add shp
+            doomed.Add shp                              ' imported, wherever it sits
         ElseIf (shp.Type = SHP_PICTURE Or shp.Type = SHP_LINKED_PICTURE) Then
-            If c = COL_PICTURE And r >= firstRow And r <= lastRow Then doomed.Add shp
+            ' any picture inside the data rows - also one that was dropped at the
+            ' wrong place; the sheet logo sits above the data area and is kept
+            If r >= firstRow And r <= lastRow Then doomed.Add shp
         End If
     Next shp
     For i = 1 To doomed.Count

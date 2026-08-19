@@ -38,6 +38,8 @@ Attribute VB_Name = "ACE_BOM_Import"
 '                                 estimate; all formulas stay untouched
 '      NewInputSheet            - creates a new, empty copy of the Input sheet
 '                                 (formulas + formatting kept, values removed)
+'      CreateMacroButtons       - puts the two push buttons [ Import BOM ] and
+'                                 [ Clean Input ] on the Input sheet
 '
 ' Installation:
 '      Excel -> Alt+F11 -> File -> Import File... -> ACE_BOM_Import.bas
@@ -61,15 +63,19 @@ Private Const COL_QTY As Long = 7            ' G - Qty System
 ' how many prepared rows the Input sheet has (column I = "Total Cost").
 Private Const TEMPLATE_PROBE_COL As String = "I"
 
-' Part related entry columns. They are emptied before every import and by
+' Entry columns of a BOM line. They are emptied before every import and by
 ' ClearBOMImport, so that nothing of the previous BOM stays behind:
-'   A Level   B Lookup Key   C Part Number   D Name
-'   E Other Reference        F Picture       G Qty System
+'   A  Level                B  Lookup Key           C  Part Number
+'   D  Name                 E  Other Reference      F  Picture
+'   G  Qty System           P  Material Reference   Q  Description / Comments
+'   AC Process Reference    AD Process Description  AH Process Time
+'   AI Direct Operator      AN Qty Operators setup  AO Set Up Time / Lot Size
+'   AP Other Setup Cost
 ' Cells containing a formula are never removed, only entered values.
-' Note: emptying B (Lookup Key) makes the VLOOKUPs of column R (Material
-' Consumption) show #N/A until new keys are entered - that is the same as
-' deleting the keys by hand. Remove "B" here if you want to keep them.
-Private Const CLEAR_COLUMNS As String = "A,B,C,D,E,F,G"
+' Note: emptying B (Lookup Key), P (Material Reference) and Q (Comments) makes
+' the VLOOKUPs of the columns R / S / T show #N/A until new entries are made -
+' that is the same as deleting those cells by hand.
+Private Const CLEAR_COLUMNS As String = "A,B,C,D,E,F,G,P,Q,AC,AD,AH,AI,AN,AO,AP"
 
 '--- Behaviour ----------------------------------------------------------------
 Private Const BOM_SHEET_NAME As String = "BOM Extract"
@@ -81,13 +87,20 @@ Private Const MIN_PIC_ROW_HEIGHT As Double = 45#
 
 ' Columns that keep their template defaults when the Input sheet is emptied.
 ' They are entered values as well, but the model needs them to stay valid:
-'   K  Company (AGG)    L  Country (DEU)     AA Process Type (None)
-'   AE Lot Size (1)     AH Process Time      AI Direct Operator
-'   AN Qty Operators    AO Set Up Time       AP Other Setup Cost
-'   BC Valuation Method (Industrial)
-' Emptying AE would produce #DIV/0! in the setup cost, emptying K would set all
-' factory rates to 0. Add or remove letters here to change what a reset keeps.
-Private Const RESET_KEEP_COLUMNS As String = "K,L,AA,AE,AH,AI,AN,AO,AP,BC"
+'   K  Company (AGG)    L  Country (DEU)   AA Process Type (None)
+'   AE Lot Size (1)     BC Valuation Method (Industrial)
+' Emptying AE would produce #DIV/0! in the setup cost (it is a divisor),
+' emptying K would set all factory rates to 0. Add or remove letters here to
+' change what a reset keeps.
+Private Const RESET_KEEP_COLUMNS As String = "K,L,AA,AE,BC"
+
+'--- Push buttons on the Input sheet (CreateMacroButtons) ---------------------
+Private Const BUTTON_ANCHOR_CELL As String = "F5"   ' top left corner of the first button
+Private Const BUTTON_WIDTH As Double = 100#
+Private Const BUTTON_HEIGHT As Double = 30#
+Private Const BUTTON_GAP As Double = 8#
+Private Const BTN_IMPORT_NAME As String = "btnImportBOM"
+Private Const BTN_CLEAN_NAME As String = "btnCleanInput"
 
 '--- Shape type constants (avoids a hard reference to the Office library) ------
 Private Const SHP_PICTURE As Long = 13
@@ -568,9 +581,16 @@ Public Sub ClearBOMImport()
     Dim wasProtected As Boolean
 
     If Not SheetExists(INPUT_SHEET) Then Exit Sub
-    If MsgBox("Clear the part columns " & CLEAR_COLUMNS & vbCrLf & _
-              "(Level, Lookup Key, Part Number, Name, Other Reference, Picture, Qty) " & _
-              "of the '" & INPUT_SHEET & "' sheet?" & vbCrLf & vbCrLf & _
+    If MsgBox("Clear the entry columns of the '" & INPUT_SHEET & "' sheet?" & vbCrLf & vbCrLf & _
+              "A  Level" & vbTab & vbTab & "B  Lookup Key" & vbCrLf & _
+              "C  Part Number" & vbTab & "D  Name" & vbCrLf & _
+              "E  Other Reference" & vbTab & "F  Picture" & vbCrLf & _
+              "G  Qty System" & vbTab & "P  Material Reference" & vbCrLf & _
+              "Q  Description / Comments" & vbTab & "AC Process Reference" & vbCrLf & _
+              "AD Process Description" & vbTab & "AH Process Time" & vbCrLf & _
+              "AI Direct Operator" & vbTab & "AN Qty Operators for setup" & vbCrLf & _
+              "AO Set Up Time per Lot Size" & vbTab & "AP Other Setup Cost" & vbCrLf & vbCrLf & _
+              "... and all pictures of the data area." & vbCrLf & _
               "Formulas and all other columns stay untouched.", _
               vbQuestion + vbYesNo, "BOM Import") <> vbYes Then Exit Sub
 
@@ -580,6 +600,102 @@ Public Sub ClearBOMImport()
     ClearInputRange ws, INPUT_FIRST_DATA_ROW, LastTemplateRow(ws)
     If wasProtected Then ProtectSheet ws
     RestoreAppState
+End Sub
+
+
+'==============================================================================
+' ENTRY POINT: put the two push buttons on the Input sheet.
+'
+'   [ Import BOM ]   -> ImportBOM
+'   [ Clean Input ]  -> ClearBOMImport
+'
+' Run once; the buttons are saved with the workbook. Running it again simply
+' replaces the two buttons (nothing is duplicated).
+'==============================================================================
+Public Sub CreateMacroButtons()
+    Dim ws As Worksheet
+    Dim anchor As Range
+    Dim wasProtected As Boolean
+
+    If Not SheetExists(INPUT_SHEET) Then
+        MsgBox "This workbook has no sheet named '" & INPUT_SHEET & "'.", vbExclamation, "BOM Import"
+        Exit Sub
+    End If
+
+    Set ws = ThisWorkbook.Worksheets(INPUT_SHEET)
+    SaveAppState
+    wasProtected = UnprotectSheet(ws)
+
+    On Error Resume Next
+    Set anchor = ws.Range(BUTTON_ANCHOR_CELL)
+    If anchor Is Nothing Then Set anchor = ws.Range("F5")
+    Err.Clear
+    On Error GoTo 0
+
+    DeleteShapeByName ws, BTN_IMPORT_NAME
+    DeleteShapeByName ws, BTN_CLEAN_NAME
+
+    AddMacroButton ws, BTN_IMPORT_NAME, "Import BOM", "ImportBOM", _
+                   anchor.Left, anchor.Top, BUTTON_WIDTH, BUTTON_HEIGHT
+    AddMacroButton ws, BTN_CLEAN_NAME, "Clean Input", "ClearBOMImport", _
+                   anchor.Left + BUTTON_WIDTH + BUTTON_GAP, anchor.Top, _
+                   BUTTON_WIDTH, BUTTON_HEIGHT
+
+    If wasProtected Then ProtectSheet ws
+    RestoreAppState
+
+    MsgBox "The buttons  [ Import BOM ]  and  [ Clean Input ]  are on the '" & _
+           INPUT_SHEET & "' sheet (at " & BUTTON_ANCHOR_CELL & ")." & vbCrLf & vbCrLf & _
+           "Save the workbook to keep them." & vbCrLf & _
+           "To move a button: right-click it and drag it to its place.", _
+           vbInformation, "BOM Import"
+End Sub
+
+
+'==============================================================================
+' Creates one form control button and links it to a macro.
+'==============================================================================
+Private Sub AddMacroButton(ws As Worksheet, ByVal shapeName As String, ByVal caption As String, _
+                           ByVal macroName As String, ByVal posLeft As Double, ByVal posTop As Double, _
+                           ByVal w As Double, ByVal h As Double)
+    Dim btn As Object
+
+    On Error Resume Next
+    Set btn = ws.Buttons.Add(posLeft, posTop, w, h)
+    If btn Is Nothing Then
+        ' fall back to the shape based form control
+        Set btn = ws.Shapes.AddFormControl(0, posLeft, posTop, w, h)   ' 0 = xlButtonControl
+    End If
+    If btn Is Nothing Then
+        Err.Clear
+        Exit Sub
+    End If
+
+    btn.Name = shapeName
+    btn.OnAction = macroName
+    btn.Placement = xlMove                     ' move with the cells, keep the size
+
+    ' caption + font - whichever of the two flavours answers, the other call
+    ' simply fails silently
+    btn.Characters.Text = caption
+    btn.Characters.Font.Bold = True
+    btn.Characters.Font.Size = 10
+    Err.Clear
+
+    btn.TextFrame.Characters.Text = caption
+    btn.TextFrame.Characters.Font.Bold = True
+    btn.TextFrame.Characters.Font.Size = 10
+    Err.Clear
+End Sub
+
+
+'==============================================================================
+' Deletes a shape by name if it exists.
+'==============================================================================
+Private Sub DeleteShapeByName(ws As Worksheet, ByVal shapeName As String)
+    On Error Resume Next
+    ws.Shapes(shapeName).Delete
+    Err.Clear
 End Sub
 
 

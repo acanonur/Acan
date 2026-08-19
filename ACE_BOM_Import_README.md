@@ -24,13 +24,14 @@ One run does two things:
 
 Data is written from row 15 downwards (row 14 is the header row).
 
-`B` Lookup Key and `E` Other Reference are **emptied** as well — the extraction
-has nothing to fill them with, and stale keys of the previous BOM would be worse
-than empty ones.
+Before writing, the macro empties all entry columns of a BOM line (see
+*Cleaning* below), so nothing of the previous BOM stays behind. The columns it
+cannot fill from the extraction — Lookup Key, Material Reference, process
+entries — simply stay empty.
 
 Everything else on the `Input` sheet is left untouched — the cost columns,
-factory/country, material, process and every formula stay exactly as they are,
-so the cost model keeps working after an import.
+factory/country, material, and every formula stay exactly as they are, so the
+cost model keeps working after an import.
 
 Headers are matched by name, not by position, so the extraction columns may sit
 anywhere and the header row may be any of the first 20 rows. Accepted synonyms:
@@ -43,8 +44,9 @@ anywhere and the header row may be any of the first 20 rows. Accepted synonyms:
 2. `Alt` + `F11` → **File → Import File…** → select `ACE_BOM_Import.bas`.
 3. Close the VBA editor and save the workbook as `.xlsm` (macro-enabled).
 
-Optional: put a button on the `Input` sheet (Developer → Insert → Button) and
-assign the macro `ImportBOM`.
+4. Run `CreateMacroButtons` once (`Alt` + `F8`) — it puts the two push buttons
+   **[ Import BOM ]** and **[ Clean Input ]** on the `Input` sheet. Save again
+   to keep them.
 
 ## Usage
 
@@ -55,10 +57,11 @@ assign the macro `ImportBOM`.
 | `ImportBOM`            | Normal use — creates the `BOM Extract` sheet **and** fills `Input` |
 | `ImportBOM_SheetOnly`  | Only creates the `BOM Extract` copy sheet                        |
 | `ImportBOM_InputOnly`  | Only fills the `Input` sheet                                     |
-| `ClearBOMImport`       | Empties the part columns A–G of `Input` (values + pictures)      |
+| `ClearBOMImport`       | **Cleaning** — empties all entry columns of `Input` (values + pictures) |
 | `FitPicturesToCells`   | Re-fits all thumbnails into their `Picture` cells                |
 | `ResetInputSheet`      | Empties the **whole** `Input` sheet for a new estimate — formulas stay |
 | `NewInputSheet`        | Creates a new, empty copy of the `Input` sheet                   |
+| `CreateMacroButtons`   | Puts the two push buttons on the `Input` sheet (run once)        |
 
 A file dialog asks for the extraction file (it starts in the folder of the ACE
 workbook). If that file is already open in Excel it is reused and left open;
@@ -66,6 +69,33 @@ otherwise it is opened read-only and closed again straight away.
 
 At the end a summary reports how many rows and pictures were imported and how
 long it took.
+
+## Cleaning — `ClearBOMImport`
+
+Empties every **entry column** of a BOM line in rows 15–287 and removes all
+pictures of the data area. This is what the **[ Clean Input ]** button runs, and
+every import runs it first.
+
+| | | |
+|---|---|---|
+| `A` Level | `B` Lookup Key | `C` Part Number |
+| `D` Name | `E` Other Reference | `F` Picture |
+| `G` Qty System | `P` Material Reference | `Q` Description / Comments |
+| `AC` Process Reference | `AD` Process Description | `AH` Process Time |
+| `AI` Direct Operator | `AN` Qty Operators for setup | `AO` Set Up Time per Lot Size |
+| `AP` Other Setup Cost | | |
+
+Cells containing a **formula are never removed** — only entered values. On the
+current workbook that clears 1 620 cells; the 34 formula cells inside `AH` and
+everything in the calculated columns stay in place.
+
+Two consequences worth knowing, both identical to deleting those cells by hand:
+emptying `B` (Lookup Key) and `Q` (Comments) makes the VLOOKUPs in `R` (Material
+Consumption) show `#N/A`, and emptying `P` (Material Reference) does the same for
+`S` / `T` — until new entries are made.
+
+The column list is the constant `CLEAR_COLUMNS` at the top of the module; add or
+remove letters there to change what the cleaning covers.
 
 ## Starting a new estimate
 
@@ -76,22 +106,20 @@ Two macros clear the entered data without ever touching a formula:
 Deletes every **typed-in value** in the data area of `Input` (rows 15–287) and
 all pictures of that area. Cells containing a **formula are never touched** — the
 macro clears constants only, so the complete cost model keeps working and simply
-calculates on empty inputs. On the current workbook this clears ~1 200 entered
+calculates on empty inputs. On the current workbook this clears ~2 560 entered
 cells while all ~15 400 formulas stay in place.
 
-Cleared: Level, Part Number, Name, Other Reference, Picture, Qty, Reference
-Cost, supply option, material, material reference, comments, manually entered
-material consumption / units / process category / process reference /
-description, rank & learning parameter, and the Product / subproducts /
+Cleared: everything the cleaning covers (see above) plus Reference Cost, supply
+option, material, manually entered material consumption / consumption units /
+process category, rank & learning parameter, and the Product / subproducts /
 Manufacturing labels.
 
-**Kept on purpose** (columns `K, L, AA, AE, AH, AI, AN, AO, AP, BC`): Company,
-Country, Process Type, Lot Size, Process Time, Direct Operator, Qty Operators,
-Set Up Time, Other Setup Cost and Valuation Method. These are entered values
-too, but they carry the template defaults — emptying `AE` (Lot Size) would give
-`#DIV/0!` in the setup cost, emptying `K` (Company) would set every factory rate
-to 0. Change the list in the constant `RESET_KEEP_COLUMNS` at the top of the
-module if you want a different behaviour.
+**Kept on purpose** (columns `K, L, AA, AE, BC`): Company, Country, Process
+Type, Lot Size and Valuation Method. These are entered values too, but they
+carry the template defaults — emptying `AE` (Lot Size) would give `#DIV/0!` in
+the setup cost because it is a divisor, and emptying `K` (Company) would set
+every factory rate to 0. Change the list in the constant `RESET_KEEP_COLUMNS` at
+the top of the module if you want a different behaviour.
 
 A confirmation dialog appears first (the default button is "No"); the action
 cannot be undone, so save a copy beforehand if in doubt.
@@ -111,15 +139,8 @@ A typical "new project" run is therefore: `ResetInputSheet` → `ImportBOM`.
 
 ## Behaviour details
 
-* **Re-importable.** Every run first empties the part columns
-  `A` Level, `B` Lookup Key, `C` Part Number, `D` Name, `E` Other Reference,
-  `F` Picture and `G` Qty System (constant `CLEAR_COLUMNS`) including all
-  pictures of the data area, so nothing of the previous BOM stays behind.
-  `B` and `E` are cleared but not refilled — the extraction has nothing to put
-  there. Cells containing a **formula are never removed**, only entered values.
-  Note that emptying `B` (Lookup Key) makes the VLOOKUPs of column `R` (Material
-  Consumption) show `#N/A` until new keys are entered — exactly as if you deleted
-  the keys by hand. Take `B` out of `CLEAR_COLUMNS` if you want to keep them.
+* **Re-importable.** Every run first runs the same cleaning as
+  `ClearBOMImport` (see below), so nothing of the previous BOM stays behind.
 * **Pictures.** Each thumbnail is scaled into the `Picture` cell of its row —
   aspect ratio kept, centred in the cell, row height raised to at least 45 pt —
   and set to **Move and size with cells**, so it follows when you change the row
@@ -150,6 +171,25 @@ A typical "new project" run is therefore: `ResetInputSheet` → `ImportBOM`.
 * Screen updating, events and calculation are switched off during the import and
   restored (plus a full recalculation) at the end — also if an error occurs.
 
+## The push buttons
+
+`CreateMacroButtons` puts two form-control buttons on the `Input` sheet:
+
+| Button | Macro |
+|--------|-------|
+| **Import BOM** | `ImportBOM` — copy sheet + fill `Input` |
+| **Clean Input** | `ClearBOMImport` — the cleaning described above |
+
+They are placed at cell `F5` (the free area next to the header block), 100 × 30 pt
+each. Run the macro again at any time — it replaces the two buttons instead of
+adding new ones. To move a button by hand, right-click it and drag it; to change
+the default position or size, edit `BUTTON_ANCHOR_CELL`, `BUTTON_WIDTH`,
+`BUTTON_HEIGHT` and `BUTTON_GAP` at the top of the module and run
+`CreateMacroButtons` again.
+
+The buttons are part of the workbook — save the file as `.xlsm` after creating
+them, and they stay there for everyone who opens it.
+
 ## Tuning
 
 Constants at the top of the module:
@@ -162,7 +202,8 @@ Constants at the top of the module:
 | `MIN_PIC_ROW_HEIGHT`    | `45`           | Minimum row height for rows with a picture    |
 | `INPUT_FIRST_DATA_ROW`  | `15`           | First data row of the `Input` sheet           |
 | `RESET_KEEP_COLUMNS`    | `K,L,AA,AE,AH,AI,AN,AO,AP,BC` | Columns whose defaults a reset keeps |
-| `CLEAR_COLUMNS`         | `A,B,C,D,E,F,G` | Part columns emptied before every import |
+| `CLEAR_COLUMNS`         | `A,B,C,D,E,F,G,P,Q,AC,AD,AH,AI,AN,AO,AP` | Entry columns the cleaning empties |
+| `BUTTON_ANCHOR_CELL`    | `F5`            | Where `CreateMacroButtons` puts the buttons |
 
 ## Good to know about the reset
 

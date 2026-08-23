@@ -6,8 +6,8 @@ and brings it into the ACE cost model (`ACE_2_1_newVersion.xlsm`).
 
 One run does two things:
 
-1. **Separate sheet with the same format** — the complete extraction (all 13
-   columns, all formatting, all thumbnails) is copied into a new sheet of the
+1. **Separate sheet with the same format** — the complete extraction (every
+   column, all formatting, all thumbnails) is copied into a new sheet of the
    ACE workbook called **`BOM Extract`**, placed right after the `Input` sheet.
 2. **`Input` sheet filled** — part numbers, names, quantities, levels and the
    thumbnails are written into the `Input` sheet of the cost model.
@@ -19,6 +19,7 @@ One run does two things:
 | `Level`               | → | `A` Level              |
 | `Part Number`         | → | `C` Part Number        |
 | `Description`         | → | `D` Name               |
+| `First Level`         | → | `E` Other Reference    |
 | `Thumbnail` (picture) | → | `F` Picture            |
 | `Qty`                 | → | `G` Qty System         |
 
@@ -36,7 +37,26 @@ cost model keeps working after an import.
 Headers are matched by name, not by position, so the extraction columns may sit
 anywhere and the header row may be any of the first 20 rows. Accepted synonyms:
 `Part Number` / `PartNumber` / `Part No`, `Description` / `Name` / `Designation`,
-`Qty` / `Quantity`, `Level`.
+`Qty` / `Quantity`, `Level`, `First Level` / `Top Level`.
+
+### Newer extractions
+
+The extractors now also write **sub-assembly rows**, a **`First Level`** column
+and a **`Type`** column (Assembly / Part / Body). Nothing needs to be configured
+for that:
+
+* extra columns are simply ignored — the mapping goes by header name,
+* sub-assembly and body rows are imported like any other row, so the tree
+  structure of the BOM ends up in the `Input` sheet,
+* the indentation the extractor puts in front of a body name (`    PartBody`)
+  is removed, so no part number starts with blanks,
+* `First Level` lands in `E` Other Reference, so the `Input` sheet can be
+  filtered per first-level assembly too. Set `IMPORT_FIRST_LEVEL = False` at the
+  top of the module to leave `E` empty instead.
+
+Because sub-assembly rows add lines, a BOM can now exceed the 273 prepared rows
+of the `Input` sheet more easily — the macro then offers to extend the sheet by
+copying the last prepared row down (see below).
 
 ## Installation
 

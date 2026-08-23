@@ -18,11 +18,17 @@ Attribute VB_Name = "ACE_BOM_Import"
 '          Level                      ->   A  Level
 '          Part Number                ->   C  Part Number
 '          Description                ->   D  Name
+'          First Level                ->   E  Other Reference
 '          Thumbnail (picture)        ->   F  Picture
 '          Qty                        ->   G  Qty System
 '
-'      The other part columns - B Lookup Key and E Other Reference - are
-'      emptied, because the extraction has nothing to fill them with.
+'      The columns are found BY HEADER NAME, so extra columns of the newer
+'      extractions ("First Level", "Type", material data, ...) do no harm and
+'      the column order may change. Rows of sub-assemblies and of single
+'      bodies are imported like any other row; the indentation the extractor
+'      writes in front of a body name is removed.
+'
+'      B Lookup Key stays empty - the extraction has nothing to fill it with.
 '      Everything else (costs, factory, material, process, all formulas) is
 '      left untouched.
 '
@@ -56,8 +62,14 @@ Private Const INPUT_FIRST_DATA_ROW As Long = 15
 Private Const COL_LEVEL As Long = 1          ' A - Level
 Private Const COL_PARTNUM As Long = 3        ' C - Part Number
 Private Const COL_NAME As Long = 4           ' D - Name
+Private Const COL_OTHERREF As Long = 5       ' E - Other Reference
 Private Const COL_PICTURE As Long = 6        ' F - Picture
 Private Const COL_QTY As Long = 7            ' G - Qty System
+
+' The extractors write a "First Level" column (the first level node of the
+' assembly a row belongs to). True = it is imported into E "Other Reference",
+' so the Input sheet can be filtered per first level as well.
+Private Const IMPORT_FIRST_LEVEL As Boolean = True
 
 ' Column that carries a formula on every prepared template row. Used to find out
 ' how many prepared rows the Input sheet has (column I = "Total Cost").
@@ -277,9 +289,10 @@ End Sub
 '==============================================================================
 Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As Worksheet, _
                            ByRef nRows As Long, ByRef nPics As Long, ByRef nSkipped As Long)
-    Dim cLevel As Long, cPart As Long, cDesc As Long, cQty As Long
+    Dim cLevel As Long, cPart As Long, cDesc As Long, cQty As Long, cFirst As Long
     Dim preparedLastRow As Long, capacity As Long
     Dim levels As Variant, parts As Variant, descs As Variant, qtys As Variant
+    Dim firsts As Variant
     Dim pics As Object, knownNames As Object
     Dim shp As Object
     Dim i As Long, srcRow As Long, tgtRow As Long
@@ -290,6 +303,11 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
     cLevel = FindColumn(bomWs, hdrRow, "level")
     cDesc = FindColumn(bomWs, hdrRow, "description", "name", "designation")
     cQty = FindColumn(bomWs, hdrRow, "qty", "quantity", "qty system", "quantity total")
+    cFirst = 0
+    If IMPORT_FIRST_LEVEL Then
+        cFirst = FindColumn(bomWs, hdrRow, "first level", "firstlevel", "first-level", _
+                            "top level", "toplevel", "main assembly")
+    End If
 
     If cPart = 0 Then Err.Raise ERR_NO_PARTNUM, , "No 'Part Number' column found in the extraction."
 
@@ -323,6 +341,7 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
     If cLevel > 0 Then levels = ReadColumn(bomWs, cLevel, hdrRow + 1, hdrRow + nRows, True)
     If cDesc > 0 Then descs = ReadColumn(bomWs, cDesc, hdrRow + 1, hdrRow + nRows, False)
     If cQty > 0 Then qtys = ReadColumn(bomWs, cQty, hdrRow + 1, hdrRow + nRows, True)
+    If cFirst > 0 Then firsts = ReadColumn(bomWs, cFirst, hdrRow + 1, hdrRow + nRows, False)
 
     '--- clear the previous import --------------------------------------------
     Application.StatusBar = "BOM import: clearing previous import ..."
@@ -337,6 +356,8 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
         inputWs.Cells(INPUT_FIRST_DATA_ROW, COL_NAME).Resize(nRows, 1).Value = descs
     If cQty > 0 Then _
         inputWs.Cells(INPUT_FIRST_DATA_ROW, COL_QTY).Resize(nRows, 1).Value = qtys
+    If cFirst > 0 Then _
+        inputWs.Cells(INPUT_FIRST_DATA_ROW, COL_OTHERREF).Resize(nRows, 1).Value = firsts
 
     '--- thumbnails ------------------------------------------------------------
     If Not COPY_PICTURES Then Exit Sub
@@ -1191,6 +1212,10 @@ Private Function ReadColumn(ws As Worksheet, ByVal col As Long, ByVal firstRow A
             Else
                 out(i, 1) = v
             End If
+        ElseIf VarType(v) = vbString Then
+            ' body rows of the extractor are written indented ("    PartBody"),
+            ' the leading blanks must not end up in the part number
+            out(i, 1) = Trim$(v)
         Else
             out(i, 1) = v
         End If

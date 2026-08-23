@@ -19,8 +19,10 @@ Option Explicit
 '     -> the whole path down to a part is visible in the list
 '   - Column N "First Level" holds the first level node (direct child of the
 '     root) the row belongs to, so the BOM can be filtered per first level
-'   - A part used in two different first level branches gets one row per
-'     branch with the quantity of that branch (GROUP_PER_FIRST_LEVEL)
+'   - Rows are grouped per parent assembly (GROUP_BY = "PARENT"): every
+'     assembly lists its own content, so a part that sits in three assemblies
+'     appears below each of them. Qty is the total number of that part below
+'     that path, so the sum over the rows is still the total quantity.
 '   - Columns A..M are unchanged, so the sheet still imports into the ACE
 '     cost model without any change
 '
@@ -43,15 +45,29 @@ Public Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
 ' tree structure is visible and a part can be located inside its assembly.
 Private Const INCLUDE_SUBASSEMBLIES As Boolean = True
 
-' Column N carries the first level node the row belongs to (the direct child of
-' the root product). With grouping per first level, a part that is used in two
-' different first level branches gets one row per branch, so the BOM can be
-' filtered by column N and the quantities stay per branch.
-Private Const GROUP_PER_FIRST_LEVEL As Boolean = True
+' How the rows are grouped:
+'   "PARENT" - one row per part per parent assembly (structured BOM, default).
+'              Every assembly shows its own content, so a part that sits in
+'              three assemblies is listed under each of them. Qty is the total
+'              number of that part below that path, so the sum over all rows is
+'              still the total quantity of the part in the product.
+'   "FIRST"  - one row per part per first level branch
+'   "GLOBAL" - one row per part in the whole tree (behaviour of the old macro);
+'              column N then lists the first level branches comma separated
+Private Const GROUP_BY As String = "PARENT"
 
 ' False = column N shows the part number of the first level node,
 ' True  = column N shows its description
 Private Const FIRST_LEVEL_USE_DESCRIPTION As Boolean = False
+
+' Thumbnails of sub-assembly rows: every leaf below the node has to be shown
+' and hidden again, which costs one selection entry per leaf. Nodes with more
+' leaves than the limit are listed without a picture instead of stalling the
+' run; the settle time is longer than for a single part because a whole branch
+' has to be redrawn.
+Private Const CAPTURE_ASSEMBLY_SHOTS As Boolean = True
+Private Const MAX_ASSY_LEAVES_FOR_SHOT As Long = 400
+Private Const ASSY_SETTLE_MS As Long = 200
 
 
 Sub GenerateMasterBOM()
@@ -105,11 +121,18 @@ Sub GenerateMasterBOM()
     Dim startTime As Double
     startTime = Timer
 
+    ' True once the spec tree / compass were toggled off, so the error handler
+    ' knows whether it has to toggle them back on
+    Dim viewToggled As Boolean
+
+    ' Any unexpected error must not leave the model completely hidden
+    On Error GoTo Fail
+
     ' --- 2. INITIALIZATION ---
     On Error Resume Next
     Set catDoc = CATIA.ActiveDocument
     If Err.Number <> 0 Then MsgBox "No Document.", vbCritical: Exit Sub
-    On Error GoTo 0
+    On Error GoTo Fail
 
     If InStr(catDoc.Name, ".CATProduct") = 0 Then MsgBox "Open Assembly.", vbExclamation: Exit Sub
 
@@ -119,7 +142,7 @@ Sub GenerateMasterBOM()
     ' Suppress CATIA alert dialogs during the run (restored at the end)
     On Error Resume Next
     CATIA.DisplayFileAlerts = False
-    On Error GoTo 0
+    On Error GoTo Fail
 
     Set fso = CreateObject("Scripting.FileSystemObject")
     tempPicPath = "C:\Temp\catia_bom_shot.jpg"
@@ -140,15 +163,15 @@ Sub GenerateMasterBOM()
     ' --- 3. TRAVERSE TREE (Count Parts, Calc Mass, Detect Multi-Body Parts) ---
     On Error Resume Next
     CATIA.RefreshDisplay = False
-    On Error GoTo 0
+    On Error GoTo Fail
 
     Call TraverseTree(rootProd, dictQty, dictRef, dictDesc, dictProps, dictLevel, _
                       dictBodies, dictPartNum, dictFirst, dictIsAssy, dictNodeLeaves, _
-                      colLeaves, 1, "")
+                      colLeaves, 1, "", "")
 
     On Error Resume Next
     CATIA.RefreshDisplay = True
-    On Error GoTo 0
+    On Error GoTo Fail
 
     If dictQty.Count = 0 Then MsgBox "No parts found.", vbInformation: Exit Sub
 
@@ -156,7 +179,7 @@ Sub GenerateMasterBOM()
     On Error Resume Next
     Set xlApp = GetObject(, "Excel.Application")
     If Err.Number <> 0 Then Set xlApp = CreateObject("Excel.Application")
-    On Error GoTo 0
+    On Error GoTo Fail
 
     xlApp.Visible = True
     xlApp.ScreenUpdating = False
@@ -198,8 +221,9 @@ Sub GenerateMasterBOM()
     Set oViewer = CATIA.ActiveWindow.ActiveViewer
     CATIA.StartCommand "Specification Tree Display"  ' Toggle off
     CATIA.StartCommand "Compass"                     ' Toggle off
+    viewToggled = True
     Sleep 100
-    On Error GoTo 0
+    On Error GoTo Fail
 
     ' Hide ALL leaf parts with ONE SetShow call.
     ' Parent nodes stay untouched, so showing one leaf later is enough.
@@ -236,6 +260,8 @@ Sub GenerateMasterBOM()
         ' Try to read part data without opening any window
         ' (a sub-assembly has no CATPart of its own)
         hasPart = False
+        Set oPart = Nothing
+        Set oPartDoc = Nothing
         If Not isAssy Then hasPart = TryGetLoadedPart(oPartProd, oPart, oPartDoc)
 
         ' --- MATERIAL & DENSITY ---
@@ -259,7 +285,12 @@ Sub GenerateMasterBOM()
         End If
 
         If dims(0) < 0.1 Then
+            ' ReferenceProduct itself can raise on a node that is not loaded,
+            ' and that would abort the whole run with everything still hidden
+            On Error Resume Next
             Call GetInertiaDims(oPartProd.ReferenceProduct, dims)
+            Err.Clear
+            On Error GoTo Fail
         End If
 
         If dims(0) > 0 Then xlSheet.Cells(r, 9).Value = Format(dims(0), "0.0") Else xlSheet.Cells(r, 9).Value = "N/A"
@@ -273,13 +304,22 @@ Sub GenerateMasterBOM()
             Set colNodeLeaves = Nothing
             If dictNodeLeaves.Exists(uniqueKey) Then Set colNodeLeaves = dictNodeLeaves(uniqueKey)
 
-            If Not colNodeLeaves Is Nothing Then
+            If colNodeLeaves Is Nothing Then
+                xlSheet.Cells(r, 1).Value = "No Preview"
+            ElseIf colNodeLeaves.Count = 0 Then
+                ' nothing with geometry below this node - the scene would be empty
+                xlSheet.Cells(r, 1).Value = "No Preview"
+            ElseIf Not CAPTURE_ASSEMBLY_SHOTS Then
+                xlSheet.Cells(r, 1).Value = "-"
+            ElseIf colNodeLeaves.Count > MAX_ASSY_LEAVES_FOR_SHOT Then
+                ' showing and hiding thousands of leaves for one picture would
+                ' cost more than the whole rest of the run
+                xlSheet.Cells(r, 1).Value = colNodeLeaves.Count & " parts"
+            Else
                 Call SetShowCollection(sel, colNodeLeaves, 0)   ' 0 = SHOW
-                Sleep 50
+                Sleep ASSY_SETTLE_MS                            ' a whole branch has to redraw
                 Call CaptureViewToExcel(oViewer, xlSheet, r, tempPicPath, fso)
                 Call SetShowCollection(sel, colNodeLeaves, 1)   ' 1 = HIDE again
-            Else
-                xlSheet.Cells(r, 1).Value = "No Preview"
             End If
         ElseIf Not oPartProd Is Nothing Then
             Call SetShowSingle(sel, oPartProd, 0)   ' 0 = SHOW
@@ -388,7 +428,7 @@ Sub GenerateMasterBOM()
     CATIA.StartCommand "Compass"                     ' Toggle on
     If Not oViewer Is Nothing Then oViewer.Reframe
     CATIA.DisplayFileAlerts = True
-    On Error GoTo 0
+    On Error GoTo Fail
     sel.Clear
 
     ' --- 8. FINALIZE EXCEL ---
@@ -400,13 +440,39 @@ Sub GenerateMasterBOM()
     ' filter on the header row: column N = first level, column O = Assembly/Part
     On Error Resume Next
     xlSheet.Range("B1:O1").AutoFilter
-    On Error GoTo 0
+    On Error GoTo Fail
 
     MsgBox "BOM Exported Successfully!" & vbCrLf & _
            "Rows written:    " & (r - 2) & vbCrLf & _
            "  sub-assemblies: " & nAssyRows & vbCrLf & _
            "  parts:          " & nPartRows & vbCrLf & _
            "Time elapsed: " & Format(Timer - startTime, "0.0") & " seconds", vbInformation
+    Exit Sub
+
+' ------------------------------------------------------------------------------
+' Something went wrong: put the model, CATIA and Excel back into a usable state
+' before reporting. Without this the run would leave every part hidden.
+' ------------------------------------------------------------------------------
+Fail:
+    Dim failMsg As String
+    failMsg = "The BOM run stopped with error " & Err.Number & " - " & Err.Description
+
+    On Error Resume Next
+    Call SetShowCollection(sel, colLeaves, 0)         ' show all leaf parts again
+    If viewToggled Then
+        CATIA.StartCommand "Specification Tree Display"
+        CATIA.StartCommand "Compass"
+        If Not oViewer Is Nothing Then oViewer.Reframe
+    End If
+    CATIA.RefreshDisplay = True
+    CATIA.DisplayFileAlerts = True
+    If Not sel Is Nothing Then sel.Clear
+    If Not xlApp Is Nothing Then xlApp.ScreenUpdating = True
+    Err.Clear
+
+    MsgBox failMsg & vbCrLf & vbCrLf & _
+           "Visibility, spec tree and compass were restored." & vbCrLf & _
+           "The rows written so far are in the Excel sheet.", vbCritical
 
 End Sub
 
@@ -507,7 +573,8 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
                       dProps As Object, dLevel As Object, dBodies As Object, _
                       dPartNum As Object, dFirst As Object, dIsAssy As Object, _
                       dNodeLeaves As Object, colLeaves As Collection, _
-                      ByVal currentLevel As Integer, ByVal firstLevelName As String) As Collection
+                      ByVal currentLevel As Integer, ByVal firstLevelName As String, _
+                      ByVal parentKey As String) As Collection
 
     Dim childProd As Product, i As Integer, partNum As String
     Dim myLeaves As Collection, childLeaves As Collection
@@ -546,9 +613,11 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
         If childProd.Products.Count > 0 Then
 
             ' ---------- SUB-ASSEMBLY ----------
-            sKey = ""
+            ' the key is needed in any case: it is the parent key of everything
+            ' below this node
+            sKey = MakeRowKey(parentKey, childFirst, partNum)
+
             If INCLUDE_SUBASSEMBLIES And partNum <> "" Then
-                sKey = MakeRowKey(childFirst, partNum)
                 If dQty.Exists(sKey) Then
                     dQty(sKey) = dQty(sKey) + 1
                     Call AddFirstLevel(dFirst, sKey, childFirst)
@@ -560,10 +629,10 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
 
             Set childLeaves = TraverseTree(childProd, dQty, dRef, dDesc, dProps, dLevel, _
                                            dBodies, dPartNum, dFirst, dIsAssy, dNodeLeaves, _
-                                           colLeaves, currentLevel + 1, childFirst)
+                                           colLeaves, currentLevel + 1, childFirst, sKey)
 
             ' the leaves below this node are needed to show it for its screenshot
-            If Len(sKey) > 0 Then
+            If INCLUDE_SUBASSEMBLIES And partNum <> "" Then
                 If Not dNodeLeaves.Exists(sKey) Then dNodeLeaves.Add sKey, childLeaves
             End If
 
@@ -582,7 +651,7 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
             myLeaves.Add childProd
 
             If partNum <> "" Then
-                sKey = MakeRowKey(childFirst, partNum)
+                sKey = MakeRowKey(parentKey, childFirst, partNum)
 
                 If dQty.Exists(sKey) Then
                     dQty(sKey) = dQty(sKey) + 1
@@ -608,16 +677,23 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
 End Function
 
 ' ==============================================================================
-' HELPER: KEY OF A BOM ROW
-' With GROUP_PER_FIRST_LEVEL every first level branch gets its own rows, so the
-' sheet can be filtered by column N and the quantities stay per branch.
+' HELPER: KEY OF A BOM ROW - see GROUP_BY at the top of the module
+'   "PARENT" (default): the path of the parent assemblies, so every assembly
+'                       lists its own content and a part that sits in several
+'                       assemblies appears below each of them
+'   "FIRST":            one row per first level branch
+'   "GLOBAL":           one row per part number in the whole tree
 ' ==============================================================================
-Function MakeRowKey(ByVal firstLevel As String, ByVal partNum As String) As String
-    If GROUP_PER_FIRST_LEVEL Then
-        MakeRowKey = firstLevel & "|" & partNum
-    Else
-        MakeRowKey = partNum
-    End If
+Function MakeRowKey(ByVal parentKey As String, ByVal firstLevel As String, _
+                    ByVal partNum As String) As String
+    Select Case UCase$(GROUP_BY)
+        Case "GLOBAL"
+            MakeRowKey = partNum
+        Case "FIRST"
+            MakeRowKey = firstLevel & "|" & partNum
+        Case Else
+            MakeRowKey = parentKey & ">" & partNum
+    End Select
 End Function
 
 ' ==============================================================================
@@ -679,13 +755,13 @@ End Sub
 
 ' ==============================================================================
 ' HELPER: COLLECT THE FIRST LEVEL NAMES OF A ROW
-' Only used when GROUP_PER_FIRST_LEVEL is off: one row can then belong to
-' several first level branches, which are listed comma separated.
+' Only used with GROUP_BY = "GLOBAL": one row can then belong to several first
+' level branches, which are listed comma separated.
 ' ==============================================================================
 Sub AddFirstLevel(dFirst As Object, ByVal sKey As String, ByVal firstLevel As String)
     Dim cur As String
 
-    If GROUP_PER_FIRST_LEVEL Then Exit Sub
+    If UCase$(GROUP_BY) <> "GLOBAL" Then Exit Sub
     If Len(firstLevel) = 0 Then Exit Sub
     If Not dFirst.Exists(sKey) Then Exit Sub
 

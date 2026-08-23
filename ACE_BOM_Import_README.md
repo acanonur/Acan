@@ -53,6 +53,10 @@ for that:
 * `First Level` lands in `E` Other Reference, so the `Input` sheet can be
   filtered per first-level assembly too. Set `IMPORT_FIRST_LEVEL = False` at the
   top of the module to leave `E` empty instead.
+* rows whose `Type` is `Assembly` are written **in bold** (columns A–G), so the
+  structure rows can be told apart from the parts that carry the cost. The block
+  is un-bolded first on every import, so nothing stale survives. Switch it off
+  with `MARK_ASSEMBLY_ROWS = False`.
 
 Because sub-assembly rows add lines, a BOM can now exceed the 273 prepared rows
 of the `Input` sheet more easily — the macro then offers to extend the sheet by

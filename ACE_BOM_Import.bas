@@ -71,6 +71,11 @@ Private Const COL_QTY As Long = 7            ' G - Qty System
 ' so the Input sheet can be filtered per first level as well.
 Private Const IMPORT_FIRST_LEVEL As Boolean = True
 
+' The extractors write a "Type" column (Assembly / Part / Body). True = the
+' rows of sub-assemblies are written in bold in the Input sheet, so structure
+' rows can be told apart from the parts that carry the cost.
+Private Const MARK_ASSEMBLY_ROWS As Boolean = True
+
 ' Column that carries a formula on every prepared template row. Used to find out
 ' how many prepared rows the Input sheet has (column I = "Total Cost").
 Private Const TEMPLATE_PROBE_COL As String = "I"
@@ -289,10 +294,10 @@ End Sub
 '==============================================================================
 Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As Worksheet, _
                            ByRef nRows As Long, ByRef nPics As Long, ByRef nSkipped As Long)
-    Dim cLevel As Long, cPart As Long, cDesc As Long, cQty As Long, cFirst As Long
+    Dim cLevel As Long, cPart As Long, cDesc As Long, cQty As Long, cFirst As Long, cType As Long
     Dim preparedLastRow As Long, capacity As Long
     Dim levels As Variant, parts As Variant, descs As Variant, qtys As Variant
-    Dim firsts As Variant
+    Dim firsts As Variant, types As Variant
     Dim pics As Object, knownNames As Object
     Dim shp As Object
     Dim i As Long, srcRow As Long, tgtRow As Long
@@ -308,6 +313,8 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
         cFirst = FindColumn(bomWs, hdrRow, "first level", "firstlevel", "first-level", _
                             "top level", "toplevel", "main assembly")
     End If
+    cType = 0
+    If MARK_ASSEMBLY_ROWS Then cType = FindColumn(bomWs, hdrRow, "type", "row type", "kind")
 
     If cPart = 0 Then Err.Raise ERR_NO_PARTNUM, , "No 'Part Number' column found in the extraction."
 
@@ -342,6 +349,7 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
     If cDesc > 0 Then descs = ReadColumn(bomWs, cDesc, hdrRow + 1, hdrRow + nRows, False)
     If cQty > 0 Then qtys = ReadColumn(bomWs, cQty, hdrRow + 1, hdrRow + nRows, True)
     If cFirst > 0 Then firsts = ReadColumn(bomWs, cFirst, hdrRow + 1, hdrRow + nRows, False)
+    If cType > 0 Then types = ReadColumn(bomWs, cType, hdrRow + 1, hdrRow + nRows, False)
 
     '--- clear the previous import --------------------------------------------
     Application.StatusBar = "BOM import: clearing previous import ..."
@@ -358,6 +366,17 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
         inputWs.Cells(INPUT_FIRST_DATA_ROW, COL_QTY).Resize(nRows, 1).Value = qtys
     If cFirst > 0 Then _
         inputWs.Cells(INPUT_FIRST_DATA_ROW, COL_OTHERREF).Resize(nRows, 1).Value = firsts
+
+    '--- mark the sub-assembly rows -------------------------------------------
+    ' the whole block is reset first, so a re-import never leaves an old row bold
+    If cType > 0 Then
+        inputWs.Cells(INPUT_FIRST_DATA_ROW, COL_LEVEL).Resize(nRows, COL_QTY).Font.Bold = False
+        For i = 1 To nRows
+            If StrComp(Trim$(CStr(types(i, 1))), "Assembly", vbTextCompare) = 0 Then
+                inputWs.Cells(INPUT_FIRST_DATA_ROW + i - 1, COL_LEVEL).Resize(1, COL_QTY).Font.Bold = True
+            End If
+        Next i
+    End If
 
     '--- thumbnails ------------------------------------------------------------
     If Not COPY_PICTURES Then Exit Sub

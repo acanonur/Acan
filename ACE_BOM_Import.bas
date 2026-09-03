@@ -35,6 +35,9 @@ Attribute VB_Name = "ACE_BOM_Import"
 ' Entry points (Alt+F8):
 '
 '      ImportBOM                - does both steps (normal use)
+'      ImportBOM_PartsOnly      - same, but the "Assembly" rows of a structure
+'                                 sheet are skipped: only the parts that carry
+'                                 cost reach the Input sheet
 '      ImportBOM_SheetOnly      - only creates the "BOM Extract" copy sheet
 '      ImportBOM_InputOnly      - only fills the Input sheet
 '      ClearBOMImport           - removes imported values + pictures from Input
@@ -126,6 +129,13 @@ Private Const SHP_LINKED_PICTURE As Long = 11
 '--- Custom errors ------------------------------------------------------------
 Private Const ERR_NO_PARTNUM As Long = vbObjectError + 1
 Private Const ERR_USER_CANCEL As Long = vbObjectError + 2
+Private Const ERR_NO_ROWS As Long = vbObjectError + 3
+
+'--- Run mode -----------------------------------------------------------------
+' Set by the entry points: True = the "Assembly" rows of a structure sheet are
+' skipped, so only the parts that carry cost land in the Input sheet.
+Private mSkipAssemblyRows As Boolean
+Private mFilteredOut As Long
 
 '--- Saved application state ---------------------------------------------------
 Private mScreen As Boolean
@@ -139,6 +149,16 @@ Private mStateSaved As Boolean
 ' ENTRY POINT: full import (copy sheet + fill Input sheet)
 '==============================================================================
 Public Sub ImportBOM()
+    mSkipAssemblyRows = False
+    RunImport True, True
+End Sub
+
+'==============================================================================
+' ENTRY POINT: import a sheet of the assembly structure version, but WITHOUT
+' its sub-assembly rows - only the parts that carry cost reach the Input sheet
+'==============================================================================
+Public Sub ImportBOM_PartsOnly()
+    mSkipAssemblyRows = True
     RunImport True, True
 End Sub
 
@@ -146,6 +166,7 @@ End Sub
 ' ENTRY POINT: only create the separate copy of the extraction
 '==============================================================================
 Public Sub ImportBOM_SheetOnly()
+    mSkipAssemblyRows = False
     RunImport True, False
 End Sub
 
@@ -153,6 +174,7 @@ End Sub
 ' ENTRY POINT: only fill the Input sheet
 '==============================================================================
 Public Sub ImportBOM_InputOnly()
+    mSkipAssemblyRows = False
     RunImport False, True
 End Sub
 
@@ -283,6 +305,10 @@ CleanFail:
     RestoreAppState
     If errNo = ERR_USER_CANCEL Then
         MsgBox "BOM import cancelled - nothing was changed.", vbInformation, "BOM Import"
+    ElseIf errNo = ERR_NO_ROWS Then
+        MsgBox "Nothing to import: every row of that extraction is a sub-assembly row." & vbCrLf & _
+               "Use ImportBOM (instead of ImportBOM_PartsOnly) for a structure sheet.", _
+               vbExclamation, "BOM Import"
     Else
         MsgBox msg, vbCritical, "BOM Import"
     End If
@@ -297,7 +323,8 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
     Dim cLevel As Long, cPart As Long, cDesc As Long, cQty As Long, cFirst As Long, cType As Long
     Dim preparedLastRow As Long, capacity As Long
     Dim levels As Variant, parts As Variant, descs As Variant, qtys As Variant
-    Dim firsts As Variant, types As Variant
+    Dim firsts As Variant, types As Variant, rawTypes As Variant
+    Dim nSrc As Long, idx() As Long, keepRow As Boolean
     Dim pics As Object, knownNames As Object
     Dim shp As Object
     Dim i As Long, srcRow As Long, tgtRow As Long
@@ -317,6 +344,30 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
     If MARK_ASSEMBLY_ROWS Then cType = FindColumn(bomWs, hdrRow, "type", "row type", "kind")
 
     If cPart = 0 Then Err.Raise ERR_NO_PARTNUM, , "No 'Part Number' column found in the extraction."
+
+    '--- which source rows are imported? --------------------------------------
+    ' (the assembly rows of a structure sheet can be skipped)
+    nSrc = nRows
+    If cType > 0 Then rawTypes = ReadColumn(bomWs, cType, hdrRow + 1, hdrRow + nSrc, False)
+
+    ReDim idx(1 To nSrc)
+    nRows = 0
+    mFilteredOut = 0
+    For i = 1 To nSrc
+        keepRow = True
+        If mSkipAssemblyRows And cType > 0 Then
+            If StrComp(Trim$(CStr(rawTypes(i, 1))), "Assembly", vbTextCompare) = 0 Then keepRow = False
+        End If
+        If keepRow Then
+            nRows = nRows + 1
+            idx(nRows) = i
+        Else
+            mFilteredOut = mFilteredOut + 1
+        End If
+    Next i
+
+    If nRows = 0 Then Err.Raise ERR_NO_ROWS, , "Nothing left to import - every row of the " & _
+                                               "extraction is a sub-assembly row."
 
     '--- how many prepared rows does the template offer? ----------------------
     preparedLastRow = LastTemplateRow(inputWs)
@@ -344,12 +395,14 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
     End If
 
     '--- read the extraction into arrays --------------------------------------
-    parts = ReadColumn(bomWs, cPart, hdrRow + 1, hdrRow + nRows, False)
-    If cLevel > 0 Then levels = ReadColumn(bomWs, cLevel, hdrRow + 1, hdrRow + nRows, True)
-    If cDesc > 0 Then descs = ReadColumn(bomWs, cDesc, hdrRow + 1, hdrRow + nRows, False)
-    If cQty > 0 Then qtys = ReadColumn(bomWs, cQty, hdrRow + 1, hdrRow + nRows, True)
-    If cFirst > 0 Then firsts = ReadColumn(bomWs, cFirst, hdrRow + 1, hdrRow + nRows, False)
-    If cType > 0 Then types = ReadColumn(bomWs, cType, hdrRow + 1, hdrRow + nRows, False)
+    ' PickRows keeps only the source rows of idx(), so a truncated or filtered
+    ' import stays row-aligned with the pictures further down
+    parts = PickRows(ReadColumn(bomWs, cPart, hdrRow + 1, hdrRow + nSrc, False), idx, nRows)
+    If cLevel > 0 Then levels = PickRows(ReadColumn(bomWs, cLevel, hdrRow + 1, hdrRow + nSrc, True), idx, nRows)
+    If cDesc > 0 Then descs = PickRows(ReadColumn(bomWs, cDesc, hdrRow + 1, hdrRow + nSrc, False), idx, nRows)
+    If cQty > 0 Then qtys = PickRows(ReadColumn(bomWs, cQty, hdrRow + 1, hdrRow + nSrc, True), idx, nRows)
+    If cFirst > 0 Then firsts = PickRows(ReadColumn(bomWs, cFirst, hdrRow + 1, hdrRow + nSrc, False), idx, nRows)
+    If cType > 0 Then types = PickRows(rawTypes, idx, nRows)
 
     '--- clear the previous import --------------------------------------------
     Application.StatusBar = "BOM import: clearing previous import ..."
@@ -398,7 +451,7 @@ Private Sub FillInputSheet(bomWs As Worksheet, ByVal hdrRow As Long, inputWs As 
     On Error GoTo 0
 
     For i = 1 To nRows
-        srcRow = hdrRow + i
+        srcRow = hdrRow + idx(i)
         tgtRow = INPUT_FIRST_DATA_ROW + i - 1
         If pics.Exists(srcRow) Then
             If i Mod 20 = 0 Then
@@ -1205,6 +1258,22 @@ Private Function LastTemplateRow(ws As Worksheet) As Long
     LastTemplateRow = r
 End Function
 
+' Keeps the rows listed in idx() of a column that was read for ALL source rows.
+' That is what keeps values, pictures and the target rows aligned when rows are
+' filtered out or the import is truncated.
+'==============================================================================
+Private Function PickRows(all As Variant, idx() As Long, ByVal n As Long) As Variant
+    Dim out() As Variant, j As Long
+
+    ReDim out(1 To n, 1 To 1)
+    For j = 1 To n
+        out(j, 1) = all(idx(j), 1)
+    Next j
+    PickRows = out
+End Function
+
+
+'==============================================================================
 ' Reads one column into a 2D array; text stays text, numeric text becomes a number.
 Private Function ReadColumn(ws As Worksheet, ByVal col As Long, ByVal firstRow As Long, _
                             ByVal lastRow As Long, ByVal asNumber As Boolean) As Variant
@@ -1339,6 +1408,9 @@ Private Function BuildReport(ByVal madeCopy As Boolean, ByVal filledInput As Boo
         s = s & "Rows written to '" & INPUT_SHEET & "':  " & nRows & _
                 "  (rows " & INPUT_FIRST_DATA_ROW & "-" & INPUT_FIRST_DATA_ROW + nRows - 1 & ")" & vbCrLf
         s = s & "Pictures copied:  " & nPics & vbCrLf
+        If mFilteredOut > 0 Then
+            s = s & "Sub-assembly rows skipped:  " & mFilteredOut & vbCrLf
+        End If
         If nSkipped > 0 Then
             s = s & vbCrLf & "NOT imported: " & nSkipped & " row(s) - the Input sheet " & _
                     "had no prepared rows left." & vbCrLf

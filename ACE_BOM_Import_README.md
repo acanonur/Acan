@@ -39,11 +39,22 @@ anywhere and the header row may be any of the first 20 rows. Accepted synonyms:
 `Part Number` / `PartNumber` / `Part No`, `Description` / `Name` / `Designation`,
 `Qty` / `Quantity`, `Level`, `First Level` / `Top Level`.
 
-### Newer extractions
+### The two extraction versions
 
-The extractors now also write **sub-assembly rows**, a **`First Level`** column
-and a **`Type`** column (Assembly / Part / Body). Nothing needs to be configured
-for that:
+The assembly extractor offers two versions and the import handles both:
+
+| Extraction | Import with | Result in `Input` |
+|---|---|---|
+| `GenerateMasterBOM` — part list | `ImportBOM` | one row per part, as always |
+| `GenerateAssemblyBOM` — assembly structure | `ImportBOM` | assemblies **and** parts, structure visible |
+| `GenerateAssemblyBOM` — assembly structure | `ImportBOM_PartsOnly` | only the parts, the assembly rows are skipped |
+
+`ImportBOM_PartsOnly` is the one to use when you want the structure sheet for
+reading but only the cost-carrying parts inside the cost model; the number of
+skipped rows is reported at the end.
+
+Both versions write a **`First Level`** column and a **`Type`** column
+(Assembly / Part / Body). Nothing needs to be configured for that:
 
 * extra columns are simply ignored — the mapping goes by header name,
 * sub-assembly and body rows are imported like any other row, so the tree
@@ -79,6 +90,7 @@ copying the last prepared row down (see below).
 | Macro                  | What it does                                                     |
 |------------------------|------------------------------------------------------------------|
 | `ImportBOM`            | Normal use — creates the `BOM Extract` sheet **and** fills `Input` |
+| `ImportBOM_PartsOnly`  | Same, but skips the `Assembly` rows of a structure sheet          |
 | `ImportBOM_SheetOnly`  | Only creates the `BOM Extract` copy sheet                        |
 | `ImportBOM_InputOnly`  | Only fills the `Input` sheet                                     |
 | `ClearBOMImport`       | **Cleaning** — empties all entry columns of `Input` (values + pictures) |

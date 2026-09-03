@@ -13,18 +13,28 @@ Option Explicit
 '   - CATIA.RefreshDisplay is off during tree traversal
 '   - Excel ScreenUpdating is off while rows are written
 '
-' TREE STRUCTURE IN THE SHEET:
-'   - Sub-assemblies (products with children) get their own row, marked
-'     "Assembly" in column O and written in bold, directly above their content
-'     -> the whole path down to a part is visible in the list
-'   - Column N "First Level" holds the first level node (direct child of the
-'     root) the row belongs to, so the BOM can be filtered per first level
-'   - Rows are grouped per parent assembly (GROUP_BY = "PARENT"): every
-'     assembly lists its own content, so a part that sits in three assemblies
-'     appears below each of them. Qty is the total number of that part below
-'     that path, so the sum over the rows is still the total quantity.
-'   - Columns A..M are unchanged, so the sheet still imports into the ACE
-'     cost model without any change
+' TWO VERSIONS - PICK THE ONE YOU NEED (Tools > Macro > Macros):
+'
+'   GenerateMasterBOM      PART LIST (the classic BOM, unchanged behaviour)
+'                          - one row per part number
+'                          - Qty = number of instances in the whole product
+'                          - no sub-assembly rows, so the list stays short
+'
+'   GenerateAssemblyBOM    ASSEMBLY STRUCTURE
+'                          - sub-assemblies get their own row, marked
+'                            "Assembly" in column O and written in bold,
+'                            directly above their content
+'                          - every assembly lists its own content, so a part
+'                            that sits in three assemblies appears below each
+'                            of them and can be located in the tree
+'                          - Qty is the number of that part below that path,
+'                            the sum over the rows stays the total quantity
+'
+' BOTH versions write:
+'   - Column N "First Level": the first level node (direct child of the root)
+'     the row belongs to, so the BOM can be filtered per first level
+'   - Column O "Type": Assembly / Part / Body
+'   - Columns A..M unchanged, so both sheets import into the ACE cost model
 '
 ' NEW FEATURE (multi-body CATPart):
 '   - If a leaf CATPart contains MORE THAN ONE solid Body (PartBody), each
@@ -41,20 +51,15 @@ Public Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
 ' ==============================================================================
 ' SETTINGS
 ' ==============================================================================
-' Sub-assemblies (products that have children) get their own row, so the whole
-' tree structure is visible and a part can be located inside its assembly.
-Private Const INCLUDE_SUBASSEMBLIES As Boolean = True
-
-' How the rows are grouped:
-'   "PARENT" - one row per part per parent assembly (structured BOM, default).
-'              Every assembly shows its own content, so a part that sits in
-'              three assemblies is listed under each of them. Qty is the total
-'              number of that part below that path, so the sum over all rows is
-'              still the total quantity of the part in the product.
-'   "FIRST"  - one row per part per first level branch
-'   "GLOBAL" - one row per part in the whole tree (behaviour of the old macro);
-'              column N then lists the first level branches comma separated
-Private Const GROUP_BY As String = "PARENT"
+' --- run mode --------------------------------------------------------------
+' Both entry points set these two before the run; they are never changed by
+' hand. mGroupBy can be:
+'   "GLOBAL" - one row per part number in the whole tree (part list); column N
+'              then lists all first level branches the part is used in
+'   "PARENT" - one row per part per parent assembly (assembly structure)
+'   "FIRST"  - one row per part per first level branch (in between)
+Private mIncludeSubassemblies As Boolean
+Private mGroupBy As String
 
 ' False = column N shows the part number of the first level node,
 ' True  = column N shows its description
@@ -70,7 +75,33 @@ Private Const MAX_ASSY_LEAVES_FOR_SHOT As Long = 400
 Private Const ASSY_SETTLE_MS As Long = 200
 
 
+' ==============================================================================
+' ENTRY POINT 1: PART LIST  (the classic BOM - same result as before)
+' One row per part number, Qty = instances in the whole product, no assembly
+' rows. Column N lists the first level branch(es) the part is used in.
+' ==============================================================================
 Sub GenerateMasterBOM()
+    mIncludeSubassemblies = False
+    mGroupBy = "GLOBAL"
+    Call RunBOM
+End Sub
+
+' ==============================================================================
+' ENTRY POINT 2: ASSEMBLY STRUCTURE
+' Sub-assemblies get their own row and every assembly lists its own content,
+' so a part can be located inside the tree. Longer list, same columns.
+' ==============================================================================
+Sub GenerateAssemblyBOM()
+    mIncludeSubassemblies = True
+    mGroupBy = "PARENT"
+    Call RunBOM
+End Sub
+
+
+' ==============================================================================
+' THE WORKER USED BY BOTH ENTRY POINTS
+' ==============================================================================
+Private Sub RunBOM()
 
     ' --- 1. SETUP & VARIABLES ---
     Dim catDoc As Document
@@ -442,8 +473,11 @@ Sub GenerateMasterBOM()
     xlSheet.Range("B1:O1").AutoFilter
     On Error GoTo Fail
 
-    MsgBox "BOM Exported Successfully!" & vbCrLf & _
-           "Rows written:    " & (r - 2) & vbCrLf & _
+    Dim modeName As String
+    If mIncludeSubassemblies Then modeName = "Assembly structure" Else modeName = "Part list"
+
+    MsgBox "BOM Exported Successfully!  (" & modeName & ")" & vbCrLf & _
+           "Rows written:     " & (r - 2) & vbCrLf & _
            "  sub-assemblies: " & nAssyRows & vbCrLf & _
            "  parts:          " & nPartRows & vbCrLf & _
            "Time elapsed: " & Format(Timer - startTime, "0.0") & " seconds", vbInformation
@@ -617,7 +651,7 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
             ' below this node
             sKey = MakeRowKey(parentKey, childFirst, partNum)
 
-            If INCLUDE_SUBASSEMBLIES And partNum <> "" Then
+            If mIncludeSubassemblies And partNum <> "" Then
                 If dQty.Exists(sKey) Then
                     dQty(sKey) = dQty(sKey) + 1
                     Call AddFirstLevel(dFirst, sKey, childFirst)
@@ -632,7 +666,7 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
                                            colLeaves, currentLevel + 1, childFirst, sKey)
 
             ' the leaves below this node are needed to show it for its screenshot
-            If INCLUDE_SUBASSEMBLIES And partNum <> "" Then
+            If mIncludeSubassemblies And partNum <> "" Then
                 If Not dNodeLeaves.Exists(sKey) Then dNodeLeaves.Add sKey, childLeaves
             End If
 
@@ -677,7 +711,7 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
 End Function
 
 ' ==============================================================================
-' HELPER: KEY OF A BOM ROW - see GROUP_BY at the top of the module
+' HELPER: KEY OF A BOM ROW - see the run mode at the top of the module
 '   "PARENT" (default): the path of the parent assemblies, so every assembly
 '                       lists its own content and a part that sits in several
 '                       assemblies appears below each of them
@@ -686,7 +720,7 @@ End Function
 ' ==============================================================================
 Function MakeRowKey(ByVal parentKey As String, ByVal firstLevel As String, _
                     ByVal partNum As String) As String
-    Select Case UCase$(GROUP_BY)
+    Select Case UCase$(mGroupBy)
         Case "GLOBAL"
             MakeRowKey = partNum
         Case "FIRST"
@@ -755,13 +789,13 @@ End Sub
 
 ' ==============================================================================
 ' HELPER: COLLECT THE FIRST LEVEL NAMES OF A ROW
-' Only used with GROUP_BY = "GLOBAL": one row can then belong to several first
-' level branches, which are listed comma separated.
+' Only used in the part list ("GLOBAL"): one row can then belong to several
+' first level branches, which are listed comma separated.
 ' ==============================================================================
 Sub AddFirstLevel(dFirst As Object, ByVal sKey As String, ByVal firstLevel As String)
     Dim cur As String
 
-    If UCase$(GROUP_BY) <> "GLOBAL" Then Exit Sub
+    If UCase$(mGroupBy) <> "GLOBAL" Then Exit Sub
     If Len(firstLevel) = 0 Then Exit Sub
     If Not dFirst.Exists(sKey) Then Exit Sub
 

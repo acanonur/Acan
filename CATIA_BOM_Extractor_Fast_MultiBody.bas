@@ -125,8 +125,19 @@ Private Const ASSY_SETTLE_MS As Long = 120
 ' Multi-body detection has to load every leaf CATPart. Switch it off when you do
 ' not need one row per body: on a big tree that alone saves most of the loading.
 Private Const DETECT_MULTIBODY As Boolean = True
-' Design mode is applied ONCE to the root instead of once per node.
-Private Const FORCE_DESIGN_MODE As Boolean = True
+' Product.ApplyWorkMode is RECURSIVE: one call on the root promotes every
+' CATPart of the assembly in a single blocking COM call - that is the long
+' "CATIA not responding" phase before the first row appears. Parts are promoted
+' one at a time in the row loop instead, which spreads the same work over a
+' responsive UI. Set this to True only if your parts must all be loaded first.
+Private Const FORCE_DESIGN_MODE As Boolean = False
+
+' Mass / volume / area of a sub-assembly row. Reading them means a full
+' recursive evaluation of the whole subtree per node (WetArea worst of all) and
+' is the biggest single cost of the assembly structure version. The numbers are
+' the sum of the part rows listed below the node anyway, so they are off by
+' default.
+Private Const ASSEMBLY_METRICS As Boolean = False
 
 ' --- caches (filled during the run) ------------------------------------------
 Private mDimCache As Object      ' part number -> Array(L, W, H)
@@ -188,6 +199,8 @@ Private Sub RunBOM()
     Dim colNodeLeaves As Collection
     Dim nAssyRows As Long, nPartRows As Long
     Dim cacheArr As Variant
+    Dim solidNames() As String
+    Dim nSolid As Integer
 
     ' Part data
     Dim oPart As Part
@@ -282,7 +295,18 @@ Private Sub RunBOM()
     CATIA.RefreshDisplay = True
     On Error GoTo Fail
 
-    If dictQty.Count = 0 Then MsgBox "No parts found.", vbInformation: Exit Sub
+    If dictQty.Count = 0 Then
+        ' nothing to write - but the two SESSION flags this run changed must be
+        ' put back, otherwise CATIA stays without file alerts and without HSO
+        ' synchronisation until it is restarted
+        On Error Resume Next
+        CATIA.HSOSynchronized = True
+        CATIA.DisplayFileAlerts = True
+        Err.Clear
+        On Error GoTo Fail
+        MsgBox "No parts found.", vbInformation
+        Exit Sub
+    End If
 
     ' --- 4. EXCEL SETUP ---
     On Error Resume Next
@@ -318,6 +342,7 @@ Private Sub RunBOM()
         .Columns("B:B").ColumnWidth = 8
         .Columns("C:D").ColumnWidth = 20
         .Columns("F:H").NumberFormat = "0.000000000"
+        .Columns("I:K").NumberFormat = "0.0"
         .Columns("M:M").NumberFormat = "0.000"
         .Columns("N:N").ColumnWidth = 22
         .Columns("O:O").ColumnWidth = 10
@@ -379,16 +404,40 @@ Private Sub RunBOM()
         End If
 
         propsArray = dictProps(uniqueKey)
-        xlSheet.Cells(r, 6).Value = propsArray(0)
-        xlSheet.Cells(r, 7).Value = propsArray(1)
-        xlSheet.Cells(r, 8).Value = propsArray(2)
+        If isAssy And Not ASSEMBLY_METRICS Then
+            xlSheet.Cells(r, 6).Value = ""      ' sum of the rows below it
+            xlSheet.Cells(r, 7).Value = ""
+            xlSheet.Cells(r, 8).Value = ""
+        Else
+            xlSheet.Cells(r, 6).Value = propsArray(0)
+            xlSheet.Cells(r, 7).Value = propsArray(1)
+            xlSheet.Cells(r, 8).Value = propsArray(2)
+        End If
 
         ' Try to read part data without opening any window
         ' (a sub-assembly has no CATPart of its own)
         hasPart = False
         Set oPart = Nothing
         Set oPartDoc = Nothing
-        If Not isAssy Then hasPart = TryGetLoadedPart(oPartProd, oPart, oPartDoc)
+        If Not isAssy Then
+            ' promote just this part to design mode - one small step per row
+            ' instead of one huge blocking call over the whole tree
+            On Error Resume Next
+            oPartProd.ApplyWorkMode 2
+            Err.Clear
+            On Error GoTo Fail
+            hasPart = TryGetLoadedPart(oPartProd, oPart, oPartDoc)
+        End If
+
+        ' multi-body detection moved out of the traversal: it needs a loaded
+        ' CATPart, and doing it here keeps the traversal free of any loading
+        If hasPart And DETECT_MULTIBODY And Not mBodyCache.Exists(strPartNum) Then
+            mBodyCache.Add strPartNum, True
+            nSolid = GetSolidBodyNames(oPart, solidNames)
+            If nSolid > 1 Then
+                If Not dictBodies.Exists(strPartNum) Then dictBodies.Add strPartNum, solidNames
+            End If
+        End If
 
         ' --- MATERIAL & DENSITY (measured once per part number) ---
         strMatName = "N/A"
@@ -433,9 +482,10 @@ Private Sub RunBOM()
             mDimCache.Add strPartNum, Array(dims(0), dims(1), dims(2))
         End If
 
-        If dims(0) > 0 Then xlSheet.Cells(r, 9).Value = Format(dims(0), "0.0") Else xlSheet.Cells(r, 9).Value = "N/A"
-        If dims(1) > 0 Then xlSheet.Cells(r, 10).Value = Format(dims(1), "0.0") Else xlSheet.Cells(r, 10).Value = "N/A"
-        If dims(2) > 0 Then xlSheet.Cells(r, 11).Value = Format(dims(2), "0.0") Else xlSheet.Cells(r, 11).Value = "N/A"
+        ' numbers, not Format() strings - otherwise the columns are text
+        If dims(0) > 0 Then xlSheet.Cells(r, 9).Value = dims(0) Else xlSheet.Cells(r, 9).Value = "N/A"
+        If dims(1) > 0 Then xlSheet.Cells(r, 10).Value = dims(1) Else xlSheet.Cells(r, 10).Value = "N/A"
+        If dims(2) > 0 Then xlSheet.Cells(r, 11).Value = dims(2) Else xlSheet.Cells(r, 11).Value = "N/A"
 
         ' --- SCREENSHOT ------------------------------------------------------
         ' Part: show only that instance. Sub-assembly: show all leaf instances
@@ -527,9 +577,9 @@ Private Sub RunBOM()
                     ' equivalent box from the body inertia - creates nothing
                     If dims(0) < 0.1 Then Call GetBodyInertiaDims(oPartDoc, oBody, dims)
 
-                    If dims(0) > 0 Then xlSheet.Cells(r, 9).Value = Format(dims(0), "0.0") Else xlSheet.Cells(r, 9).Value = "N/A"
-                    If dims(1) > 0 Then xlSheet.Cells(r, 10).Value = Format(dims(1), "0.0") Else xlSheet.Cells(r, 10).Value = "N/A"
-                    If dims(2) > 0 Then xlSheet.Cells(r, 11).Value = Format(dims(2), "0.0") Else xlSheet.Cells(r, 11).Value = "N/A"
+                    If dims(0) > 0 Then xlSheet.Cells(r, 9).Value = dims(0) Else xlSheet.Cells(r, 9).Value = "N/A"
+                    If dims(1) > 0 Then xlSheet.Cells(r, 10).Value = dims(1) Else xlSheet.Cells(r, 10).Value = "N/A"
+                    If dims(2) > 0 Then xlSheet.Cells(r, 11).Value = dims(2) Else xlSheet.Cells(r, 11).Value = "N/A"
 
                     xlSheet.Cells(r, 12).Value = bMat
                     If bDens > 0 Then
@@ -783,10 +833,6 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
     Dim myLeaves As Collection, childLeaves As Collection
     Dim k As Long
     Dim sKey As String, childFirst As String
-    Dim oLeafPart As Part
-    Dim oLeafDoc As PartDocument
-    Dim solidNames() As String
-    Dim nSolid As Integer
 
     Set myLeaves = New Collection
     Set TraverseTree = myLeaves          ' set early: an error still returns a list
@@ -866,19 +912,9 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
                     Call AddBomRow(dQty, dRef, dDesc, dProps, dLevel, dPartNum, dFirst, dIsAssy, _
                                    sKey, childProd, partNum, childFirst, currentLevel, False)
 
-                    ' Multi-body detection: CATPart with more than one solid
-                    ' body => treat each body as a sub-part later. This has to
-                    ' load the CATPart, so it is switchable and the answer is
-                    ' remembered per part number.
-                    If DETECT_MULTIBODY And Not mBodyCache.Exists(partNum) Then
-                        mBodyCache.Add partNum, True          ' asked already
-                        If TryGetLoadedPart(childProd, oLeafPart, oLeafDoc) Then
-                            nSolid = GetSolidBodyNames(oLeafPart, solidNames)
-                            If nSolid > 1 Then
-                                If Not dBodies.Exists(partNum) Then dBodies.Add partNum, solidNames
-                            End If
-                        End If
-                    End If
+                    ' NOTE: multi-body detection used to happen here. It needs a
+                    ' loaded CATPart, so it forced the whole tree into memory
+                    ' during the traversal. It is done in the row loop now.
                 End If
             End If
         End If
@@ -960,8 +996,13 @@ Sub AddBomRow(dQty As Object, dRef As Object, dDesc As Object, dProps As Object,
     On Error GoTo 0
     dDesc.Add sKey, sDesc
 
-    Call ReadProductProps(oProd, dMass, dVol, dArea)
-    dProps.Add sKey, Array(dMass, dVol, dArea)
+    If isAssembly And Not ASSEMBLY_METRICS Then
+        ' structure row: no recursive mass / volume / wet area evaluation
+        dProps.Add sKey, Array(0#, 0#, 0#)
+    Else
+        Call ReadProductProps(oProd, dMass, dVol, dArea)
+        dProps.Add sKey, Array(dMass, dVol, dArea)
+    End If
 End Sub
 
 ' ==============================================================================
@@ -1363,7 +1404,7 @@ Function MeasureAABBExtremum(oPart As Part, oPartDoc As PartDocument, _
     Dim oTmpSet As HybridBody
     Err.Clear
     Set oTmpSet = oPart.HybridBodies.Add()
-    If oTmpSet Is Nothing Then GoTo CleanupE
+    If oTmpSet Is Nothing Then mBBoxDisabled = True: GoTo CleanupE
     oTmpSet.Name = "TMP_BOM_MEASURE"
     oPart.InWorkObject = oTmpSet
 
@@ -1390,7 +1431,7 @@ Function MeasureAABBExtremum(oPart As Part, oPartDoc As PartDocument, _
         End If
 
         Set oDir = Nothing
-        If okAll = False Then Exit For
+        If okAll = False Then mBBoxDisabled = True: Exit For
     Next k
 
     ' Restore the in-work object BEFORE deleting - deleting the set while
@@ -1399,17 +1440,22 @@ Function MeasureAABBExtremum(oPart As Part, oPartDoc As PartDocument, _
     Err.Clear
     oPart.InWorkObject = oPart.MainBody
 
-    ' Hide the temporary set instead of running the interactive Delete command,
-    ' which is what pops CATIA's modal panel. The set stays in the part until it
-    ' is closed without saving - that is the price of MEASURE_MODE = "BOX".
+    ' Remove the temporary set through the FACTORY (no interactive Delete
+    ' command, so no modal panel). If that is refused, hide it - it then stays
+    ' in the part until it is closed without saving, the price of "BOX" mode.
     Dim oPartSel As Selection
     Err.Clear
-    Set oPartSel = oPartDoc.Selection
-    oPartSel.Clear
-    oPartSel.Add oTmpSet
-    oPartSel.VisProperties.SetShow 1
-    oPartSel.Clear
-    Set oPartSel = Nothing
+    oHSF.DeleteObjectForDatum oPart.CreateReferenceFromObject(oTmpSet)
+    If Err.Number <> 0 Then
+        Err.Clear
+        Set oPartSel = oPartDoc.Selection
+        oPartSel.Clear
+        oPartSel.Add oTmpSet
+        oPartSel.VisProperties.SetShow 1
+        oPartSel.Clear
+        Set oPartSel = Nothing
+    End If
+    Err.Clear
 
     If okAll Then
         If (spans(0) + spans(1) + spans(2)) > 0.1 Then

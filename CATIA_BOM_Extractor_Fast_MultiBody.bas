@@ -24,11 +24,14 @@ Option Explicit
 '     part only the target is shown and hidden again.
 '   - Excel ScreenUpdating is off while rows are written.
 '
-' IF SOMETHING IS STILL SLOW, the settings block below has the switches:
-'   DETECT_MULTIBODY = False      no CATPart is loaded during the traversal
-'   CAPTURE_PART_SHOTS = False    no thumbnails at all - by far the biggest win
-'   CAPTURE_ASSEMBLY_SHOTS        off by default (it has to show every leaf)
-'   MEASURE_MODE = "BOX"          exact bounding box, but slow and noisy
+' IF IT IS TOO SLOW, the settings block below has the switches - each of them
+' trades content for speed:
+'   CAPTURE_ASSEMBLY_SHOTS = False  no pictures on the assembly rows
+'   CAPTURE_PART_SHOTS = False      no pictures at all - the biggest single win
+'   ASSEMBLY_VOLUME_AREA = False    assembly rows keep the mass, lose volume/area
+'   ASSEMBLY_METRICS = False        assembly rows have no mass/volume/area
+'   DETECT_MULTIBODY = False        no extra row per body of a multi-body part
+'   MEASURE_MODE = "BOX"           (the opposite: exact box, but slow and noisy)
 '
 ' TWO VERSIONS - PICK THE ONE YOU NEED (Tools > Macro > Macros):
 '
@@ -103,10 +106,13 @@ Private Const MEASURE_MODE As String = "SAFE"
 
 ' --- SCREENSHOTS ------------------------------------------------------------
 Private Const CAPTURE_PART_SHOTS As Boolean = True
-' Assembly thumbnails have to show and hide every leaf below the node, which is
-' the most expensive thing in the whole run - off by default.
-Private Const CAPTURE_ASSEMBLY_SHOTS As Boolean = False
-Private Const MAX_ASSY_LEAVES_FOR_SHOT As Long = 50
+' Assembly thumbnails have to show and hide every leaf below the node. That is
+' the most expensive single thing in the run, but without it the assembly rows
+' have no picture at all - so it stays ON, with a cap: a node with more leaves
+' than the limit is listed without a picture instead of stalling the run.
+' Set CAPTURE_ASSEMBLY_SHOTS = False if you want the run as fast as possible.
+Private Const CAPTURE_ASSEMBLY_SHOTS As Boolean = True
+Private Const MAX_ASSY_LEAVES_FOR_SHOT As Long = 400
 ' One fixed isometric viewpoint for all pictures instead of whatever camera the
 ' session happened to be left in.
 Private Const SET_ISO_VIEW As Boolean = True
@@ -132,17 +138,21 @@ Private Const DETECT_MULTIBODY As Boolean = True
 ' responsive UI. Set this to True only if your parts must all be loaded first.
 Private Const FORCE_DESIGN_MODE As Boolean = False
 
-' Mass / volume / area of a sub-assembly row. Reading them means a full
-' recursive evaluation of the whole subtree per node (WetArea worst of all) and
-' is the biggest single cost of the assembly structure version. The numbers are
-' the sum of the part rows listed below the node anyway, so they are off by
-' default.
-Private Const ASSEMBLY_METRICS As Boolean = False
+' Mass / volume / area of a sub-assembly row. Reading them means a recursive
+' evaluation over the whole subtree, so they are the expensive part of the
+' assembly structure version - but without them the assembly rows are empty,
+' so they stay ON.
+Private Const ASSEMBLY_METRICS As Boolean = True
+' ... of the three, Volume and WetArea are the costly ones (a full B-Rep
+' integration over the subtree). Set this to False to keep only the mass on
+' assembly rows if the run is too slow.
+Private Const ASSEMBLY_VOLUME_AREA As Boolean = True
 
 ' --- caches (filled during the run) ------------------------------------------
 Private mDimCache As Object      ' part number -> Array(L, W, H)
 Private mMatCache As Object      ' part number -> Array(material, density)
 Private mBodyCache As Object     ' part number -> Variant array of body names
+Private mPropCache As Object     ' part number -> Array(mass, volume, area)
 Private mBBoxDisabled As Boolean ' the temp geometry path failed once - stop it
 
 
@@ -201,6 +211,7 @@ Private Sub RunBOM()
     Dim cacheArr As Variant
     Dim solidNames() As String
     Dim nSolid As Integer
+    Dim dMass As Double, dVol As Double, dArea As Double
 
     ' Part data
     Dim oPart As Part
@@ -271,6 +282,7 @@ Private Sub RunBOM()
     Set mDimCache = CreateObject("Scripting.Dictionary")
     Set mMatCache = CreateObject("Scripting.Dictionary")
     Set mBodyCache = CreateObject("Scripting.Dictionary")
+    Set mPropCache = CreateObject("Scripting.Dictionary")
     mBBoxDisabled = False
 
     ' Selection.Add is used thousands of times; without this every single one
@@ -403,31 +415,37 @@ Private Sub RunBOM()
             xlSheet.Cells(r, 15).Value = "Part"
         End If
 
-        propsArray = dictProps(uniqueKey)
-        If isAssy And Not ASSEMBLY_METRICS Then
-            xlSheet.Cells(r, 6).Value = ""      ' sum of the rows below it
-            xlSheet.Cells(r, 7).Value = ""
-            xlSheet.Cells(r, 8).Value = ""
+        ' --- MASS / VOLUME / AREA (read once per part number, after loading) ---
+        If mPropCache.Exists(strPartNum) Then
+            propsArray = mPropCache(strPartNum)
         Else
-            xlSheet.Cells(r, 6).Value = propsArray(0)
-            xlSheet.Cells(r, 7).Value = propsArray(1)
-            xlSheet.Cells(r, 8).Value = propsArray(2)
+            dMass = 0: dVol = 0: dArea = 0
+            If (Not isAssy) Or ASSEMBLY_METRICS Then
+                Call ReadProductProps(oPartProd, dMass, dVol, dArea, isAssy)
+            End If
+            propsArray = Array(dMass, dVol, dArea)
+            mPropCache.Add strPartNum, propsArray
         End If
+
+        If propsArray(0) > 0 Then xlSheet.Cells(r, 6).Value = propsArray(0) Else xlSheet.Cells(r, 6).Value = "N/A"
+        If propsArray(1) > 0 Then xlSheet.Cells(r, 7).Value = propsArray(1) Else xlSheet.Cells(r, 7).Value = "N/A"
+        If propsArray(2) > 0 Then xlSheet.Cells(r, 8).Value = propsArray(2) Else xlSheet.Cells(r, 8).Value = "N/A"
+
+        ' Promote THIS node to design mode: mass, volume, area and the inertia
+        ' box are all 0 on a component that is still in visualization mode.
+        ' Doing it row by row instead of once over the whole tree keeps the
+        ' interface alive between the rows.
+        On Error Resume Next
+        oPartProd.ApplyWorkMode 2
+        Err.Clear
+        On Error GoTo Fail
 
         ' Try to read part data without opening any window
         ' (a sub-assembly has no CATPart of its own)
         hasPart = False
         Set oPart = Nothing
         Set oPartDoc = Nothing
-        If Not isAssy Then
-            ' promote just this part to design mode - one small step per row
-            ' instead of one huge blocking call over the whole tree
-            On Error Resume Next
-            oPartProd.ApplyWorkMode 2
-            Err.Clear
-            On Error GoTo Fail
-            hasPart = TryGetLoadedPart(oPartProd, oPart, oPartDoc)
-        End If
+        If Not isAssy Then hasPart = TryGetLoadedPart(oPartProd, oPart, oPartDoc)
 
         ' multi-body detection moved out of the traversal: it needs a loaded
         ' CATPart, and doing it here keeps the traversal free of any loading
@@ -996,13 +1014,10 @@ Sub AddBomRow(dQty As Object, dRef As Object, dDesc As Object, dProps As Object,
     On Error GoTo 0
     dDesc.Add sKey, sDesc
 
-    If isAssembly And Not ASSEMBLY_METRICS Then
-        ' structure row: no recursive mass / volume / wet area evaluation
-        dProps.Add sKey, Array(0#, 0#, 0#)
-    Else
-        Call ReadProductProps(oProd, dMass, dVol, dArea)
-        dProps.Add sKey, Array(dMass, dVol, dArea)
-    End If
+    ' Mass / volume / area are NOT read here: during the traversal the CATParts
+    ' may still be unloaded, and then every value would come back as 0. They are
+    ' read in the row loop, after the node has been promoted to design mode.
+    dProps.Add sKey, Array(0#, 0#, 0#)
 End Sub
 
 ' ==============================================================================
@@ -1029,7 +1044,8 @@ End Sub
 ' HELPER: MASS / VOLUME / AREA OF A PRODUCT (works for parts and assemblies)
 ' Volume in m3, area in m2 - same units as before
 ' ==============================================================================
-Sub ReadProductProps(oProd As Product, ByRef dMass As Double, ByRef dVol As Double, ByRef dArea As Double)
+Sub ReadProductProps(oProd As Product, ByRef dMass As Double, ByRef dVol As Double, _
+                     ByRef dArea As Double, ByVal isAssembly As Boolean)
     Dim oAnalyze As Object
     Dim oInertia As Object
 
@@ -1040,8 +1056,12 @@ Sub ReadProductProps(oProd As Product, ByRef dMass As Double, ByRef dVol As Doub
     Set oAnalyze = oProd.Analyze
     If Not oAnalyze Is Nothing Then
         dMass = oAnalyze.Mass
-        dVol = oAnalyze.Volume / (1000# ^ 3)
-        dArea = oAnalyze.WetArea / (1000# ^ 2)
+        ' Volume and WetArea integrate over the whole subtree - on an assembly
+        ' row that is the expensive part, so it can be switched off
+        If (Not isAssembly) Or ASSEMBLY_VOLUME_AREA Then
+            dVol = oAnalyze.Volume / (1000# ^ 3)
+            dArea = oAnalyze.WetArea / (1000# ^ 2)
+        End If
     End If
 
     If dMass <= 0.0000001 Then

@@ -137,6 +137,11 @@ Private Const DETECT_MULTIBODY As Boolean = True
 ' one at a time in the row loop instead, which spreads the same work over a
 ' responsive UI. Set this to True only if your parts must all be loaded first.
 Private Const FORCE_DESIGN_MODE As Boolean = False
+' Sub-assembly rows are promoted too, because their mass/volume/area and their
+' inertia box are 0 otherwise. ApplyWorkMode is recursive, so the first level 1
+' assembly row loads its whole branch in one blocking call - set this to False
+' if you would rather have empty assembly rows than that wait.
+Private Const PROMOTE_ASSEMBLY_ROWS As Boolean = True
 
 ' Mass / volume / area of a sub-assembly row. Reading them means a recursive
 ' evaluation over the whole subtree, so they are the expensive part of the
@@ -415,30 +420,18 @@ Private Sub RunBOM()
             xlSheet.Cells(r, 15).Value = "Part"
         End If
 
-        ' --- MASS / VOLUME / AREA (read once per part number, after loading) ---
-        If mPropCache.Exists(strPartNum) Then
-            propsArray = mPropCache(strPartNum)
-        Else
-            dMass = 0: dVol = 0: dArea = 0
-            If (Not isAssy) Or ASSEMBLY_METRICS Then
-                Call ReadProductProps(oPartProd, dMass, dVol, dArea, isAssy)
-            End If
-            propsArray = Array(dMass, dVol, dArea)
-            mPropCache.Add strPartNum, propsArray
+        ' Promote THIS node to design mode FIRST: mass, volume, area and the
+        ' inertia box all come back as 0 on a component that is still in
+        ' visualization mode. On an assembly node the call is recursive, so the
+        ' first one can take a while - that is the price of having the numbers,
+        ' and PROMOTE_ASSEMBLY_ROWS switches it off.
+        If (Not isAssy) Or PROMOTE_ASSEMBLY_ROWS Then
+            On Error Resume Next
+            CATIA.StatusBar = "BOM: loading " & strPartNum & " ..."
+            oPartProd.ApplyWorkMode 2
+            Err.Clear
+            On Error GoTo Fail
         End If
-
-        If propsArray(0) > 0 Then xlSheet.Cells(r, 6).Value = propsArray(0) Else xlSheet.Cells(r, 6).Value = "N/A"
-        If propsArray(1) > 0 Then xlSheet.Cells(r, 7).Value = propsArray(1) Else xlSheet.Cells(r, 7).Value = "N/A"
-        If propsArray(2) > 0 Then xlSheet.Cells(r, 8).Value = propsArray(2) Else xlSheet.Cells(r, 8).Value = "N/A"
-
-        ' Promote THIS node to design mode: mass, volume, area and the inertia
-        ' box are all 0 on a component that is still in visualization mode.
-        ' Doing it row by row instead of once over the whole tree keeps the
-        ' interface alive between the rows.
-        On Error Resume Next
-        oPartProd.ApplyWorkMode 2
-        Err.Clear
-        On Error GoTo Fail
 
         ' Try to read part data without opening any window
         ' (a sub-assembly has no CATPart of its own)
@@ -457,6 +450,25 @@ Private Sub RunBOM()
             End If
         End If
 
+        ' --- MASS / VOLUME / AREA (now that the node is loaded) ---
+        ' A zero result is NOT cached: it usually means "this instance could not
+        ' be loaded", and caching it would condemn every other row that shares
+        ' the part number.
+        If mPropCache.Exists(strPartNum) Then
+            propsArray = mPropCache(strPartNum)
+        Else
+            dMass = 0: dVol = 0: dArea = 0
+            If (Not isAssy) Or ASSEMBLY_METRICS Then
+                Call ReadProductProps(oPartProd, dMass, dVol, dArea, isAssy)
+            End If
+            propsArray = Array(dMass, dVol, dArea)
+            If dMass > 0 Or dVol > 0 Or dArea > 0 Then mPropCache.Add strPartNum, propsArray
+        End If
+
+        If propsArray(0) > 0 Then xlSheet.Cells(r, 6).Value = propsArray(0) Else xlSheet.Cells(r, 6).Value = "N/A"
+        If propsArray(1) > 0 Then xlSheet.Cells(r, 7).Value = propsArray(1) Else xlSheet.Cells(r, 7).Value = "N/A"
+        If propsArray(2) > 0 Then xlSheet.Cells(r, 8).Value = propsArray(2) Else xlSheet.Cells(r, 8).Value = "N/A"
+
         ' --- MATERIAL & DENSITY (measured once per part number) ---
         strMatName = "N/A"
         dDensity = 0
@@ -467,7 +479,8 @@ Private Sub RunBOM()
                 dDensity = CDbl(cacheArr(1))
             Else
                 Call GetMaterialAndDensity(oPart, strMatName, dDensity)
-                mMatCache.Add strPartNum, Array(strMatName, dDensity)
+                If dDensity > 0 Or strMatName <> "N/A" Then _
+                    mMatCache.Add strPartNum, Array(strMatName, dDensity)
             End If
         End If
 
@@ -497,7 +510,7 @@ Private Sub RunBOM()
                 Err.Clear
                 On Error GoTo Fail
             End If
-            mDimCache.Add strPartNum, Array(dims(0), dims(1), dims(2))
+            If dims(0) > 0 Then mDimCache.Add strPartNum, Array(dims(0), dims(1), dims(2))
         End If
 
         ' numbers, not Format() strings - otherwise the columns are text

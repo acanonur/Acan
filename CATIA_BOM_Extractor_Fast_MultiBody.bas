@@ -24,11 +24,14 @@ Option Explicit
 '     part only the target is shown and hidden again.
 '   - Excel ScreenUpdating is off while rows are written.
 '
-' IF SOMETHING IS STILL SLOW, the settings block below has the switches:
-'   DETECT_MULTIBODY = False      no CATPart is loaded during the traversal
-'   CAPTURE_PART_SHOTS = False    no thumbnails at all - by far the biggest win
-'   CAPTURE_ASSEMBLY_SHOTS        off by default (it has to show every leaf)
-'   MEASURE_MODE = "BOX"          exact bounding box, but slow and noisy
+' IF IT IS TOO SLOW, the settings block below has the switches - each of them
+' trades content for speed:
+'   CAPTURE_ASSEMBLY_SHOTS = False  no pictures on the assembly rows
+'   CAPTURE_PART_SHOTS = False      no pictures at all - the biggest single win
+'   ASSEMBLY_VOLUME_AREA = False    assembly rows keep the mass, lose volume/area
+'   ASSEMBLY_METRICS = False        assembly rows have no mass/volume/area
+'   DETECT_MULTIBODY = False        no extra row per body of a multi-body part
+'   MEASURE_MODE = "BOX"           (the opposite: exact box, but slow and noisy)
 '
 ' TWO VERSIONS - PICK THE ONE YOU NEED (Tools > Macro > Macros):
 '
@@ -103,10 +106,13 @@ Private Const MEASURE_MODE As String = "SAFE"
 
 ' --- SCREENSHOTS ------------------------------------------------------------
 Private Const CAPTURE_PART_SHOTS As Boolean = True
-' Assembly thumbnails have to show and hide every leaf below the node, which is
-' the most expensive thing in the whole run - off by default.
-Private Const CAPTURE_ASSEMBLY_SHOTS As Boolean = False
-Private Const MAX_ASSY_LEAVES_FOR_SHOT As Long = 50
+' Assembly thumbnails have to show and hide every leaf below the node. That is
+' the most expensive single thing in the run, but without it the assembly rows
+' have no picture at all - so it stays ON, with a cap: a node with more leaves
+' than the limit is listed without a picture instead of stalling the run.
+' Set CAPTURE_ASSEMBLY_SHOTS = False if you want the run as fast as possible.
+Private Const CAPTURE_ASSEMBLY_SHOTS As Boolean = True
+Private Const MAX_ASSY_LEAVES_FOR_SHOT As Long = 400
 ' One fixed isometric viewpoint for all pictures instead of whatever camera the
 ' session happened to be left in.
 Private Const SET_ISO_VIEW As Boolean = True
@@ -131,18 +137,37 @@ Private Const DETECT_MULTIBODY As Boolean = True
 ' one at a time in the row loop instead, which spreads the same work over a
 ' responsive UI. Set this to True only if your parts must all be loaded first.
 Private Const FORCE_DESIGN_MODE As Boolean = False
+' Sub-assembly rows are promoted too, because their mass/volume/area and their
+' inertia box are 0 otherwise. ApplyWorkMode is recursive, so the first level 1
+' assembly row loads its whole branch in one blocking call - set this to False
+' if you would rather have empty assembly rows than that wait.
+Private Const PROMOTE_ASSEMBLY_ROWS As Boolean = True
 
-' Mass / volume / area of a sub-assembly row. Reading them means a full
-' recursive evaluation of the whole subtree per node (WetArea worst of all) and
-' is the biggest single cost of the assembly structure version. The numbers are
-' the sum of the part rows listed below the node anyway, so they are off by
-' default.
-Private Const ASSEMBLY_METRICS As Boolean = False
+' A component in NoShow hides its WHOLE subtree in the 3D view, whatever the
+' children say. So a leaf below a sub-assembly that the user had hidden would be
+' captured as an empty picture. The run therefore shows every node once and then
+' hides only the leaves. Side effect: components that were hidden before the run
+' are visible after it. Set PRESERVE_VISIBILITY = True to have the macro record
+' the previous state of every node and put it back - correct, but it costs one
+' selection round trip per node before the first row.
+Private Const PRESERVE_VISIBILITY As Boolean = False
+
+' Mass / volume / area of a sub-assembly row. Reading them means a recursive
+' evaluation over the whole subtree, so they are the expensive part of the
+' assembly structure version - but without them the assembly rows are empty,
+' so they stay ON.
+Private Const ASSEMBLY_METRICS As Boolean = True
+' ... of the three, Volume and WetArea are the costly ones (a full B-Rep
+' integration over the subtree). Set this to False to keep only the mass on
+' assembly rows if the run is too slow.
+Private Const ASSEMBLY_VOLUME_AREA As Boolean = True
 
 ' --- caches (filled during the run) ------------------------------------------
 Private mDimCache As Object      ' part number -> Array(L, W, H)
 Private mMatCache As Object      ' part number -> Array(material, density)
 Private mBodyCache As Object     ' part number -> Variant array of body names
+Private mPropCache As Object     ' part number -> Array(mass, volume, area)
+Private mAllNodes As Collection  ' every visited instance: assemblies AND leaves
 Private mBBoxDisabled As Boolean ' the temp geometry path failed once - stop it
 
 
@@ -187,6 +212,7 @@ Private Sub RunBOM()
 
     ' Every leaf instance in the tree (needed to hide them all in one shot)
     Dim colLeaves As Collection
+    Dim colWasShown As Collection, colWasHidden As Collection
 
     ' Excel
     Dim xlApp As Object, xlBook As Object, xlSheet As Object
@@ -201,6 +227,7 @@ Private Sub RunBOM()
     Dim cacheArr As Variant
     Dim solidNames() As String
     Dim nSolid As Integer
+    Dim dMass As Double, dVol As Double, dArea As Double
 
     ' Part data
     Dim oPart As Part
@@ -271,6 +298,8 @@ Private Sub RunBOM()
     Set mDimCache = CreateObject("Scripting.Dictionary")
     Set mMatCache = CreateObject("Scripting.Dictionary")
     Set mBodyCache = CreateObject("Scripting.Dictionary")
+    Set mPropCache = CreateObject("Scripting.Dictionary")
+    Set mAllNodes = New Collection
     mBBoxDisabled = False
 
     ' Selection.Add is used thousands of times; without this every single one
@@ -376,8 +405,18 @@ Private Sub RunBOM()
     Call Settle(100)
     On Error GoTo Fail
 
-    ' Hide ALL leaf parts with ONE SetShow call.
-    ' Parent nodes stay untouched, so showing one leaf later is enough.
+    ' Visibility baseline for the whole run:
+    '   1. remember the previous state, if the user wants it back afterwards
+    '   2. SHOW every node - a hidden sub-assembly would blank out every picture
+    '      of the parts below it, whatever their own state says
+    '   3. HIDE every leaf, so the scene is empty and one leaf can be shown at
+    '      a time
+    If PRESERVE_VISIBILITY Then
+        Set colWasShown = New Collection
+        Set colWasHidden = New Collection
+        Call SplitByShowState(sel, mAllNodes, colWasShown, colWasHidden)
+    End If
+    Call SetShowCollection(sel, mAllNodes, 0)
     Call SetShowCollection(sel, colLeaves, 1)
     Call Settle(100)
 
@@ -403,15 +442,17 @@ Private Sub RunBOM()
             xlSheet.Cells(r, 15).Value = "Part"
         End If
 
-        propsArray = dictProps(uniqueKey)
-        If isAssy And Not ASSEMBLY_METRICS Then
-            xlSheet.Cells(r, 6).Value = ""      ' sum of the rows below it
-            xlSheet.Cells(r, 7).Value = ""
-            xlSheet.Cells(r, 8).Value = ""
-        Else
-            xlSheet.Cells(r, 6).Value = propsArray(0)
-            xlSheet.Cells(r, 7).Value = propsArray(1)
-            xlSheet.Cells(r, 8).Value = propsArray(2)
+        ' Promote THIS node to design mode FIRST: mass, volume, area and the
+        ' inertia box all come back as 0 on a component that is still in
+        ' visualization mode. On an assembly node the call is recursive, so the
+        ' first one can take a while - that is the price of having the numbers,
+        ' and PROMOTE_ASSEMBLY_ROWS switches it off.
+        If (Not isAssy) Or PROMOTE_ASSEMBLY_ROWS Then
+            On Error Resume Next
+            CATIA.StatusBar = "BOM: loading " & strPartNum & " ..."
+            oPartProd.ApplyWorkMode 2
+            Err.Clear
+            On Error GoTo Fail
         End If
 
         ' Try to read part data without opening any window
@@ -419,15 +460,7 @@ Private Sub RunBOM()
         hasPart = False
         Set oPart = Nothing
         Set oPartDoc = Nothing
-        If Not isAssy Then
-            ' promote just this part to design mode - one small step per row
-            ' instead of one huge blocking call over the whole tree
-            On Error Resume Next
-            oPartProd.ApplyWorkMode 2
-            Err.Clear
-            On Error GoTo Fail
-            hasPart = TryGetLoadedPart(oPartProd, oPart, oPartDoc)
-        End If
+        If Not isAssy Then hasPart = TryGetLoadedPart(oPartProd, oPart, oPartDoc)
 
         ' multi-body detection moved out of the traversal: it needs a loaded
         ' CATPart, and doing it here keeps the traversal free of any loading
@@ -439,6 +472,25 @@ Private Sub RunBOM()
             End If
         End If
 
+        ' --- MASS / VOLUME / AREA (now that the node is loaded) ---
+        ' A zero result is NOT cached: it usually means "this instance could not
+        ' be loaded", and caching it would condemn every other row that shares
+        ' the part number.
+        If mPropCache.Exists(strPartNum) Then
+            propsArray = mPropCache(strPartNum)
+        Else
+            dMass = 0: dVol = 0: dArea = 0
+            If (Not isAssy) Or ASSEMBLY_METRICS Then
+                Call ReadProductProps(oPartProd, dMass, dVol, dArea, isAssy)
+            End If
+            propsArray = Array(dMass, dVol, dArea)
+            If dMass > 0 Or dVol > 0 Or dArea > 0 Then mPropCache.Add strPartNum, propsArray
+        End If
+
+        If propsArray(0) > 0 Then xlSheet.Cells(r, 6).Value = propsArray(0) Else xlSheet.Cells(r, 6).Value = "N/A"
+        If propsArray(1) > 0 Then xlSheet.Cells(r, 7).Value = propsArray(1) Else xlSheet.Cells(r, 7).Value = "N/A"
+        If propsArray(2) > 0 Then xlSheet.Cells(r, 8).Value = propsArray(2) Else xlSheet.Cells(r, 8).Value = "N/A"
+
         ' --- MATERIAL & DENSITY (measured once per part number) ---
         strMatName = "N/A"
         dDensity = 0
@@ -449,7 +501,8 @@ Private Sub RunBOM()
                 dDensity = CDbl(cacheArr(1))
             Else
                 Call GetMaterialAndDensity(oPart, strMatName, dDensity)
-                mMatCache.Add strPartNum, Array(strMatName, dDensity)
+                If dDensity > 0 Or strMatName <> "N/A" Then _
+                    mMatCache.Add strPartNum, Array(strMatName, dDensity)
             End If
         End If
 
@@ -479,7 +532,7 @@ Private Sub RunBOM()
                 Err.Clear
                 On Error GoTo Fail
             End If
-            mDimCache.Add strPartNum, Array(dims(0), dims(1), dims(2))
+            If dims(0) > 0 Then mDimCache.Add strPartNum, Array(dims(0), dims(1), dims(2))
         End If
 
         ' numbers, not Format() strings - otherwise the columns are text
@@ -619,7 +672,7 @@ Private Sub RunBOM()
     Next uniqueKey
 
     ' --- 7. RESTORE SCENE (done ONCE) ---
-    Call SetShowCollection(sel, colLeaves, 0)   ' show all leaf parts again
+    Call RestoreVisibility(sel, colLeaves, colWasShown, colWasHidden)
 
     On Error Resume Next
     If viewToggled And savedLayout >= 0 Then oWin.Layout = savedLayout
@@ -662,7 +715,7 @@ Fail:
     failMsg = "The BOM run stopped with error " & Err.Number & " - " & Err.Description
 
     On Error Resume Next
-    Call SetShowCollection(sel, colLeaves, 0)         ' show all leaf parts again
+    Call RestoreVisibility(sel, colLeaves, colWasShown, colWasHidden)
     If viewToggled And savedLayout >= 0 Then oWin.Layout = savedLayout
     If compassToggled And Len(COMPASS_COMMAND) > 0 Then CATIA.StartCommand COMPASS_COMMAND
     If Not oViewer Is Nothing Then oViewer.Reframe
@@ -747,6 +800,57 @@ Sub SetShowCollection(sel As Selection, colItems As Collection, ByVal showMode A
     Next i
     sel.VisProperties.SetShow showMode
     sel.Clear
+    Err.Clear
+End Sub
+
+' ==============================================================================
+' HELPER: PUT THE VISIBILITY BACK
+' With PRESERVE_VISIBILITY the exact state from before the run is restored,
+' otherwise everything is simply made visible again (the leaves are what the
+' run hid).
+' ==============================================================================
+Sub RestoreVisibility(sel As Selection, colLeaves As Collection, _
+                      colWasShown As Collection, colWasHidden As Collection)
+    On Error Resume Next
+
+    If PRESERVE_VISIBILITY And Not colWasShown Is Nothing Then
+        Call SetShowCollection(sel, colWasShown, 0)
+        Call SetShowCollection(sel, colWasHidden, 1)
+    Else
+        Call SetShowCollection(sel, colLeaves, 0)
+    End If
+    Err.Clear
+End Sub
+
+' ==============================================================================
+' HELPER: SPLIT A COLLECTION INTO "WAS VISIBLE" AND "WAS HIDDEN"
+' Late bound on purpose: GetShow wants a CatVisPropertyShow out-parameter, and
+' going through Object keeps the module compiling even where that enum is not
+' exposed.
+' ==============================================================================
+Sub SplitByShowState(sel As Selection, colItems As Collection, _
+                     colShown As Collection, colHidden As Collection)
+    On Error Resume Next
+    Dim i As Long
+    Dim oSel As Object
+    Dim vShow As Long
+
+    If colItems Is Nothing Then Exit Sub
+    Set oSel = sel
+
+    For i = 1 To colItems.Count
+        oSel.Clear
+        oSel.Add colItems.Item(i)
+        vShow = 1                                  ' 1 = NoShow, assumed on error
+        oSel.VisProperties.GetShow vShow
+        If vShow = 0 Then                          ' 0 = catVisPropertyShowAttr
+            colShown.Add colItems.Item(i)
+        Else
+            colHidden.Add colItems.Item(i)
+        End If
+        Err.Clear
+    Next i
+    oSel.Clear
     Err.Clear
 End Sub
 
@@ -845,8 +949,10 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
 
         ' NOTE: no ApplyWorkMode here any more. Doing it per node forced every
         ' CATPart of the tree into design mode during the traversal, which is
-        ' what made CATIA go "not responding" on deep trees. It is done once on
-        ' the root in RunBOM instead.
+        ' what made CATIA go "not responding" on deep trees. Each row promotes
+        ' its own node in RunBOM instead.
+        mAllNodes.Add childProd          ' assemblies and leaves, for the show/hide baseline
+
         partNum = ""
         On Error Resume Next
         partNum = childProd.PartNumber
@@ -996,13 +1102,10 @@ Sub AddBomRow(dQty As Object, dRef As Object, dDesc As Object, dProps As Object,
     On Error GoTo 0
     dDesc.Add sKey, sDesc
 
-    If isAssembly And Not ASSEMBLY_METRICS Then
-        ' structure row: no recursive mass / volume / wet area evaluation
-        dProps.Add sKey, Array(0#, 0#, 0#)
-    Else
-        Call ReadProductProps(oProd, dMass, dVol, dArea)
-        dProps.Add sKey, Array(dMass, dVol, dArea)
-    End If
+    ' Mass / volume / area are NOT read here: during the traversal the CATParts
+    ' may still be unloaded, and then every value would come back as 0. They are
+    ' read in the row loop, after the node has been promoted to design mode.
+    dProps.Add sKey, Array(0#, 0#, 0#)
 End Sub
 
 ' ==============================================================================
@@ -1029,7 +1132,8 @@ End Sub
 ' HELPER: MASS / VOLUME / AREA OF A PRODUCT (works for parts and assemblies)
 ' Volume in m3, area in m2 - same units as before
 ' ==============================================================================
-Sub ReadProductProps(oProd As Product, ByRef dMass As Double, ByRef dVol As Double, ByRef dArea As Double)
+Sub ReadProductProps(oProd As Product, ByRef dMass As Double, ByRef dVol As Double, _
+                     ByRef dArea As Double, ByVal isAssembly As Boolean)
     Dim oAnalyze As Object
     Dim oInertia As Object
 
@@ -1040,8 +1144,12 @@ Sub ReadProductProps(oProd As Product, ByRef dMass As Double, ByRef dVol As Doub
     Set oAnalyze = oProd.Analyze
     If Not oAnalyze Is Nothing Then
         dMass = oAnalyze.Mass
-        dVol = oAnalyze.Volume / (1000# ^ 3)
-        dArea = oAnalyze.WetArea / (1000# ^ 2)
+        ' Volume and WetArea integrate over the whole subtree - on an assembly
+        ' row that is the expensive part, so it can be switched off
+        If (Not isAssembly) Or ASSEMBLY_VOLUME_AREA Then
+            dVol = oAnalyze.Volume / (1000# ^ 3)
+            dArea = oAnalyze.WetArea / (1000# ^ 2)
+        End If
     End If
 
     If dMass <= 0.0000001 Then

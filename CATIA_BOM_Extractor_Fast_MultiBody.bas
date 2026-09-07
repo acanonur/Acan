@@ -373,7 +373,7 @@ Private Sub RunBOM()
     End If
 
     If SET_ISO_VIEW Then Call SetIsoViewpoint(oViewer)
-    Call Settle 100
+    Call Settle(100)
     On Error GoTo Fail
 
     ' Hide ALL leaf parts with ONE SetShow call.

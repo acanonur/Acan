@@ -143,6 +143,15 @@ Private Const FORCE_DESIGN_MODE As Boolean = False
 ' if you would rather have empty assembly rows than that wait.
 Private Const PROMOTE_ASSEMBLY_ROWS As Boolean = True
 
+' A component in NoShow hides its WHOLE subtree in the 3D view, whatever the
+' children say. So a leaf below a sub-assembly that the user had hidden would be
+' captured as an empty picture. The run therefore shows every node once and then
+' hides only the leaves. Side effect: components that were hidden before the run
+' are visible after it. Set PRESERVE_VISIBILITY = True to have the macro record
+' the previous state of every node and put it back - correct, but it costs one
+' selection round trip per node before the first row.
+Private Const PRESERVE_VISIBILITY As Boolean = False
+
 ' Mass / volume / area of a sub-assembly row. Reading them means a recursive
 ' evaluation over the whole subtree, so they are the expensive part of the
 ' assembly structure version - but without them the assembly rows are empty,
@@ -158,6 +167,7 @@ Private mDimCache As Object      ' part number -> Array(L, W, H)
 Private mMatCache As Object      ' part number -> Array(material, density)
 Private mBodyCache As Object     ' part number -> Variant array of body names
 Private mPropCache As Object     ' part number -> Array(mass, volume, area)
+Private mAllNodes As Collection  ' every visited instance: assemblies AND leaves
 Private mBBoxDisabled As Boolean ' the temp geometry path failed once - stop it
 
 
@@ -202,6 +212,7 @@ Private Sub RunBOM()
 
     ' Every leaf instance in the tree (needed to hide them all in one shot)
     Dim colLeaves As Collection
+    Dim colWasShown As Collection, colWasHidden As Collection
 
     ' Excel
     Dim xlApp As Object, xlBook As Object, xlSheet As Object
@@ -288,6 +299,7 @@ Private Sub RunBOM()
     Set mMatCache = CreateObject("Scripting.Dictionary")
     Set mBodyCache = CreateObject("Scripting.Dictionary")
     Set mPropCache = CreateObject("Scripting.Dictionary")
+    Set mAllNodes = New Collection
     mBBoxDisabled = False
 
     ' Selection.Add is used thousands of times; without this every single one
@@ -393,8 +405,18 @@ Private Sub RunBOM()
     Call Settle(100)
     On Error GoTo Fail
 
-    ' Hide ALL leaf parts with ONE SetShow call.
-    ' Parent nodes stay untouched, so showing one leaf later is enough.
+    ' Visibility baseline for the whole run:
+    '   1. remember the previous state, if the user wants it back afterwards
+    '   2. SHOW every node - a hidden sub-assembly would blank out every picture
+    '      of the parts below it, whatever their own state says
+    '   3. HIDE every leaf, so the scene is empty and one leaf can be shown at
+    '      a time
+    If PRESERVE_VISIBILITY Then
+        Set colWasShown = New Collection
+        Set colWasHidden = New Collection
+        Call SplitByShowState(sel, mAllNodes, colWasShown, colWasHidden)
+    End If
+    Call SetShowCollection(sel, mAllNodes, 0)
     Call SetShowCollection(sel, colLeaves, 1)
     Call Settle(100)
 
@@ -650,7 +672,7 @@ Private Sub RunBOM()
     Next uniqueKey
 
     ' --- 7. RESTORE SCENE (done ONCE) ---
-    Call SetShowCollection(sel, colLeaves, 0)   ' show all leaf parts again
+    Call RestoreVisibility(sel, colLeaves, colWasShown, colWasHidden)
 
     On Error Resume Next
     If viewToggled And savedLayout >= 0 Then oWin.Layout = savedLayout
@@ -693,7 +715,7 @@ Fail:
     failMsg = "The BOM run stopped with error " & Err.Number & " - " & Err.Description
 
     On Error Resume Next
-    Call SetShowCollection(sel, colLeaves, 0)         ' show all leaf parts again
+    Call RestoreVisibility(sel, colLeaves, colWasShown, colWasHidden)
     If viewToggled And savedLayout >= 0 Then oWin.Layout = savedLayout
     If compassToggled And Len(COMPASS_COMMAND) > 0 Then CATIA.StartCommand COMPASS_COMMAND
     If Not oViewer Is Nothing Then oViewer.Reframe
@@ -778,6 +800,57 @@ Sub SetShowCollection(sel As Selection, colItems As Collection, ByVal showMode A
     Next i
     sel.VisProperties.SetShow showMode
     sel.Clear
+    Err.Clear
+End Sub
+
+' ==============================================================================
+' HELPER: PUT THE VISIBILITY BACK
+' With PRESERVE_VISIBILITY the exact state from before the run is restored,
+' otherwise everything is simply made visible again (the leaves are what the
+' run hid).
+' ==============================================================================
+Sub RestoreVisibility(sel As Selection, colLeaves As Collection, _
+                      colWasShown As Collection, colWasHidden As Collection)
+    On Error Resume Next
+
+    If PRESERVE_VISIBILITY And Not colWasShown Is Nothing Then
+        Call SetShowCollection(sel, colWasShown, 0)
+        Call SetShowCollection(sel, colWasHidden, 1)
+    Else
+        Call SetShowCollection(sel, colLeaves, 0)
+    End If
+    Err.Clear
+End Sub
+
+' ==============================================================================
+' HELPER: SPLIT A COLLECTION INTO "WAS VISIBLE" AND "WAS HIDDEN"
+' Late bound on purpose: GetShow wants a CatVisPropertyShow out-parameter, and
+' going through Object keeps the module compiling even where that enum is not
+' exposed.
+' ==============================================================================
+Sub SplitByShowState(sel As Selection, colItems As Collection, _
+                     colShown As Collection, colHidden As Collection)
+    On Error Resume Next
+    Dim i As Long
+    Dim oSel As Object
+    Dim vShow As Long
+
+    If colItems Is Nothing Then Exit Sub
+    Set oSel = sel
+
+    For i = 1 To colItems.Count
+        oSel.Clear
+        oSel.Add colItems.Item(i)
+        vShow = 1                                  ' 1 = NoShow, assumed on error
+        oSel.VisProperties.GetShow vShow
+        If vShow = 0 Then                          ' 0 = catVisPropertyShowAttr
+            colShown.Add colItems.Item(i)
+        Else
+            colHidden.Add colItems.Item(i)
+        End If
+        Err.Clear
+    Next i
+    oSel.Clear
     Err.Clear
 End Sub
 
@@ -876,8 +949,10 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
 
         ' NOTE: no ApplyWorkMode here any more. Doing it per node forced every
         ' CATPart of the tree into design mode during the traversal, which is
-        ' what made CATIA go "not responding" on deep trees. It is done once on
-        ' the root in RunBOM instead.
+        ' what made CATIA go "not responding" on deep trees. Each row promotes
+        ' its own node in RunBOM instead.
+        mAllNodes.Add childProd          ' assemblies and leaves, for the show/hide baseline
+
         partNum = ""
         On Error Resume Next
         partNum = childProd.PartNumber

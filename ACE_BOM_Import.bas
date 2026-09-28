@@ -196,6 +196,7 @@ Private Sub RunImport(ByVal makeCopySheet As Boolean, ByVal fillInput As Boolean
     Dim bomWs As Worksheet
     Dim inputWs As Worksheet
     Dim srcWasOpen As Boolean
+    Dim pickCancelled As Boolean
     Dim keepCopySheet As Boolean
     Dim hdrRow As Long, lastRow As Long
     Dim nRows As Long, nPics As Long, nSkipped As Long
@@ -224,7 +225,8 @@ Private Sub RunImport(ByVal makeCopySheet As Boolean, ByVal fillInput As Boolean
         GoTo CleanExit
     End If
 
-    Set srcWs = FindBOMSheet(srcWb)
+    Set srcWs = FindBOMSheet(srcWb, pickCancelled)
+    If pickCancelled Then GoTo CleanExit              ' user cancelled the sheet choice
     If srcWs Is Nothing Then
         MsgBox "No BOM data found in:" & vbCrLf & srcWb.Name & vbCrLf & vbCrLf & _
                "Expected a sheet with a 'Part Number' column header.", _
@@ -1183,15 +1185,58 @@ Private Function GetWorkbook(ByVal fullPath As String, ByRef alreadyOpen As Bool
 End Function
 
 '--- extraction layout --------------------------------------------------------
-Private Function FindBOMSheet(wb As Workbook) As Worksheet
+Private Function FindBOMSheet(wb As Workbook, ByRef cancelled As Boolean) As Worksheet
     Dim ws As Worksheet
+    Dim cands As Collection
+    Dim i As Long, n As Long, deflt As Long, lastRow As Long
+    Dim msg As String, ans As String
 
+    cancelled = False
+    Set cands = New Collection
     For Each ws In wb.Worksheets
-        If FindHeaderRow(ws) > 0 Then
-            Set FindBOMSheet = ws
+        If FindHeaderRow(ws) > 0 Then cands.Add ws
+    Next ws
+
+    If cands.Count = 0 Then Exit Function
+    If cands.Count = 1 Then
+        Set FindBOMSheet = cands(1)
+        Exit Function
+    End If
+
+    ' Several BOM sheets - e.g. a BOM that was split by level: one sheet per
+    ' component. Ask which one; the sheet that was active when the file was
+    ' saved is offered first.
+    deflt = 1
+    For i = 1 To cands.Count
+        If cands(i).Name = wb.ActiveSheet.Name Then deflt = i
+    Next i
+
+    msg = "This file contains " & cands.Count & " BOM sheets. Which one should be imported?" & vbCrLf & vbCrLf
+    For i = 1 To cands.Count
+        If i > 25 Then
+            msg = msg & "  ... " & (cands.Count - 25) & " more (enter their number)" & vbCrLf
+            Exit For
+        End If
+        lastRow = LastDataRow(cands(i), FindHeaderRow(cands(i)))
+        msg = msg & "  " & i & " = " & cands(i).Name & "   (" & _
+              (lastRow - FindHeaderRow(cands(i))) & " rows)" & vbCrLf
+    Next i
+
+    Do
+        ans = Trim$(InputBox(msg, "BOM Import - choose the sheet", CStr(deflt)))
+        If Len(ans) = 0 Then
+            cancelled = True
             Exit Function
         End If
-    Next ws
+        If IsNumeric(ans) Then
+            n = CLng(ans)
+            If n >= 1 And n <= cands.Count Then
+                Set FindBOMSheet = cands(n)
+                Exit Function
+            End If
+        End If
+        MsgBox "Please enter a number between 1 and " & cands.Count & ".", vbExclamation, "BOM Import"
+    Loop
 End Function
 
 ' The header row is the first row (within the first 20) that carries a

@@ -103,6 +103,14 @@ A file dialog asks for the extraction file (it starts in the folder of the ACE
 workbook). If that file is already open in Excel it is reused and left open;
 otherwise it is opened read-only and closed again straight away.
 
+**A BOM that was split by level** (the assembly extractor asks for a split level
+at its start) has one sheet per component plus an `Index` sheet. When the file
+contains more than one BOM sheet, the import asks which one to bring in and
+lists every sheet with its number of rows; the sheet that was active when the
+file was saved is offered first. The `Index` sheet is never offered. Quantities
+on a component sheet are per ONE piece of that component — the `Index` sheet
+says how many pieces the product contains.
+
 At the end a summary reports how many rows and pictures were imported and how
 long it took.
 

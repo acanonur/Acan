@@ -1186,10 +1186,11 @@ End Function
 
 '--- extraction layout --------------------------------------------------------
 Private Function FindBOMSheet(wb As Workbook, ByRef cancelled As Boolean) As Worksheet
+    Const PROMPT_BUDGET As Long = 900          ' InputBox cuts its prompt at 1024 characters
     Dim ws As Worksheet
     Dim cands As Collection
-    Dim i As Long, n As Long, deflt As Long, lastRow As Long
-    Dim msg As String, ans As String
+    Dim i As Long, n As Long, deflt As Long, shown As Long, hdr As Long
+    Dim msg As String, ans As String, lineTxt As String, nm As String
 
     cancelled = False
     Set cands = New Collection
@@ -1211,16 +1212,24 @@ Private Function FindBOMSheet(wb As Workbook, ByRef cancelled As Boolean) As Wor
         If cands(i).Name = wb.ActiveSheet.Name Then deflt = i
     Next i
 
-    msg = "This file contains " & cands.Count & " BOM sheets. Which one should be imported?" & vbCrLf & vbCrLf
+    msg = cands.Count & " BOM sheets. Enter the number or the sheet name:" & vbCrLf
+    shown = 0
     For i = 1 To cands.Count
-        If i > 25 Then
-            msg = msg & "  ... " & (cands.Count - 25) & " more (enter their number)" & vbCrLf
-            Exit For
-        End If
-        lastRow = LastDataRow(cands(i), FindHeaderRow(cands(i)))
-        msg = msg & "  " & i & " = " & cands(i).Name & "   (" & _
-              (lastRow - FindHeaderRow(cands(i))) & " rows)" & vbCrLf
+        nm = cands(i).Name
+        If Len(nm) > 24 Then nm = Left$(nm, 23) & "~"
+        hdr = FindHeaderRow(cands(i))
+        lineTxt = i & " = " & nm & " (" & (LastDataRow(cands(i), hdr) - hdr) & " rows"
+        ' a sheet the extractor could not finish carries a note in Q1
+        If Left$(CStr(cands(i).Cells(1, 17).Value), 2) = "!!" Then lineTxt = lineTxt & ", INCOMPLETE"
+        lineTxt = lineTxt & ")" & vbCrLf
+        If Len(msg) + Len(lineTxt) > PROMPT_BUDGET Then Exit For
+        msg = msg & lineTxt
+        shown = shown + 1
     Next i
+    If shown < cands.Count Then
+        msg = msg & "... " & (cands.Count - shown) & " more: " & (shown + 1) & " to " & cands.Count & _
+              " in the order of the sheet tabs, or type the sheet name"
+    End If
 
     Do
         ans = Trim$(InputBox(msg, "BOM Import - choose the sheet", CStr(deflt)))
@@ -1228,14 +1237,24 @@ Private Function FindBOMSheet(wb As Workbook, ByRef cancelled As Boolean) As Wor
             cancelled = True
             Exit Function
         End If
-        If IsNumeric(ans) Then
+
+        ' plain digits only - "1e10" or "2.5" would pass IsNumeric and overflow or round
+        If Len(ans) <= 4 And Not (ans Like "*[!0-9]*") Then
             n = CLng(ans)
             If n >= 1 And n <= cands.Count Then
                 Set FindBOMSheet = cands(n)
                 Exit Function
             End If
+        Else
+            For i = 1 To cands.Count
+                If StrComp(cands(i).Name, ans, vbTextCompare) = 0 Then
+                    Set FindBOMSheet = cands(i)
+                    Exit Function
+                End If
+            Next i
         End If
-        MsgBox "Please enter a number between 1 and " & cands.Count & ".", vbExclamation, "BOM Import"
+        MsgBox "Please enter a number between 1 and " & cands.Count & ", or a sheet name.", _
+               vbExclamation, "BOM Import"
     Loop
 End Function
 

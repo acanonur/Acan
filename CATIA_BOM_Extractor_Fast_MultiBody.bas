@@ -261,6 +261,8 @@ Private mSheetName As String     ' name of the sheet being written
 Private mXlApp As Object, mXlBook As Object, mFso As Object
 Private mOwnXl As Boolean        ' mXlApp was started by this run
 Private mXlLost As Boolean       ' Excel was closed or crashed - nothing can be written any more
+Private mXlSkipAt As Double      ' when the user last chose to skip a write to a busy Excel (-1 = never)
+Private mPromoted As Object      ' part numbers already promoted to design mode in this run
 Private mTempDir As String
 Private mSheetNo As Long
 Private mSheetNames As Object    ' every sheet name used in the workbook
@@ -385,6 +387,7 @@ Private Sub RunBOM()
     Set mXlBook = Nothing
     mOwnXl = False
     mXlLost = False
+    mXlSkipAt = -1
     Set mFso = CreateObject("Scripting.FileSystemObject")
     Call StartRunFiles(rootPN)
     Call LogLine("BOM run on " & catDoc.Name & "  (" & modeName & ")")
@@ -395,6 +398,7 @@ Private Sub RunBOM()
     Set mPropCache = CreateObject("Scripting.Dictionary")
     Set mAssyKids = CreateObject("Scripting.Dictionary")
     Set mRollCache = CreateObject("Scripting.Dictionary")
+    Set mPromoted = CreateObject("Scripting.Dictionary")
     Set mSheetNames = CreateObject("Scripting.Dictionary")
     mSheetNames.CompareMode = vbTextCompare
     mBBoxDisabled = False
@@ -989,11 +993,16 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
             tRow = Timer
 
             ' promote THIS part to design mode first - mass, volume, area and the
-            ' inertia box are all 0 on a component in visualization mode
-            On Error Resume Next
-            oPartProd.ApplyWorkMode 2
-            Err.Clear
-            On Error GoTo 0
+            ' inertia box are all 0 on a component in visualization mode. The
+            ' CATPart document is shared by all instances of the part, so once
+            ' per part number is enough.
+            If Not mPromoted.Exists(strPartNum) Then
+                On Error Resume Next
+                oPartProd.ApplyWorkMode 2
+                Err.Clear
+                On Error GoTo 0
+                mPromoted.Add strPartNum, True
+            End If
             tLoad = Elapsed(tRow)
 
             hasPart = False
@@ -2069,9 +2078,11 @@ End Sub
 
 ' a new sheet at the end of the workbook, or Nothing when Excel refuses
 Private Function AddSheet(xlBook As Object, ByVal baseName As String) As Object
-    Dim ws As Object, tries As Long, e As Long
+    Dim ws As Object, e As Long
+    Dim t0 As Double, told As Boolean
 
     Set AddSheet = Nothing
+    t0 = Timer
     Do
         If Not XlReady() Then Exit Function
         On Error Resume Next
@@ -2083,12 +2094,14 @@ Private Function AddSheet(xlBook As Object, ByVal baseName As String) As Object
         On Error GoTo 0
         If Not ws Is Nothing Then Exit Do
         Call NoteXlError(e)
-        tries = tries + 1
-        If Not IsExcelBusy(e) Or tries >= 3 Then
+        If Not IsExcelBusy(e) Then
             Call LogLine("Excel could not add the sheet " & baseName & ": error " & e)
             Exit Function
         End If
-        Call Settle(1000)
+        If Not XlKeepTrying(t0, told) Then
+            Call LogLine("skipped: the sheet " & baseName)
+            Exit Function
+        End If
     Loop
 
     Call NameSheet(ws, baseName)
@@ -2162,9 +2175,9 @@ End Sub
 ' HELPER: TALKING TO A BUSY EXCEL
 ' Excel refuses calls from another program while it is busy - a cell in edit
 ' mode, an open dialog or menu, a drag in progress. VBA then gets error 50290
-' (or "call was rejected"). Every write therefore waits until Excel is ready,
-' retries a few times, and a write that still fails is logged and skipped - it
-' never ends the run.
+' (or "call was rejected"). Every write therefore keeps trying for
+' EXCEL_WAIT_SECONDS, then asks the user (Retry / Cancel). A write that cannot
+' be done is logged and skipped - it never ends the run.
 ' ==============================================================================
 Private Function IsExcelBusy(ByVal e As Long) As Boolean
     Select Case e
@@ -2207,16 +2220,52 @@ Private Sub NoteXlError(ByVal e As Long)
     End If
 End Sub
 
-' waits (CATIA stays alive) until Excel takes calls again. After
-' EXCEL_WAIT_SECONDS the user is asked - no data is dropped silently.
-' False = Excel is gone, or the user chose to skip this write.
+' After a "busy" answer from Excel: wait a little and say whether to try again.
+' Excel is given EXCEL_WAIT_SECONDS, then the user is asked - no data is ever
+' dropped silently. After a "skip", writes are skipped without asking again for
+' 30 seconds, so one stuck cell edit does not bring up a question per row.
+Private Function XlKeepTrying(ByRef t0 As Double, ByRef told As Boolean) As Boolean
+    Dim ans As Long
+
+    XlKeepTrying = False
+    If mXlLost Then Exit Function
+    If mXlSkipAt >= 0 Then
+        If Elapsed(mXlSkipAt) < 30 Then Exit Function
+        mXlSkipAt = -1
+    End If
+
+    If Not told Then
+        told = True
+        Call LogLine("Excel is busy - waiting (a cell in edit mode or a dialog open in the BOM Excel?)")
+        Call SetStatus("BOM: Excel is busy - finish the cell you are editing or close the dialog in Excel ...")
+    End If
+    If Elapsed(t0) > EXCEL_WAIT_SECONDS Then
+        Call LogLine("Excel still busy after " & EXCEL_WAIT_SECONDS & " s - asking the user")
+        ans = MsgBox("The Excel window of the BOM does not accept data right now." & vbCrLf & _
+                     "Most likely a cell is being edited there, or a dialog is open." & vbCrLf & vbCrLf & _
+                     "Finish it in Excel (Enter or Esc), then click Retry." & vbCrLf & _
+                     "Cancel = skip what Excel cannot take now and go on.", _
+                     vbRetryCancel + vbExclamation, "BOM - Excel is busy")
+        If ans = vbCancel Then
+            Call LogLine("the user chose to skip writes while Excel is busy")
+            mXlSkipAt = Timer
+            Exit Function
+        End If
+        t0 = Timer
+    End If
+    Call Settle(500)
+    XlKeepTrying = True
+End Function
+
+' waits (CATIA stays alive) until Excel takes calls again. Application.Ready is
+' only a hint - it can say True while a cell is being edited - so every write
+' still retries on a "busy" error itself.
+' False = Excel is gone, or the user chose to skip.
 Private Function XlReady() As Boolean
     Dim t0 As Double, ok As Boolean, e As Long, told As Boolean
-    Dim ans As Long
 
     XlReady = False
     If mXlApp Is Nothing Or mXlLost Then Exit Function
-    XlReady = True
     t0 = Timer
     Do
         ok = False
@@ -2228,46 +2277,28 @@ Private Function XlReady() As Boolean
         On Error GoTo 0
         If e <> 0 Then
             Call NoteXlError(e)
-            If mXlLost Then
-                XlReady = False
-                Exit Function
-            End If
+            If mXlLost Then Exit Function
             ' an error that does not mean "busy": cannot tell, just try the call
             If Not IsExcelBusy(e) Then ok = True
         End If
-        If ok Then Exit Function
-
-        If Not told Then
-            told = True
-            Call LogLine("Excel is busy - waiting (a cell in edit mode or a dialog open in the BOM Excel?)")
-            Call SetStatus("BOM: Excel is busy - finish the cell you are editing or close the dialog in Excel ...")
+        If ok Then
+            XlReady = True
+            Exit Function
         End If
-        If Elapsed(t0) > EXCEL_WAIT_SECONDS Then
-            Call LogLine("Excel still busy after " & EXCEL_WAIT_SECONDS & " s - asking the user")
-            ans = MsgBox("The Excel window of the BOM does not accept data right now." & vbCrLf & _
-                         "Most likely a cell is being edited there, or a dialog is open." & vbCrLf & vbCrLf & _
-                         "Finish it in Excel (Enter or Esc), then click Retry." & vbCrLf & _
-                         "Cancel = skip this one write and go on.", _
-                         vbRetryCancel + vbExclamation, "BOM - Excel is busy")
-            If ans = vbCancel Then
-                Call LogLine("the user skipped a write while Excel was busy")
-                XlReady = False
-                Exit Function
-            End If
-            t0 = Timer
-        End If
-        Call Settle(250)
+        If Not XlKeepTrying(t0, told) Then Exit Function
     Loop
 End Function
 
 ' writes a 2-D array (1-based) to the sheet with its top left corner at (r, c)
 Private Function XlWriteBlock(ws As Object, ByVal r As Long, ByVal c As Long, arr As Variant) As Boolean
-    Dim tries As Long, e As Long, nr As Long, nc As Long
+    Dim e As Long, nr As Long, nc As Long
+    Dim t0 As Double, told As Boolean
 
     XlWriteBlock = False
     If ws Is Nothing Then Exit Function
     nr = UBound(arr, 1) - LBound(arr, 1) + 1
     nc = UBound(arr, 2) - LBound(arr, 2) + 1
+    t0 = Timer
     Do
         If Not XlReady() Then
             Call LogLine("skipped: Excel write at row " & r & ", column " & c)
@@ -2284,12 +2315,15 @@ Private Function XlWriteBlock(ws As Object, ByVal r As Long, ByVal c As Long, ar
             Exit Function
         End If
         Call NoteXlError(e)
-        tries = tries + 1
-        If Not IsExcelBusy(e) Or tries >= 5 Then
+        If Not IsExcelBusy(e) Then
             Call LogLine("Excel write failed at row " & r & ", column " & c & ": error " & e)
             Exit Function
         End If
-        Call Settle(1000)
+        ' "busy" is answered before Excel does anything, so trying again is safe
+        If Not XlKeepTrying(t0, told) Then
+            Call LogLine("skipped: Excel write at row " & r & ", column " & c)
+            Exit Function
+        End If
     Loop
 End Function
 
@@ -2302,10 +2336,12 @@ End Function
 
 ' one picture into column A of a row, sized to the row
 Private Function XlInsertPicture(ws As Object, ByVal rowNo As Long, ByVal picPath As String) As Boolean
-    Dim shp As Object, tries As Long, e As Long
+    Dim shp As Object, e As Long
     Dim x As Double, y As Double
+    Dim t0 As Double, told As Boolean
 
     XlInsertPicture = False
+    t0 = Timer
     Do
         If Not XlReady() Then Exit Function
         On Error Resume Next
@@ -2319,12 +2355,11 @@ Private Function XlInsertPicture(ws As Object, ByVal rowNo As Long, ByVal picPat
         On Error GoTo 0
         If Not shp Is Nothing Then Exit Do
         Call NoteXlError(e)
-        tries = tries + 1
-        If Not IsExcelBusy(e) Or tries >= 3 Then
+        If Not IsExcelBusy(e) Then
             Call LogLine("Excel could not insert the picture of row " & rowNo & ": error " & e)
             Exit Function
         End If
-        Call Settle(1000)
+        If Not XlKeepTrying(t0, told) Then Exit Function
     Loop
 
     On Error Resume Next

@@ -43,6 +43,10 @@ Option Explicit
 '     WetArea over hundreds of parts) - in ONE call per assembly row.
 '   - Nothing is loaded while the levels are counted, and no file alert can wait
 '     hidden behind the windows (DisplayFileAlerts is off from the start).
+'   - A sub-assembly that is NOT LOADED in CATIA is not loaded by the macro
+'     either (that would again be one huge blocking call): it gets a row marked
+'     "NOT LOADED" and the final message lists it - load it and run again if
+'     its content is needed.
 '   - The tree walks pump the message queue every few nodes.
 '   - Error 50290 means "Excel is busy" (a cell in edit mode, an open dialog).
 '     The macro writes into an Excel of its own, waits while it is busy and
@@ -262,14 +266,22 @@ Private mXlApp As Object, mXlBook As Object, mFso As Object
 Private mOwnXl As Boolean        ' mXlApp was started by this run
 Private mXlLost As Boolean       ' Excel was closed or crashed - nothing can be written any more
 Private mXlSkipAt As Double      ' when the user last chose to skip a write to a busy Excel (-1 = never)
+Private mXlLastErr As Long       ' error of the last failed XlWriteBlock (0 = skipped / busy)
 Private mPromoted As Object      ' part numbers already promoted to design mode in this run
+Private mBodyValCache As Object  ' part number|body -> Array(mass, vol, area, L, W, H, material, density)
 Private mTempDir As String
 Private mSheetNo As Long
 Private mSheetNames As Object    ' every sheet name used in the workbook
 Private mShotParts As Boolean    ' pictures of the part (and body) rows in this run
 Private mShotAssy As Boolean     ' pictures of the assembly rows in this run
 Private mLogPath As String, mSavePath As String
-Private mSavedOnce As Boolean, mLastSave As Double
+Private mSavedOnce As Boolean    ' the workbook has been saved at least once
+Private mSaveTried As Boolean    ' a save has been attempted (throttles retries of a failing save)
+Private mLastSave As Double      ' Timer of the last save attempt
+Private mLastSaveOK As Boolean   ' the last save attempt worked
+Private mLastSaveAt As Date      ' time of the last save that worked
+Private mIdxRedo As Collection   ' Index writes Excel could not take - repeated at the end
+Private mNotLoaded As Object     ' part numbers of sub-assemblies that are not loaded in CATIA
 Private mSlow As Collection      ' Array(seconds, step) of every slow step
 Private mPump As Long            ' node counter of the tree walks
 
@@ -350,6 +362,21 @@ Private Sub RunBOM()
     Dim rootSceneSet As Boolean
 
     startTime = Timer
+
+    ' nothing of an earlier run may be used by this one - not even by the
+    ' error handler (log file, workbook, save path)
+    Set mXlApp = Nothing
+    Set mXlBook = Nothing
+    mOwnXl = False
+    mXlLost = False
+    mXlSkipAt = -1
+    mLogPath = ""
+    mSavePath = ""
+    mSavedOnce = False
+    mSaveTried = False
+    mLastSaveOK = False
+    Set mIdxRedo = New Collection
+
     On Error GoTo Fail
 
     ' --- 1. DOCUMENT ------------------------------------------------------------
@@ -383,11 +410,6 @@ Private Sub RunBOM()
     If mIncludeSubassemblies Then modeName = "Assembly structure" Else modeName = "Part list"
 
     ' --- 2. LOG FILE, SAVE PATH, CACHES ------------------------------------------
-    Set mXlApp = Nothing                 ' never an Excel of an earlier run
-    Set mXlBook = Nothing
-    mOwnXl = False
-    mXlLost = False
-    mXlSkipAt = -1
     Set mFso = CreateObject("Scripting.FileSystemObject")
     Call StartRunFiles(rootPN)
     Call LogLine("BOM run on " & catDoc.Name & "  (" & modeName & ")")
@@ -399,6 +421,8 @@ Private Sub RunBOM()
     Set mAssyKids = CreateObject("Scripting.Dictionary")
     Set mRollCache = CreateObject("Scripting.Dictionary")
     Set mPromoted = CreateObject("Scripting.Dictionary")
+    Set mNotLoaded = CreateObject("Scripting.Dictionary")
+    Set mBodyValCache = CreateObject("Scripting.Dictionary")
     Set mSheetNames = CreateObject("Scripting.Dictionary")
     mSheetNames.CompareMode = vbTextCompare
     mBBoxDisabled = False
@@ -455,26 +479,8 @@ Private Sub RunBOM()
     ' --- 5. EXCEL ------------------------------------------------------------------
     ' An Excel of its own: what the user does in his own Excel during the run
     ' (a cell in edit mode, an open dialog) can then never make a write fail.
-    On Error Resume Next
-    If Not OWN_EXCEL_INSTANCE Then Set mXlApp = GetObject(, "Excel.Application")
-    Err.Clear
-    If mXlApp Is Nothing Then
-        Set mXlApp = CreateObject("Excel.Application")
-        mOwnXl = Not (mXlApp Is Nothing)
-    End If
-    Err.Clear
-    On Error GoTo Fail
-    If mXlApp Is Nothing Then Err.Raise vbObjectError + 513, , "Excel could not be started"
-
-    mXlApp.Visible = True
-    On Error Resume Next
-    ' an Excel started by the macro stays open when the macro ends
-    If mOwnXl Then mXlApp.UserControl = True
-    Err.Clear
-    On Error GoTo Fail
-    Set mXlBook = mXlApp.Workbooks.Add
+    If Not StartExcel(firstSheet) Then Err.Raise vbObjectError + 513, , "Excel could not be started"
     Call KeepOneSheet(mXlBook)
-    Set firstSheet = mXlBook.Sheets(1)
 
     ' --- 6. MAIN WINDOW: geometry only, fixed camera ----------------------------
     Call PrepareWindow(rootWin, rootViewer, rootLayout, rootLayoutSet)
@@ -491,7 +497,8 @@ Private Sub RunBOM()
         totRows = nRows: totAssy = nAssy: totParts = nParts
         Call LogLine("sheet BOM: " & statusTxt & ", " & nRows & " rows, " & _
                      Format(Elapsed(unitStart), "0") & " s")
-        If Not unitOK Then MsgBox "The run stopped early:" & vbCrLf & statusTxt, vbExclamation
+        ' (a failure is reported in the final message - AFTER CATIA is restored
+        '  and the workbook is saved, never before)
 
     Else
 
@@ -533,6 +540,7 @@ Private Sub RunBOM()
             nRows = 0: nAssy = 0: nParts = 0
             statusTxt = "not started"
             Set xlSheet = Nothing
+            mXlSkipAt = -1                   ' a "skip" given for an earlier component ends here
             Call CheckExcel                  ' Excel gone: stop the whole run here
             ' an error in here ends this component only, never the whole run
             On Error GoTo UnitFail
@@ -542,7 +550,7 @@ Private Sub RunBOM()
             Set xlSheet = AddSheet(mXlBook, Format(nUnits, "00") & " " & CStr(unitKey))
             If xlSheet Is Nothing Then Err.Raise vbObjectError + 514, , "Excel could not add a sheet"
 
-            Call WriteIndexRow(idxSheet, idxRow, nUnits, CStr(unitKey), CStr(dUnitDesc(unitKey)), _
+            Call NoteIndexRow(idxSheet, idxRow, nUnits, CStr(unitKey), CStr(dUnitDesc(unitKey)), _
                                splitLevel, CLng(dUnitQty(unitKey)), CStr(dUnitFirst(unitKey)), _
                                CStr(dUnitPath(unitKey)), mSheetName)
 
@@ -585,7 +593,7 @@ Private Sub RunBOM()
                 On Error GoTo UnitFail
                 Set unitWin = Nothing
 
-                Call WriteIndexResult(idxSheet, idxRow, nRows, statusTxt, Elapsed(unitStart), "own window")
+                Call NoteIndexResult(idxSheet, idxRow, nRows, statusTxt, Elapsed(unitStart), "own window")
                 Call LogLine("component " & CStr(unitKey) & ": " & statusTxt & ", " & nRows & " rows, " & _
                              Format(Elapsed(unitStart), "0") & " s")
                 totRows = totRows + nRows: totAssy = totAssy + nAssy: totParts = totParts + nParts
@@ -609,11 +617,11 @@ UnitCleanup:
             Set unitWin = Nothing
             rootWin.Activate
             If xlSheet Is Nothing Then
-                Call WriteIndexRow(idxSheet, idxRow, nUnits, CStr(unitKey), CStr(dUnitDesc(unitKey)), _
+                Call NoteIndexRow(idxSheet, idxRow, nUnits, CStr(unitKey), CStr(dUnitDesc(unitKey)), _
                                    splitLevel, CLng(dUnitQty(unitKey)), CStr(dUnitFirst(unitKey)), _
                                    CStr(dUnitPath(unitKey)), "")
             End If
-            Call WriteIndexResult(idxSheet, idxRow, nRows, statusTxt, Elapsed(unitStart), "-")
+            Call NoteIndexResult(idxSheet, idxRow, nRows, statusTxt, Elapsed(unitStart), "-")
             Err.Clear
 
 UnitNext:
@@ -632,6 +640,7 @@ UnitNext:
             rootSceneSet = True
 
             For i = 1 To colFbKey.Count
+                mXlSkipAt = -1
                 Call CheckExcel
                 unitKey = colFbKey(i)
                 unitStart = Timer
@@ -646,7 +655,7 @@ UnitNext:
                                      nRows, nAssy, nParts, statusTxt)
                 Call SetShowSingle(rootSel, unitInst, 1)
 
-                Call WriteIndexResult(idxSheet, CLng(colFbIdxRow(i)), nRows, statusTxt, _
+                Call NoteIndexResult(idxSheet, CLng(colFbIdxRow(i)), nRows, statusTxt, _
                                       Elapsed(unitStart), "main window")
                 Call LogLine("component " & CStr(unitKey) & ": " & statusTxt & ", " & nRows & " rows, " & _
                              Format(Elapsed(unitStart), "0") & " s")
@@ -657,22 +666,30 @@ UnitNext:
             Next i
 
             If colLooseInst.Count > 0 Then
+                mXlSkipAt = -1
                 Call CheckExcel
                 unitStart = Timer
                 Call LogLine("=== above level " & splitLevel)
                 Set xlSheet = AddSheet(mXlBook, "Above level " & splitLevel)
                 If Not xlSheet Is Nothing Then
-                    Call WriteIndexRow(idxSheet, idxRow, 0, "(above level " & splitLevel & ")", _
+                    Call NoteIndexRow(idxSheet, idxRow, 0, "(above level " & splitLevel & ")", _
                                        "parts that are not inside any component of level " & splitLevel & _
                                        IIf(mIncludeSubassemblies, ", and the assemblies above it", ""), _
                                        0, colLooseParts.Count, "", "", mSheetName)
                     unitOK = ProcessLoose(colLooseInst, colLooseLevel, colLooseFirst, colLooseKey, _
                                           colLooseIsAssy, rootSel, rootViewer, xlSheet, _
                                           nRows, nAssy, nParts, statusTxt)
-                    Call WriteIndexResult(idxSheet, idxRow, nRows, statusTxt, Elapsed(unitStart), "main window")
+                    Call NoteIndexResult(idxSheet, idxRow, nRows, statusTxt, Elapsed(unitStart), "main window")
                     Call LogLine("above level " & splitLevel & ": " & statusTxt & ", " & nRows & " rows, " & _
                                  Format(Elapsed(unitStart), "0") & " s")
                     totRows = totRows + nRows: totAssy = totAssy + nAssy: totParts = totParts + nParts
+                Else
+                    Call LogLine("above level " & splitLevel & ": no sheet - Excel could not add one")
+                    Call NoteIndexRow(idxSheet, idxRow, 0, "(above level " & splitLevel & ")", _
+                                "parts that are not inside any component of level " & splitLevel, _
+                                0, colLooseParts.Count, "", "", "")
+                    Call NoteIndexResult(idxSheet, idxRow, 0, "stopped: Excel could not add the sheet", _
+                                   Elapsed(unitStart), "-")
                 End If
             End If
 
@@ -682,6 +699,8 @@ UnitNext:
             rootSceneSet = False
         End If
 
+        ' Index writes Excel could not take during the run get a second chance
+        Call RedoIndexWrites(idxSheet)
         Call FinishIndexLayout(idxSheet)
     End If
 
@@ -707,19 +726,26 @@ UnitNext:
     Call XlRestore
 
     If splitLevel = 0 Then
+        If Not unitOK Then
+            MsgBox "The run stopped early  (" & modeName & ")" & vbCrLf & statusTxt & vbCrLf & vbCrLf & _
+                   "Rows written:     " & totRows & vbCrLf & _
+                   "Time: " & Format(Elapsed(startTime) / 60#, "0.0") & " min" & vbCrLf & vbCrLf & _
+                   NotLoadedText() & SavedText(), vbExclamation
+            Exit Sub
+        End If
         MsgBox "BOM exported  (" & modeName & ")" & vbCrLf & vbCrLf & _
                "Rows written:     " & totRows & vbCrLf & _
                "  sub-assemblies: " & totAssy & vbCrLf & _
                "  parts:          " & totParts & vbCrLf & _
                "Time: " & Format(Elapsed(startTime) / 60#, "0.0") & " min" & vbCrLf & vbCrLf & _
-               SavedText(), vbInformation
+               NotLoadedText() & SavedText(), vbInformation
     Else
         MsgBox "BOM exported  (" & modeName & ", split at level " & splitLevel & ")" & vbCrLf & vbCrLf & _
                "Component sheets: " & nUnits & "  (" & nUnitsOK & " complete)" & vbCrLf & _
                "Rows written:     " & totRows & vbCrLf & _
                "Time: " & Format(Elapsed(startTime) / 60#, "0.0") & " min" & vbCrLf & vbCrLf & _
                "The Index sheet links to every component sheet." & vbCrLf & vbCrLf & _
-               SavedText(), vbInformation
+               NotLoadedText() & SavedText(), vbInformation
     End If
     Exit Sub
 
@@ -759,10 +785,17 @@ FailCleanup:
     Call XlRestore
     Err.Clear
 
-    MsgBox failMsg & vbCrLf & vbCrLf & _
-           "Visibility, spec tree and compass were restored." & vbCrLf & _
-           "The rows written so far are in the Excel workbook." & vbCrLf & vbCrLf & _
-           SavedText(), vbCritical
+    If mXlLost Then
+        MsgBox failMsg & vbCrLf & vbCrLf & _
+               "Visibility, spec tree and compass were restored." & vbCrLf & _
+               "Excel was closed during the run." & vbCrLf & vbCrLf & _
+               SavedText(), vbCritical
+    Else
+        MsgBox failMsg & vbCrLf & vbCrLf & _
+               "Visibility, spec tree and compass were restored." & vbCrLf & _
+               "The rows written so far are in the Excel workbook." & vbCrLf & vbCrLf & _
+               SavedText(), vbCritical
+    End If
 
 End Sub
 
@@ -782,6 +815,7 @@ Private Function ProcessTree(treeRoot As Product, sel As Selection, oViewer As V
                              ByVal unitQty As Long, ByRef nRows As Long, ByRef nAssy As Long, _
                              ByRef nParts As Long, ByRef statusTxt As String) As Boolean
     Dim r As Long, t0 As Double
+    Dim hdrOK As Boolean, nLost As Long
 
     ProcessTree = False
     nRows = 0: nAssy = 0: nParts = 0
@@ -791,7 +825,7 @@ Private Function ProcessTree(treeRoot As Product, sel As Selection, oViewer As V
     On Error GoTo SheetFail
 
     Call ResetSheetData
-    Call WriteHeader(xlSheet)
+    hdrOK = WriteHeader(xlSheet)
 
     ' --- the tree of this sheet (numbers are NOT read here) ---
     Call SetStatus("BOM: reading the tree of " & mSheetName & " ...")
@@ -813,7 +847,8 @@ Private Function ProcessTree(treeRoot As Product, sel As Selection, oViewer As V
     Call WriteDataRows(r, nAssy, nParts)
     nRows = r - 2
     Call FillAssemblyRows
-    Call FlushSheet(xlSheet)
+    nLost = FlushSheet(xlSheet)
+    Call RetryLostWrites(xlSheet, hdrOK, nLost)
 
     ' the numbers are complete - make them visible before the pictures start
     Call FinishSheetLayout(xlSheet)
@@ -823,6 +858,14 @@ Private Function ProcessTree(treeRoot As Product, sel As Selection, oViewer As V
     ' --- PASS 2: the pictures ---
     Call CheckExcel
     Call TakePictures(sel, oViewer, xlSheet)
+
+    ' rows Excel never took: the sheet is NOT reported as complete
+    If Not hdrOK Or nLost > 0 Then
+        statusTxt = SheetLostText(hdrOK, nLost)
+        Call LogLine(mSheetName & " " & statusTxt)
+        Call MarkSheetIncomplete(xlSheet, statusTxt)
+        Exit Function
+    End If
 
     ProcessTree = True
     statusTxt = "OK"
@@ -857,6 +900,7 @@ Private Function ProcessLoose(colInst As Collection, colLevel As Collection, _
     Dim i As Long, r As Long
     Dim oProd As Product, pn As String, sKey As String
     Dim isAssembly As Boolean
+    Dim hdrOK As Boolean, nLost As Long
 
     ProcessLoose = False
     nRows = 0: nAssy = 0: nParts = 0
@@ -865,7 +909,7 @@ Private Function ProcessLoose(colInst As Collection, colLevel As Collection, _
     On Error GoTo LooseFail
 
     Call ResetSheetData
-    Call WriteHeader(xlSheet)
+    hdrOK = WriteHeader(xlSheet)
 
     ' the rows are keyed like everywhere else (MakeRowKey), so the part list
     ' groups by part number and the assembly structure by parent path
@@ -898,11 +942,19 @@ Private Function ProcessLoose(colInst As Collection, colLevel As Collection, _
     Call WriteDataRows(r, nAssy, nParts)
     nRows = r - 2
     Call FillAssemblyRows
-    Call FlushSheet(xlSheet)
+    nLost = FlushSheet(xlSheet)
+    Call RetryLostWrites(xlSheet, hdrOK, nLost)
     Call FinishSheetLayout(xlSheet)
     Call SaveWorkbook(False)
     Call CheckExcel
     Call TakePictures(sel, oViewer, xlSheet)
+
+    If Not hdrOK Or nLost > 0 Then
+        statusTxt = SheetLostText(hdrOK, nLost)
+        Call LogLine(mSheetName & " " & statusTxt)
+        Call MarkSheetIncomplete(xlSheet, statusTxt)
+        Exit Function
+    End If
 
     ProcessLoose = True
     statusTxt = "OK"
@@ -946,6 +998,7 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
     Dim bDens As Double, bDensInertia As Double, bMat As String
     Dim nDone As Long, nTotal As Long
     Dim tRow As Double, tLoad As Double, tRowAll As Double
+    Dim notLoaded As Boolean, bodyKey As String, bv As Variant
 
     On Error Resume Next
     CATIA.RefreshDisplay = False
@@ -974,23 +1027,51 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
             Call BufSet(r, 15, "Assembly")
             mBoldRows.Add r
             mAssyRows.Add Array(r, strPartNum, oPartProd)
-            If mShotAssy Then
+            ' (the extra sheet above the split level has no leaf lists - no picture there)
+            If mShotAssy And mNodeLeaves.Exists(CStr(uniqueKey)) Then
                 Call AddJob(r, "ASSY", CStr(uniqueKey), "")
             Else
                 Call BufSet(r, 1, "-")
             End If
 
         Else
-            ' ---------- PART ----------
-            nParts = nParts + 1
-            Call BufSet(r, 15, "Part")
-
+            ' ---------- PART (or a sub-assembly that is not loaded) ----------
             Call SetStatus("BOM " & mSheetName & ": numbers, row " & nDone & " of " & _
                            nTotal & " - " & strPartNum)
             ' written BEFORE the part is loaded: if CATIA hangs, the last line of
             ' the log names the part
             Call LogLine(mSheetName & "  row " & nDone & "/" & nTotal & "  " & strPartNum)
             tRow = Timer
+
+            ' A sub-assembly that is NOT LOADED has no children and looks like a
+            ' part. ApplyWorkMode 2 on it would load its whole content in ONE
+            ' blocking call - so it is neither loaded nor measured: it gets an
+            ' "Assembly" row marked NOT LOADED, and the final message lists it.
+            notLoaded = mNotLoaded.Exists(strPartNum)
+            If Not notLoaded And Not mPromoted.Exists(strPartNum) Then
+                notLoaded = IsUnloadedAssembly(oPartProd)
+                If notLoaded Then
+                    mNotLoaded.Add strPartNum, True
+                    Call LogLine(mSheetName & "  NOT LOADED sub-assembly: " & strPartNum & _
+                                 " - its content is missing in the BOM")
+                End If
+            End If
+        End If
+
+        If notLoaded And Not isAssy Then
+            nAssy = nAssy + 1
+            Call BufSet(r, 15, "Assembly")
+            mBoldRows.Add r
+            Call BufSet(r, 1, "-")
+            For bi = 6 To 11
+                Call BufSet(r, bi, "N/A")
+            Next bi
+            Call BufSet(r, 12, "NOT LOADED - content missing")
+            Call BufSet(r, 13, "N/A")
+
+        ElseIf Not isAssy Then
+            nParts = nParts + 1
+            Call BufSet(r, 15, "Part")
 
             ' promote THIS part to design mode first - mass, volume, area and the
             ' inertia box are all 0 on a component in visualization mode. The
@@ -1098,33 +1179,42 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
                         Call BufSet(r, 14, mFirst(uniqueKey))
                         Call BufSet(r, 15, "Body")
 
-                        bMass = 0: bVol = 0: bArea = 0
-                        bDens = 0: bDensInertia = 0
-                        bMat = "N/A"
+                        ' body values: once per part number and body for the whole run
+                        bodyKey = strPartNum & "|" & CStr(bodyNames(bi))
+                        If mBodyValCache.Exists(bodyKey) Then
+                            bv = mBodyValCache(bodyKey)
+                        Else
+                            bMass = 0: bVol = 0: bArea = 0
+                            bDens = 0: bDensInertia = 0
+                            bMat = "N/A"
 
-                        Call GetBodyMaterial(oPart, oBody, bMat, bDens)
-                        Call GetBodyMassAndDensity(oPartDoc, oBody, bMass, bDensInertia)
-                        If bDens <= 0 Then bDens = bDensInertia
-                        Call GetBodyVolumeArea(oPartDoc, oPart, oBody, bVol, bArea)
-                        If bMass <= 0 And bDens > 0 And bVol > 0 Then bMass = bVol * bDens
+                            Call GetBodyMaterial(oPart, oBody, bMat, bDens)
+                            Call GetBodyMassAndDensity(oPartDoc, oBody, bMass, bDensInertia)
+                            If bDens <= 0 Then bDens = bDensInertia
+                            Call GetBodyVolumeArea(oPartDoc, oPart, oBody, bVol, bArea)
+                            If bMass <= 0 And bDens > 0 And bVol > 0 Then bMass = bVol * bDens
 
-                        Call PutNumber(r, 6, bMass)
-                        Call PutNumber(r, 7, bVol)
-                        Call PutNumber(r, 8, bArea)
-
-                        dims(0) = 0: dims(1) = 0: dims(2) = 0
-                        If UCase$(MEASURE_MODE) = "BOX" Then
-                            If Not MeasureTarget(oPart, oBody, dims) Then
-                                Call MeasureAABBExtremum(oPart, oPartDoc, oBody, dims)
+                            dims(0) = 0: dims(1) = 0: dims(2) = 0
+                            If UCase$(MEASURE_MODE) = "BOX" Then
+                                If Not MeasureTarget(oPart, oBody, dims) Then
+                                    Call MeasureAABBExtremum(oPart, oPartDoc, oBody, dims)
+                                End If
                             End If
-                        End If
-                        If dims(0) < 0.1 Then Call GetBodyInertiaDims(oPartDoc, oBody, dims)
-                        Call PutNumber(r, 9, dims(0))
-                        Call PutNumber(r, 10, dims(1))
-                        Call PutNumber(r, 11, dims(2))
+                            If dims(0) < 0.1 Then Call GetBodyInertiaDims(oPartDoc, oBody, dims)
 
-                        Call BufSet(r, 12, bMat)
-                        Call PutNumber(r, 13, bDens)
+                            bv = Array(bMass, bVol, bArea, dims(0), dims(1), dims(2), bMat, bDens)
+                            If bMass > 0 Or bVol > 0 Or bArea > 0 Then mBodyValCache.Add bodyKey, bv
+                            DoEvents                     ' a part with many bodies takes a while
+                        End If
+
+                        Call PutNumber(r, 6, bv(0))
+                        Call PutNumber(r, 7, bv(1))
+                        Call PutNumber(r, 8, bv(2))
+                        Call PutNumber(r, 9, bv(3))
+                        Call PutNumber(r, 10, bv(4))
+                        Call PutNumber(r, 11, bv(5))
+                        Call BufSet(r, 12, CStr(bv(6)))
+                        Call PutNumber(r, 13, bv(7))
 
                         If mShotParts Then
                             Call AddJob(r, "BODY", CStr(uniqueKey), CStr(bodyNames(bi)))
@@ -1220,7 +1310,9 @@ Private Sub FillAssemblyRows()
         If mDimCache.Exists(pn) Then
             cacheArr = mDimCache(pn)
             dims(0) = CDbl(cacheArr(0)): dims(1) = CDbl(cacheArr(1)): dims(2) = CDbl(cacheArr(2))
-        ElseIf ASSY_DIMS_MAX_PARTS > 0 And v(3) > 0 And v(3) <= ASSY_DIMS_MAX_PARTS Then
+        ElseIf ASSY_DIMS_MAX_PARTS > 0 And v(3) > 0 And v(3) <= ASSY_DIMS_MAX_PARTS And v(5) = 0 Then
+            ' (only when the whole content is known - otherwise the inertia
+            '  would run over parts nobody has counted)
             Call SetStatus("BOM " & mSheetName & ": size of the assembly " & pn)
             Call LogLine(mSheetName & "  assembly size " & pn & "  (" & v(3) & " parts)")
             t = Timer
@@ -1237,7 +1329,11 @@ Private Sub FillAssemblyRows()
         Call PutNumber(r, 10, dims(1))
         Call PutNumber(r, 11, dims(2))
 
-        Call BufSet(r, 12, "N/A")
+        If v(5) > 0 Then
+            Call BufSet(r, 12, "sum incomplete - content missing")
+        Else
+            Call BufSet(r, 12, "N/A")
+        End If
         Call BufSet(r, 13, "N/A")
         Set oProd = Nothing
         DoEvents
@@ -1247,22 +1343,23 @@ End Sub
 
 ' ==============================================================================
 ' HELPER: MASS / VOLUME / AREA OF ONE PIECE OF AN ASSEMBLY, ADDED UP
-' Returns Array(mass, volume, area, part instances, part instances without values)
-' over every part instance below it. Pure bookkeeping - nothing is asked from
+' Returns Array(mass, volume, area, part instances, part instances without
+' values, pieces of unknown content) over every part instance below it. Unknown
+' content = a sub-assembly whose sheet failed, or one CATIA has not loaded. Pure bookkeeping - nothing is asked from
 ' CATIA. The content of every assembly part number is noted while the trees are
 ' walked (mAssyKids); the part values are the ones pass 1 has read (mPropCache).
 ' ==============================================================================
 Private Function RollUp(ByVal pn As String, ByVal depth As Long) As Variant
     Dim kids As Collection, k As Variant, v As Variant, res As Variant
     Dim m As Double, vo As Double, a As Double
-    Dim np As Long, nm As Long
+    Dim np As Long, nm As Long, nu As Long
 
     If mRollCache.Exists(pn) Then
         RollUp = mRollCache(pn)
         Exit Function
     End If
     If depth > 60 Or Not mAssyKids.Exists(pn) Then
-        RollUp = Array(0#, 0#, 0#, 0&, 1&)          ' content unknown
+        RollUp = Array(0#, 0#, 0#, 0&, 0&, 1&)       ' content unknown
         Exit Function
     End If
 
@@ -1271,7 +1368,9 @@ Private Function RollUp(ByVal pn As String, ByVal depth As Long) As Variant
         If k(1) Then
             v = RollUp(CStr(k(0)), depth + 1)
             m = m + v(0): vo = vo + v(1): a = a + v(2)
-            np = np + v(3): nm = nm + v(4)
+            np = np + v(3): nm = nm + v(4): nu = nu + v(5)
+        ElseIf mNotLoaded.Exists(CStr(k(0))) Then
+            nu = nu + 1                                ' a sub-assembly CATIA has not loaded
         Else
             np = np + 1
             If mPropCache.Exists(CStr(k(0))) Then
@@ -1283,10 +1382,42 @@ Private Function RollUp(ByVal pn As String, ByVal depth As Long) As Variant
         End If
     Next k
 
-    res = Array(m, vo, a, np, nm)
+    res = Array(m, vo, a, np, nm, nu)
     ' a complete sum never changes again; an incomplete one may, later in the run
-    If nm = 0 Then mRollCache.Add pn, res
+    If nm = 0 And nu = 0 Then mRollCache.Add pn, res
     RollUp = res
+End Function
+
+' ==============================================================================
+' HELPER: IS A CHILDLESS NODE A SUB-ASSEMBLY THAT IS NOT LOADED?
+' Nothing is loaded in design mode here:
+'   1. its CATPart is already in the session                   -> a part
+'   2. its shape file is known (CATPart, cgr ...) - not loaded  -> a part
+'   3. otherwise its structure is loaded (visualization mode,
+'      no geometry in design mode): children appear            -> not loaded
+' ==============================================================================
+Private Function IsUnloadedAssembly(oProd As Product) As Boolean
+    Dim tn As String, pth As String, nk As Long
+
+    IsUnloadedAssembly = False
+    On Error Resume Next
+
+    tn = ""
+    tn = TypeName(oProd.ReferenceProduct.Parent)
+    Err.Clear
+    If tn = "PartDocument" Then Exit Function
+
+    pth = ""
+    pth = LCase$(CStr(oProd.GetMasterShapeRepresentationPathName))
+    Err.Clear
+    If Len(pth) > 0 And Right$(pth, 11) <> ".catproduct" Then Exit Function
+
+    nk = 0
+    oProd.ApplyWorkMode 1
+    Err.Clear
+    nk = oProd.Products.Count
+    Err.Clear
+    IsUnloadedAssembly = (nk > 0)
 End Function
 
 ' notes the content of an assembly part number once (all its instances share it)
@@ -1337,10 +1468,8 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
     Call SetShowCollection(sel, mLeaves, 1)
     Call Settle(100)
 
-    On Error Resume Next
-    mXlApp.ScreenUpdating = False
-    Err.Clear
-    On Error GoTo 0
+    ' (Excel keeps repainting here: one repaint per picture costs nothing next to
+    '  a capture, and a run that is stopped or killed must not leave it frozen)
 
     ' --- 2. per picture: capture into a file, put it into Excel, delete it ---
     '        (so there is only ever one picture file on disk)
@@ -1557,14 +1686,15 @@ Private Sub PutNumber(ByVal r As Long, ByVal c As Long, ByVal v As Variant)
 End Sub
 
 ' writes the buffer to the sheet (rows 2 ...) in blocks of 500 rows
-Private Sub FlushSheet(xlSheet As Object)
+Private Function FlushSheet(xlSheet As Object) As Long
     Const BLOCK_ROWS As Long = 500
-    Dim arr() As Variant
+    Dim arr() As Variant, rowArr() As Variant
     Dim i0 As Long, n As Long, i As Long, c As Long
-    Dim rr As Variant
+    Dim rr As Variant, nLost As Long
 
     mFlushed = True
-    If mBufRows = 0 Then Exit Sub
+    FlushSheet = 0
+    If mBufRows = 0 Then Exit Function
 
     Call SetStatus("BOM " & mSheetName & ": writing " & mBufRows & " rows to Excel ...")
     For i0 = 1 To mBufRows Step BLOCK_ROWS
@@ -1576,11 +1706,25 @@ Private Sub FlushSheet(xlSheet As Object)
                 arr(i, c) = mBuf(c, i0 + i - 1)
             Next c
         Next i
-        Call XlWriteBlock(xlSheet, i0 + 1, 1, arr)
+        If Not XlWriteBlock(xlSheet, i0 + 1, 1, arr) Then
+            If mXlLost Or mXlLastErr = 0 Then
+                nLost = nLost + n                    ' Excel gone, or the user skipped
+            Else
+                ' Excel refused a VALUE: row by row, so it costs one row, not 500
+                Call LogLine(mSheetName & ": block from row " & (i0 + 1) & " refused - writing it row by row")
+                ReDim rowArr(1 To 1, 1 To 15)
+                For i = 1 To n
+                    For c = 1 To 15
+                        rowArr(1, c) = mBuf(c, i0 + i - 1)
+                    Next c
+                    If Not XlWriteBlock(xlSheet, i0 + i, 1, rowArr) Then nLost = nLost + 1
+                Next i
+            End If
+        End If
     Next i0
 
     ' assembly rows in bold - only looks, so a failure here is ignored
-    If mBoldRows.Count > 0 Then
+    If mBoldRows.Count > 0 And Not mXlLost Then
         Call XlReady
         On Error Resume Next
         For Each rr In mBoldRows
@@ -1589,14 +1733,36 @@ Private Sub FlushSheet(xlSheet As Object)
         Err.Clear
         On Error GoTo 0
     End If
+    FlushSheet = nLost
+End Function
+
+' a header or rows Excel did not take: one more try before the pictures (the
+' user may have freed Excel meanwhile). The whole buffer is written again -
+' the same values, so nothing is doubled.
+Private Sub RetryLostWrites(xlSheet As Object, ByRef hdrOK As Boolean, ByRef nLost As Long)
+    If hdrOK And nLost = 0 Then Exit Sub
+    If mXlLost Then Exit Sub
+    Call LogLine(mSheetName & ": writing again what Excel did not take")
+    mXlSkipAt = -1
+    If Not hdrOK Then hdrOK = WriteHeader(xlSheet)
+    If nLost > 0 Then nLost = FlushSheet(xlSheet)
 End Sub
+
+Private Function SheetLostText(ByVal hdrOK As Boolean, ByVal nLost As Long) As String
+    Dim s As String
+    s = "INCOMPLETE: "
+    If Not hdrOK Then s = s & "the header row"
+    If Not hdrOK And nLost > 0 Then s = s & " and "
+    If nLost > 0 Then s = s & nLost & " rows"
+    SheetLostText = s & " could not be written to Excel"
+End Function
 
 
 ' ==============================================================================
 ' HELPER: THE COLUMN HEADERS OF A BOM SHEET
 ' (identical on every sheet, so every sheet imports into the ACE cost model)
 ' ==============================================================================
-Private Sub WriteHeader(xlSheet As Object)
+Private Function WriteHeader(xlSheet As Object) As Boolean
     Dim h As Variant, a(1 To 1, 1 To 15) As Variant
     Dim i As Long
 
@@ -1607,14 +1773,18 @@ Private Sub WriteHeader(xlSheet As Object)
         a(1, i + 1) = h(i)
     Next i
 
-    ' the formats first: part numbers stay text (leading zeros, "1E5" ...)
+    ' the formats first: every text column stays TEXT - part numbers keep
+    ' leading zeros, "1E5" stays "1E5", and a description like "+X PANEL" or
+    ' "-Y WALL" is not taken for a formula (#NAME? or a refused block)
     Call XlReady
     On Error Resume Next
     With xlSheet
         .Columns("A:A").ColumnWidth = 15
         .Columns("B:B").ColumnWidth = 8
         .Columns("C:D").ColumnWidth = 20
-        .Columns("C:C").NumberFormat = "@"
+        .Columns("A:A").NumberFormat = "@"
+        .Columns("C:D").NumberFormat = "@"
+        .Columns("L:L").NumberFormat = "@"
         .Columns("F:H").NumberFormat = "0.000000000"
         .Columns("I:K").NumberFormat = "0.0"
         .Columns("M:M").NumberFormat = "0.000"
@@ -1627,8 +1797,8 @@ Private Sub WriteHeader(xlSheet As Object)
     Err.Clear
     On Error GoTo 0
 
-    Call XlWriteBlock(xlSheet, 1, 1, a)
-End Sub
+    WriteHeader = XlWriteBlock(xlSheet, 1, 1, a)
+End Function
 
 
 ' ==============================================================================
@@ -1684,7 +1854,8 @@ Private Sub WriteIndexHeader(idxSheet As Object, ByVal splitLevel As Long)
 
     Call XlReady
     On Error Resume Next
-    idxSheet.Columns("B:B").NumberFormat = "@"
+    idxSheet.Columns("B:C").NumberFormat = "@"
+    idxSheet.Columns("F:G").NumberFormat = "@"
     Err.Clear
     On Error GoTo 0
     Call XlWriteBlock(idxSheet, 1, 1, a)
@@ -1699,11 +1870,12 @@ Private Sub WriteIndexHeader(idxSheet As Object, ByVal splitLevel As Long)
     Err.Clear
 End Sub
 
-Private Sub WriteIndexRow(idxSheet As Object, ByVal idxRow As Long, ByVal no As Long, _
-                          ByVal pn As String, ByVal desc As String, ByVal lvl As Long, _
-                          ByVal qty As Long, ByVal firstLevel As String, ByVal pathTxt As String, _
-                          ByVal sheetName As String)
+Private Function WriteIndexRow(idxSheet As Object, ByVal idxRow As Long, ByVal no As Long, _
+                               ByVal pn As String, ByVal desc As String, ByVal lvl As Long, _
+                               ByVal qty As Long, ByVal firstLevel As String, ByVal pathTxt As String, _
+                               ByVal sheetName As String) As Boolean
     Dim a(1 To 1, 1 To 10) As Variant
+    Dim ok As Boolean
 
     If no > 0 Then a(1, 1) = no
     a(1, 2) = pn
@@ -1713,31 +1885,73 @@ Private Sub WriteIndexRow(idxSheet As Object, ByVal idxRow As Long, ByVal no As 
     a(1, 6) = firstLevel
     a(1, 7) = pathTxt
     a(1, 10) = "waiting ..."
-    Call XlWriteBlock(idxSheet, idxRow, 1, a)
+    ok = XlWriteBlock(idxSheet, idxRow, 1, a)
+    WriteIndexRow = ok
+    If Not ok Then Exit Function
 
-    If Len(sheetName) = 0 Then Exit Sub
+    If Len(sheetName) = 0 Then Exit Function
     Call XlReady
     On Error Resume Next
     idxSheet.Hyperlinks.Add idxSheet.Cells(idxRow, 8), "", _
                             "'" & Replace(sheetName, "'", "''") & "'!A1", "", sheetName
     Err.Clear
-End Sub
+End Function
 
-Private Sub WriteIndexResult(idxSheet As Object, ByVal idxRow As Long, ByVal nRows As Long, _
-                             ByVal statusTxt As String, ByVal secs As Double, ByVal whereTxt As String)
+Private Function WriteIndexResult(idxSheet As Object, ByVal idxRow As Long, ByVal nRows As Long, _
+                                  ByVal statusTxt As String, ByVal secs As Double, _
+                                  ByVal whereTxt As String) As Boolean
     Dim a(1 To 1, 1 To 4) As Variant
+    Dim ok As Boolean
 
     a(1, 1) = nRows
     a(1, 2) = statusTxt
     a(1, 3) = Round(secs, 1)
     a(1, 4) = whereTxt
-    Call XlWriteBlock(idxSheet, idxRow, 9, a)
+    ok = XlWriteBlock(idxSheet, idxRow, 9, a)
+    WriteIndexResult = ok
+    If Not ok Then Exit Function
 
-    If statusTxt = "OK" Then Exit Sub
+    If statusTxt = "OK" Then Exit Function
     Call XlReady
     On Error Resume Next
     idxSheet.Range(idxSheet.Cells(idxRow, 1), idxSheet.Cells(idxRow, 12)).Interior.Color = RGB(255, 220, 200)
     Err.Clear
+End Function
+
+' the Index writes of the run: what Excel could not take is kept and written
+' again at the end (RedoIndexWrites), so no component is missing on the Index
+Private Sub NoteIndexRow(idxSheet As Object, ByVal idxRow As Long, ByVal no As Long, _
+                   ByVal pn As String, ByVal desc As String, ByVal lvl As Long, _
+                   ByVal qty As Long, ByVal firstLevel As String, ByVal pathTxt As String, _
+                   ByVal sheetName As String)
+    If Not WriteIndexRow(idxSheet, idxRow, no, pn, desc, lvl, qty, firstLevel, pathTxt, sheetName) Then
+        mIdxRedo.Add Array("ROW", idxRow, no, pn, desc, lvl, qty, firstLevel, pathTxt, sheetName)
+    End If
+End Sub
+
+Private Sub NoteIndexResult(idxSheet As Object, ByVal idxRow As Long, ByVal nRows As Long, _
+                      ByVal statusTxt As String, ByVal secs As Double, ByVal whereTxt As String)
+    If Not WriteIndexResult(idxSheet, idxRow, nRows, statusTxt, secs, whereTxt) Then
+        mIdxRedo.Add Array("RES", idxRow, nRows, statusTxt, secs, whereTxt)
+    End If
+End Sub
+
+Private Sub RedoIndexWrites(idxSheet As Object)
+    Dim it As Variant, ok As Boolean
+    If mIdxRedo Is Nothing Then Exit Sub
+    If mIdxRedo.Count = 0 Then Exit Sub
+    Call LogLine("writing " & mIdxRedo.Count & " Index entries again")
+    mXlSkipAt = -1
+    For Each it In mIdxRedo
+        If it(0) = "ROW" Then
+            ok = WriteIndexRow(idxSheet, CLng(it(1)), CLng(it(2)), CStr(it(3)), CStr(it(4)), _
+                               CLng(it(5)), CLng(it(6)), CStr(it(7)), CStr(it(8)), CStr(it(9)))
+        Else
+            ok = WriteIndexResult(idxSheet, CLng(it(1)), CLng(it(2)), CStr(it(3)), CDbl(it(4)), CStr(it(5)))
+        End If
+        If Not ok Then Call LogLine("Index row " & it(1) & " could not be written")
+    Next it
+    Set mIdxRedo = New Collection
 End Sub
 
 Private Sub FinishIndexLayout(idxSheet As Object)
@@ -2082,9 +2296,15 @@ Private Function AddSheet(xlBook As Object, ByVal baseName As String) As Object
     Dim t0 As Double, told As Boolean
 
     Set AddSheet = Nothing
+    ' creating a sheet is not one cell that can be skipped: it always waits and
+    ' asks again, whatever was answered for an earlier write
+    mXlSkipAt = -1
     t0 = Timer
     Do
-        If Not XlReady() Then Exit Function
+        If Not XlReady() Then
+            Call LogLine("skipped: the sheet " & baseName)
+            Exit Function
+        End If
         On Error Resume Next
         Err.Clear
         Set ws = Nothing
@@ -2208,8 +2428,23 @@ End Function
 
 ' ends the current component (or the run, outside a component) when Excel is gone
 Private Sub CheckExcel()
+    Dim e As Long, nm As String
+
+    ' the workbook itself can be closed while Excel stays open
+    If Not mXlLost And Not mXlBook Is Nothing Then
+        On Error Resume Next
+        Err.Clear
+        nm = mXlBook.Name
+        e = Err.Number
+        Err.Clear
+        On Error GoTo 0
+        If e <> 0 And Not IsExcelBusy(e) Then
+            mXlLost = True
+            Call LogLine("the BOM workbook is gone (error " & e & ") - nothing can be written any more")
+        End If
+    End If
     If mXlLost Then Err.Raise vbObjectError + 515, , _
-        "Excel was closed or does not answer any more - the run is stopped"
+        "Excel or the BOM workbook was closed - the run is stopped"
 End Sub
 
 ' notes the outcome of an Excel call
@@ -2295,6 +2530,7 @@ Private Function XlWriteBlock(ws As Object, ByVal r As Long, ByVal c As Long, ar
     Dim t0 As Double, told As Boolean
 
     XlWriteBlock = False
+    mXlLastErr = 0
     If ws Is Nothing Then Exit Function
     nr = UBound(arr, 1) - LBound(arr, 1) + 1
     nc = UBound(arr, 2) - LBound(arr, 2) + 1
@@ -2316,6 +2552,7 @@ Private Function XlWriteBlock(ws As Object, ByVal r As Long, ByVal c As Long, ar
         End If
         Call NoteXlError(e)
         If Not IsExcelBusy(e) Then
+            mXlLastErr = e
             Call LogLine("Excel write failed at row " & r & ", column " & c & ": error " & e)
             Exit Function
         End If
@@ -2371,10 +2608,67 @@ Private Function XlInsertPicture(ws As Object, ByVal rowNo As Long, ByVal picPat
     XlInsertPicture = True
 End Function
 
-' Excel back to normal at the end of the run (also after an error)
+' starts the Excel of the run (or attaches to the open one when
+' OWN_EXCEL_INSTANCE is False), makes it visible and adds the workbook
+Private Function StartExcel(ByRef firstSheet As Object) As Boolean
+    Dim e As Long, t0 As Double, told As Boolean
+
+    StartExcel = False
+    Set firstSheet = Nothing
+    On Error Resume Next
+    If Not OWN_EXCEL_INSTANCE Then Set mXlApp = GetObject(, "Excel.Application")
+    Err.Clear
+    If mXlApp Is Nothing Then
+        Set mXlApp = CreateObject("Excel.Application")
+        mOwnXl = Not (mXlApp Is Nothing)
+    End If
+    Err.Clear
+    On Error GoTo 0
+    If mXlApp Is Nothing Then
+        Call LogLine("Excel could not be started")
+        Exit Function
+    End If
+
+    ' a fresh Excel can still be loading its add-ins and refuse calls for a while
+    t0 = Timer
+    Do
+        On Error Resume Next
+        Err.Clear
+        mXlApp.Visible = True
+        If Err.Number = 0 And mXlBook Is Nothing Then Set mXlBook = mXlApp.Workbooks.Add
+        If Err.Number = 0 And Not mXlBook Is Nothing Then Set firstSheet = mXlBook.Sheets(1)
+        e = Err.Number
+        Err.Clear
+        On Error GoTo 0
+        If e = 0 And Not firstSheet Is Nothing Then Exit Do
+        Call NoteXlError(e)
+        If Not IsExcelBusy(e) Then
+            Call LogLine("Excel could not be prepared: error " & e)
+            Exit Function
+        End If
+        If Not XlKeepTrying(t0, told) Then Exit Function
+    Loop
+
+    ' an Excel started by the macro stays open when the macro ends
+    On Error Resume Next
+    If mOwnXl Then mXlApp.UserControl = True
+    Err.Clear
+    On Error GoTo 0
+    StartExcel = True
+End Function
+
+' Excel back to normal at the end of the run (also after an error). An own
+' Excel that never got its workbook is closed again instead of being left
+' running invisible.
 Private Sub XlRestore()
     If mXlApp Is Nothing Then Exit Sub
     On Error Resume Next
+    If mOwnXl And mXlBook Is Nothing Then
+        mXlApp.Quit
+        Set mXlApp = Nothing
+        Err.Clear
+        Exit Sub
+    End If
     mXlApp.ScreenUpdating = True
     mXlApp.DisplayAlerts = True
     If mOwnXl Then mXlApp.UserControl = True
@@ -2388,30 +2682,46 @@ End Sub
 ' log file and save path of this run:  <folder>\BOM_<product>_<date>_<time>.txt/.xlsx
 Private Sub StartRunFiles(ByVal rootPN As String)
     Dim folder As String, baseName As String, bad As Variant
+    Dim k As Long, f As Integer, e As Long
 
     mLogPath = ""
     mSavePath = ""
     mSavedOnce = False
+    mSaveTried = False
+    mLastSaveOK = False
     mLastSave = Timer
     Set mSlow = New Collection
 
+    ' file name: no character Windows or Excel refuses
+    baseName = rootPN
+    For Each bad In Array("\", "/", ":", "*", "?", Chr(34), "<", ">", "|", "[", "]")
+        baseName = Replace(baseName, CStr(bad), "_")
+    Next bad
+    For k = 0 To 31
+        baseName = Replace(baseName, Chr(k), "_")
+    Next k
+    baseName = Trim$(baseName)
+    If Len(baseName) = 0 Then baseName = "product"
+    If Len(baseName) > 60 Then baseName = Left$(baseName, 60)
+    baseName = "BOM_" & baseName & "_" & Format(Now, "yyyymmdd_hhnnss")
+
+    ' the folder must be WRITABLE, not only exist - otherwise the user's TEMP
     folder = SAVE_FOLDER
     If Len(folder) = 0 Then folder = "C:\Temp"
     Call EnsureFolder(folder)
     On Error Resume Next
-    If Not mFso.FolderExists(folder) Then folder = CStr(Environ$("TEMP"))
+    Err.Clear
+    f = FreeFile
+    Open folder & "\" & baseName & ".txt" For Append As #f
+    e = Err.Number
+    Close #f
+    Err.Clear
+    If e <> 0 Then folder = CStr(Environ$("TEMP"))
     Err.Clear
     On Error GoTo 0
 
-    baseName = rootPN
-    For Each bad In Array("\", "/", ":", "*", "?", Chr(34), "<", ">", "|")
-        baseName = Replace(baseName, CStr(bad), "_")
-    Next bad
-    If Len(baseName) > 60 Then baseName = Left$(baseName, 60)
-    baseName = folder & "\BOM_" & baseName & "_" & Format(Now, "yyyymmdd_hhnnss")
-
-    mLogPath = baseName & ".txt"
-    If Len(SAVE_FOLDER) > 0 Then mSavePath = baseName & ".xlsx"
+    mLogPath = folder & "\" & baseName & ".txt"
+    If Len(SAVE_FOLDER) > 0 Then mSavePath = folder & "\" & baseName & ".xlsx"
 End Sub
 
 ' saves the workbook (first time: Save As). force = False saves at most every
@@ -2419,8 +2729,14 @@ End Sub
 Private Sub SaveWorkbook(ByVal force As Boolean)
     Dim e As Long, d As String
 
-    If Len(mSavePath) = 0 Or mXlBook Is Nothing Or mXlLost Then Exit Sub
-    If Not force And mSavedOnce And Elapsed(mLastSave) < SAVE_EVERY_SECONDS Then Exit Sub
+    If Len(mSavePath) = 0 Or mXlBook Is Nothing Then Exit Sub
+    If mXlLost Then
+        mLastSaveOK = False
+        Exit Sub
+    End If
+    ' throttled after any attempt - a save that keeps failing is not retried
+    ' after every picture
+    If Not force And mSaveTried And Elapsed(mLastSave) < SAVE_EVERY_SECONDS Then Exit Sub
 
     Call SetStatus("BOM: saving the workbook ...")
     Call XlReady
@@ -2440,19 +2756,27 @@ Private Sub SaveWorkbook(ByVal force As Boolean)
     Err.Clear
     On Error GoTo 0
     mLastSave = Timer
+    mSaveTried = True
+    mLastSaveOK = (e = 0)
 
     If e = 0 Then
         mSavedOnce = True
+        mLastSaveAt = Now
         Call LogLine("saved " & mSavePath)
     Else
+        Call NoteXlError(e)
         Call LogLine("saving failed: error " & e & " - " & d)
     End If
 End Sub
 
 Private Function SavedText() As String
     Dim s As String
-    If mSavedOnce Then
+    If mSavedOnce And mLastSaveOK Then
         s = "Saved as:" & vbCrLf & mSavePath
+    ElseIf mSavedOnce Then
+        s = "The LAST save did not work - only the copy of " & Format(mLastSaveAt, "hh:nn") & _
+            " is saved as:" & vbCrLf & mSavePath & vbCrLf & _
+            "Save the workbook in Excel yourself if it is still open."
     ElseIf Len(mSavePath) > 0 Then
         s = "The workbook could NOT be saved automatically - please save it yourself."
     Else
@@ -2460,6 +2784,25 @@ Private Function SavedText() As String
     End If
     If Len(mLogPath) > 0 Then s = s & vbCrLf & vbCrLf & "Log of the run:" & vbCrLf & mLogPath
     SavedText = s
+End Function
+
+' the sub-assemblies CATIA had not loaded - their content is missing in the BOM
+Private Function NotLoadedText() As String
+    Dim k As Variant, s As String, n As Long
+    NotLoadedText = ""
+    If mNotLoaded Is Nothing Then Exit Function
+    If mNotLoaded.Count = 0 Then Exit Function
+    s = mNotLoaded.Count & " sub-assembly(ies) were NOT LOADED in CATIA - their content is" & vbCrLf & _
+        "missing in the BOM (marked ""NOT LOADED"" in column L):" & vbCrLf
+    For Each k In mNotLoaded.Keys
+        n = n + 1
+        If n > 8 Then
+            s = s & "  ..." & vbCrLf
+            Exit For
+        End If
+        s = s & "  " & CStr(k) & vbCrLf
+    Next k
+    NotLoadedText = s & vbCrLf
 End Function
 
 ' one line into the log file - opened and closed every time, so the file is

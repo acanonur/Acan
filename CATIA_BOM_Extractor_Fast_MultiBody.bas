@@ -257,6 +257,7 @@ Private mJobBody As Collection   ' ... body name for "BODY"
 Private mBuf() As Variant        ' the rows of the sheet: mBuf(column, sheet row - 1)
 Private mBufRows As Long         ' rows used in mBuf
 Private mFlushed As Boolean      ' mBuf is already in Excel
+Private mLostBlocks As Object    ' first buffer row of every block Excel did not take
 Private mBoldRows As Collection  ' sheet rows written in bold (assemblies)
 Private mAssyRows As Collection  ' Array(sheet row, part number, product) of every assembly row
 Private mSheetName As String     ' name of the sheet being written
@@ -360,6 +361,7 @@ Private Sub RunBOM()
     Dim unitLayout As Long, unitLayoutSet As Boolean
     Dim ownWindow As Boolean
     Dim rootSceneSet As Boolean
+    Dim idxHdrOK As Boolean
 
     startTime = Timer
 
@@ -530,7 +532,7 @@ Private Sub RunBOM()
 
         Set idxSheet = firstSheet
         Call NameSheet(idxSheet, "Index")
-        Call WriteIndexHeader(idxSheet, splitLevel)
+        idxHdrOK = WriteIndexHeader(idxSheet, splitLevel)
         idxRow = 3
 
         ' --- the components that are CATProducts of their own: own window ------
@@ -542,6 +544,8 @@ Private Sub RunBOM()
             Set xlSheet = Nothing
             mXlSkipAt = -1                   ' a "skip" given for an earlier component ends here
             Call CheckExcel                  ' Excel gone: stop the whole run here
+            ' the Index header (and its text formats) before any more Index rows
+            If Not idxHdrOK Then idxHdrOK = WriteIndexHeader(idxSheet, splitLevel)
             ' an error in here ends this component only, never the whole run
             On Error GoTo UnitFail
 
@@ -700,6 +704,8 @@ UnitNext:
         End If
 
         ' Index writes Excel could not take during the run get a second chance
+        mXlSkipAt = -1
+        If Not idxHdrOK Then idxHdrOK = WriteIndexHeader(idxSheet, splitLevel)
         Call RedoIndexWrites(idxSheet)
         Call FinishIndexLayout(idxSheet)
     End If
@@ -727,7 +733,12 @@ UnitNext:
 
     If splitLevel = 0 Then
         If Not unitOK Then
-            MsgBox "The run stopped early  (" & modeName & ")" & vbCrLf & statusTxt & vbCrLf & vbCrLf & _
+            If Left$(statusTxt, 10) = "INCOMPLETE" Then
+                failMsg = "BOM exported, but the sheet is INCOMPLETE"
+            Else
+                failMsg = "The run stopped early"
+            End If
+            MsgBox failMsg & "  (" & modeName & ")" & vbCrLf & statusTxt & vbCrLf & vbCrLf & _
                    "Rows written:     " & totRows & vbCrLf & _
                    "Time: " & Format(Elapsed(startTime) / 60#, "0.0") & " min" & vbCrLf & vbCrLf & _
                    NotLoadedText() & SavedText(), vbExclamation
@@ -847,7 +858,7 @@ Private Function ProcessTree(treeRoot As Product, sel As Selection, oViewer As V
     Call WriteDataRows(r, nAssy, nParts)
     nRows = r - 2
     Call FillAssemblyRows
-    nLost = FlushSheet(xlSheet)
+    nLost = FlushSheet(xlSheet, False)
     Call RetryLostWrites(xlSheet, hdrOK, nLost)
 
     ' the numbers are complete - make them visible before the pictures start
@@ -861,6 +872,7 @@ Private Function ProcessTree(treeRoot As Product, sel As Selection, oViewer As V
 
     ' rows Excel never took: the sheet is NOT reported as complete
     If Not hdrOK Or nLost > 0 Then
+        nRows = nRows - nLost
         statusTxt = SheetLostText(hdrOK, nLost)
         Call LogLine(mSheetName & " " & statusTxt)
         Call MarkSheetIncomplete(xlSheet, statusTxt)
@@ -882,7 +894,7 @@ SheetCleanup:
     Call SetShowCollection(sel, mLeaves, 0)
     CATIA.RefreshDisplay = True
     ' whatever was read so far still goes into the sheet
-    If Not mFlushed Then Call FlushSheet(xlSheet)
+    If Not mFlushed Then Call FlushSheet(xlSheet, False)
     Call MarkSheetIncomplete(xlSheet, statusTxt)
     Err.Clear
 End Function
@@ -942,7 +954,7 @@ Private Function ProcessLoose(colInst As Collection, colLevel As Collection, _
     Call WriteDataRows(r, nAssy, nParts)
     nRows = r - 2
     Call FillAssemblyRows
-    nLost = FlushSheet(xlSheet)
+    nLost = FlushSheet(xlSheet, False)
     Call RetryLostWrites(xlSheet, hdrOK, nLost)
     Call FinishSheetLayout(xlSheet)
     Call SaveWorkbook(False)
@@ -950,6 +962,7 @@ Private Function ProcessLoose(colInst As Collection, colLevel As Collection, _
     Call TakePictures(sel, oViewer, xlSheet)
 
     If Not hdrOK Or nLost > 0 Then
+        nRows = nRows - nLost
         statusTxt = SheetLostText(hdrOK, nLost)
         Call LogLine(mSheetName & " " & statusTxt)
         Call MarkSheetIncomplete(xlSheet, statusTxt)
@@ -969,7 +982,7 @@ LooseCleanup:
     On Error Resume Next
     Call LogLine(mSheetName & " " & statusTxt)
     CATIA.RefreshDisplay = True
-    If Not mFlushed Then Call FlushSheet(xlSheet)
+    If Not mFlushed Then Call FlushSheet(xlSheet, False)
     Call MarkSheetIncomplete(xlSheet, statusTxt)
     Err.Clear
 End Function
@@ -1066,7 +1079,7 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
             For bi = 6 To 11
                 Call BufSet(r, bi, "N/A")
             Next bi
-            Call BufSet(r, 12, "NOT LOADED - content missing")
+            Call BufSet(r, 12, "NOT LOADED or empty - content missing")
             Call BufSet(r, 13, "N/A")
 
         ElseIf Not isAssy Then
@@ -1389,35 +1402,49 @@ Private Function RollUp(ByVal pn As String, ByVal depth As Long) As Variant
 End Function
 
 ' ==============================================================================
-' HELPER: IS A CHILDLESS NODE A SUB-ASSEMBLY THAT IS NOT LOADED?
-' Nothing is loaded in design mode here:
-'   1. its CATPart is already in the session                   -> a part
-'   2. its shape file is known (CATPart, cgr ...) - not loaded  -> a part
-'   3. otherwise its structure is loaded (visualization mode,
-'      no geometry in design mode): children appear            -> not loaded
+' HELPER: IS A CHILDLESS NODE A SUB-ASSEMBLY THAT IS NOT LOADED (OR EMPTY)?
+' Decided WITHOUT loading anything - every ApplyWorkMode on such a node would
+' load its whole content in one blocking call:
+'   its CATPart is in the session                         -> a part
+'   its shape file is a CATProduct                        -> NOT a part
+'   it has a shape file of another kind (CATPart, cgr)    -> a part
+'   its reference is the root of a CATProduct of its own  -> NOT a part
+'   no evidence either way                                -> a part (as before)
 ' ==============================================================================
 Private Function IsUnloadedAssembly(oProd As Product) As Boolean
-    Dim tn As String, pth As String, nk As Long
+    Dim oDoc As Object, tn As String, pth As String
+    Dim docPn As String, myPn As String
 
     IsUnloadedAssembly = False
     On Error Resume Next
 
-    tn = ""
-    tn = TypeName(oProd.ReferenceProduct.Parent)
+    Set oDoc = Nothing
+    Set oDoc = oProd.ReferenceProduct.Parent
     Err.Clear
+    tn = ""
+    If Not oDoc Is Nothing Then tn = TypeName(oDoc)
     If tn = "PartDocument" Then Exit Function
 
     pth = ""
     pth = LCase$(CStr(oProd.GetMasterShapeRepresentationPathName))
     Err.Clear
-    If Len(pth) > 0 And Right$(pth, 11) <> ".catproduct" Then Exit Function
+    If Right$(pth, 11) = ".catproduct" Then
+        IsUnloadedAssembly = True
+        Exit Function
+    End If
+    If Len(pth) > 0 Then Exit Function
 
-    nk = 0
-    oProd.ApplyWorkMode 1
+    ' its reference is a CATProduct document whose root IS this node (and not
+    ' the assembly the node sits in) - a sub-assembly without children
+    If tn = "ProductDocument" Then
+        docPn = ""
+        docPn = oDoc.Product.PartNumber
+        myPn = ""
+        myPn = oProd.PartNumber
+        Err.Clear
+        If Len(myPn) > 0 And StrComp(docPn, myPn, vbTextCompare) = 0 Then IsUnloadedAssembly = True
+    End If
     Err.Clear
-    nk = oProd.Products.Count
-    Err.Clear
-    IsUnloadedAssembly = (nk > 0)
 End Function
 
 ' notes the content of an assembly part number once (all its instances share it)
@@ -1650,6 +1677,7 @@ Private Sub ResetSheetData()
     ReDim mBuf(1 To 15, 1 To 256)
     mBufRows = 0
     mFlushed = False
+    Set mLostBlocks = CreateObject("Scripting.Dictionary")
     mSheetNo = mSheetNo + 1
 End Sub
 
@@ -1686,11 +1714,13 @@ Private Sub PutNumber(ByVal r As Long, ByVal c As Long, ByVal v As Variant)
 End Sub
 
 ' writes the buffer to the sheet (rows 2 ...) in blocks of 500 rows
-Private Function FlushSheet(xlSheet As Object) As Long
+' onlyLost = True writes only the blocks an earlier flush could not write.
+' Returns the number of rows Excel did not take.
+Private Function FlushSheet(xlSheet As Object, ByVal onlyLost As Boolean) As Long
     Const BLOCK_ROWS As Long = 500
     Dim arr() As Variant, rowArr() As Variant
-    Dim i0 As Long, n As Long, i As Long, c As Long
-    Dim rr As Variant, nLost As Long
+    Dim i0 As Long, n As Long, i As Long, c As Variant, k As Long
+    Dim rr As Variant, nLost As Long, nBlockLost As Long, v As Variant
 
     mFlushed = True
     FlushSheet = 0
@@ -1698,38 +1728,57 @@ Private Function FlushSheet(xlSheet As Object) As Long
 
     Call SetStatus("BOM " & mSheetName & ": writing " & mBufRows & " rows to Excel ...")
     For i0 = 1 To mBufRows Step BLOCK_ROWS
+        If onlyLost And Not mLostBlocks.Exists(i0) Then GoTo NextBlock
         n = mBufRows - i0 + 1
         If n > BLOCK_ROWS Then n = BLOCK_ROWS
         ReDim arr(1 To n, 1 To 15)
         For i = 1 To n
-            For c = 1 To 15
-                arr(i, c) = mBuf(c, i0 + i - 1)
-            Next c
+            For k = 1 To 15
+                arr(i, k) = mBuf(k, i0 + i - 1)
+            Next k
         Next i
+        nBlockLost = 0
         If Not XlWriteBlock(xlSheet, i0 + 1, 1, arr) Then
             If mXlLost Or mXlLastErr = 0 Then
-                nLost = nLost + n                    ' Excel gone, or the user skipped
+                nBlockLost = n                       ' Excel gone, or the user skipped
             Else
                 ' Excel refused a VALUE: row by row, so it costs one row, not 500
                 Call LogLine(mSheetName & ": block from row " & (i0 + 1) & " refused - writing it row by row")
                 ReDim rowArr(1 To 1, 1 To 15)
                 For i = 1 To n
-                    For c = 1 To 15
-                        rowArr(1, c) = mBuf(c, i0 + i - 1)
-                    Next c
-                    If Not XlWriteBlock(xlSheet, i0 + i, 1, rowArr) Then nLost = nLost + 1
+                    For k = 1 To 15
+                        rowArr(1, k) = mBuf(k, i0 + i - 1)
+                    Next k
+                    If Not XlWriteBlock(xlSheet, i0 + i, 1, rowArr) Then nBlockLost = nBlockLost + 1
                 Next i
             End If
         End If
+        If nBlockLost > 0 Then
+            If Not mLostBlocks.Exists(i0) Then mLostBlocks.Add i0, True
+        ElseIf mLostBlocks.Exists(i0) Then
+            mLostBlocks.Remove i0
+        End If
+        nLost = nLost + nBlockLost
+NextBlock:
     Next i0
 
-    ' assembly rows in bold - only looks, so a failure here is ignored
-    If mBoldRows.Count > 0 And Not mXlLost Then
+    If Not mXlLost Then
         Call XlReady
         On Error Resume Next
+        ' assembly rows in bold - only looks, so a failure here is ignored
         For Each rr In mBoldRows
             xlSheet.Range(xlSheet.Cells(rr, 2), xlSheet.Cells(rr, 15)).Font.Bold = True
         Next rr
+        ' a text cell shows more than 255 characters only as #####: back to
+        ' General (the value stays the text it is)
+        For i = 1 To mBufRows
+            For Each c In Array(4, 14)
+                v = mBuf(c, i)
+                If VarType(v) = vbString Then
+                    If Len(v) > 255 Then xlSheet.Cells(i + 1, c).NumberFormat = "General"
+                End If
+            Next c
+        Next i
         Err.Clear
         On Error GoTo 0
     End If
@@ -1744,8 +1793,14 @@ Private Sub RetryLostWrites(xlSheet As Object, ByRef hdrOK As Boolean, ByRef nLo
     If mXlLost Then Exit Sub
     Call LogLine(mSheetName & ": writing again what Excel did not take")
     mXlSkipAt = -1
-    If Not hdrOK Then hdrOK = WriteHeader(xlSheet)
-    If nLost > 0 Then nLost = FlushSheet(xlSheet)
+    If Not hdrOK Then
+        hdrOK = WriteHeader(xlSheet)
+        ' the text formats came late: every row again, so part numbers that
+        ' were written as numbers become text (leading zeros) - same values
+        If hdrOK Then nLost = FlushSheet(xlSheet, False)
+    ElseIf nLost > 0 Then
+        nLost = FlushSheet(xlSheet, True)
+    End If
 End Sub
 
 Private Function SheetLostText(ByVal hdrOK As Boolean, ByVal nLost As Long) As String
@@ -1764,7 +1819,7 @@ End Function
 ' ==============================================================================
 Private Function WriteHeader(xlSheet As Object) As Boolean
     Dim h As Variant, a(1 To 1, 1 To 15) As Variant
-    Dim i As Long
+    Dim i As Long, fmtOK As Boolean
 
     h = Array("Thumbnail", "Level", "Part Number", "Description", "Qty", _
               "Mass (kg)", "Volume (m3)", "Area (m2)", "Length (mm)", "Width (mm)", _
@@ -1778,6 +1833,7 @@ Private Function WriteHeader(xlSheet As Object) As Boolean
     ' "-Y WALL" is not taken for a formula (#NAME? or a refused block)
     Call XlReady
     On Error Resume Next
+    Err.Clear
     With xlSheet
         .Columns("A:A").ColumnWidth = 15
         .Columns("B:B").ColumnWidth = 8
@@ -1794,10 +1850,13 @@ Private Function WriteHeader(xlSheet As Object) As Boolean
         .Range("A1:O1").Font.Bold = True
         .Range("A1:O1").Interior.Color = RGB(220, 220, 220)
     End With
+    fmtOK = (Err.Number = 0)              ' (an error under Resume Next stays in Err)
     Err.Clear
     On Error GoTo 0
 
-    WriteHeader = XlWriteBlock(xlSheet, 1, 1, a)
+    ' success = the formats AND the header row: rows written before the text
+    ' formats would lose leading zeros, so a late format means a new flush
+    WriteHeader = XlWriteBlock(xlSheet, 1, 1, a) And fmtOK
 End Function
 
 
@@ -1833,8 +1892,9 @@ End Sub
 ' ==============================================================================
 ' HELPER: THE INDEX SHEET
 ' ==============================================================================
-Private Sub WriteIndexHeader(idxSheet As Object, ByVal splitLevel As Long)
+Private Function WriteIndexHeader(idxSheet As Object, ByVal splitLevel As Long) As Boolean
     Dim a(1 To 2, 1 To 12) As Variant
+    Dim fmtOK As Boolean
 
     a(1, 1) = "BOM split at level " & splitLevel & _
               "  -  quantities on a component sheet are per ONE piece of that component; " & _
@@ -1854,11 +1914,13 @@ Private Sub WriteIndexHeader(idxSheet As Object, ByVal splitLevel As Long)
 
     Call XlReady
     On Error Resume Next
+    Err.Clear
     idxSheet.Columns("B:C").NumberFormat = "@"
     idxSheet.Columns("F:G").NumberFormat = "@"
+    fmtOK = (Err.Number = 0)
     Err.Clear
     On Error GoTo 0
-    Call XlWriteBlock(idxSheet, 1, 1, a)
+    WriteIndexHeader = XlWriteBlock(idxSheet, 1, 1, a) And fmtOK
 
     Call XlReady
     On Error Resume Next
@@ -1868,15 +1930,23 @@ Private Sub WriteIndexHeader(idxSheet As Object, ByVal splitLevel As Long)
         .Range("A2:L2").Interior.Color = RGB(220, 220, 220)
     End With
     Err.Clear
-End Sub
+End Function
 
+' withStatus = False (a replay) writes only A:G, so a result that is already
+' in I:L is never overwritten by "waiting ..."
 Private Function WriteIndexRow(idxSheet As Object, ByVal idxRow As Long, ByVal no As Long, _
                                ByVal pn As String, ByVal desc As String, ByVal lvl As Long, _
                                ByVal qty As Long, ByVal firstLevel As String, ByVal pathTxt As String, _
-                               ByVal sheetName As String) As Boolean
-    Dim a(1 To 1, 1 To 10) As Variant
-    Dim ok As Boolean
+                               ByVal sheetName As String, ByVal withStatus As Boolean) As Boolean
+    Dim a() As Variant
+    Dim ok As Boolean, c As Variant
 
+    If withStatus Then
+        ReDim a(1 To 1, 1 To 10)
+        a(1, 10) = "waiting ..."
+    Else
+        ReDim a(1 To 1, 1 To 7)
+    End If
     If no > 0 Then a(1, 1) = no
     a(1, 2) = pn
     a(1, 3) = desc
@@ -1884,10 +1954,21 @@ Private Function WriteIndexRow(idxSheet As Object, ByVal idxRow As Long, ByVal n
     a(1, 5) = qty
     a(1, 6) = firstLevel
     a(1, 7) = pathTxt
-    a(1, 10) = "waiting ..."
     ok = XlWriteBlock(idxSheet, idxRow, 1, a)
     WriteIndexRow = ok
     If Not ok Then Exit Function
+
+    ' a text cell shows more than 255 characters only as #####: those cells go
+    ' back to General (the value stays the text it is)
+    If Len(desc) > 255 Or Len(firstLevel) > 255 Or Len(pathTxt) > 255 Then
+        Call XlReady
+        On Error Resume Next
+        For Each c In Array(3, 6, 7)
+            If Len(CStr(a(1, c))) > 255 Then idxSheet.Cells(idxRow, c).NumberFormat = "General"
+        Next c
+        Err.Clear
+        On Error GoTo 0
+    End If
 
     If Len(sheetName) = 0 Then Exit Function
     Call XlReady
@@ -1924,7 +2005,7 @@ Private Sub NoteIndexRow(idxSheet As Object, ByVal idxRow As Long, ByVal no As L
                    ByVal pn As String, ByVal desc As String, ByVal lvl As Long, _
                    ByVal qty As Long, ByVal firstLevel As String, ByVal pathTxt As String, _
                    ByVal sheetName As String)
-    If Not WriteIndexRow(idxSheet, idxRow, no, pn, desc, lvl, qty, firstLevel, pathTxt, sheetName) Then
+    If Not WriteIndexRow(idxSheet, idxRow, no, pn, desc, lvl, qty, firstLevel, pathTxt, sheetName, True) Then
         mIdxRedo.Add Array("ROW", idxRow, no, pn, desc, lvl, qty, firstLevel, pathTxt, sheetName)
     End If
 End Sub
@@ -1945,7 +2026,7 @@ Private Sub RedoIndexWrites(idxSheet As Object)
     For Each it In mIdxRedo
         If it(0) = "ROW" Then
             ok = WriteIndexRow(idxSheet, CLng(it(1)), CLng(it(2)), CStr(it(3)), CStr(it(4)), _
-                               CLng(it(5)), CLng(it(6)), CStr(it(7)), CStr(it(8)), CStr(it(9)))
+                               CLng(it(5)), CLng(it(6)), CStr(it(7)), CStr(it(8)), CStr(it(9)), False)
         Else
             ok = WriteIndexResult(idxSheet, CLng(it(1)), CLng(it(2)), CStr(it(3)), CDbl(it(4)), CStr(it(5)))
         End If
@@ -2682,7 +2763,7 @@ End Sub
 ' log file and save path of this run:  <folder>\BOM_<product>_<date>_<time>.txt/.xlsx
 Private Sub StartRunFiles(ByVal rootPN As String)
     Dim folder As String, baseName As String, bad As Variant
-    Dim k As Long, f As Integer, e As Long
+    Dim k As Long, f As Integer, e As Long, ch As String, probe As String
 
     mLogPath = ""
     mSavePath = ""
@@ -2700,6 +2781,11 @@ Private Sub StartRunFiles(ByVal rootPN As String)
     For k = 0 To 31
         baseName = Replace(baseName, Chr(k), "_")
     Next k
+    ' VBA's Open (the log) only takes characters of the Windows code page
+    For k = 1 To Len(baseName)
+        ch = Mid$(baseName, k, 1)
+        If StrConv(StrConv(ch, vbFromUnicode), vbUnicode) <> ch Then Mid$(baseName, k, 1) = "_"
+    Next k
     baseName = Trim$(baseName)
     If Len(baseName) = 0 Then baseName = "product"
     If Len(baseName) > 60 Then baseName = Left$(baseName, 60)
@@ -2711,10 +2797,12 @@ Private Sub StartRunFiles(ByVal rootPN As String)
     Call EnsureFolder(folder)
     On Error Resume Next
     Err.Clear
+    probe = folder & "\~bom_write_probe.tmp"
     f = FreeFile
-    Open folder & "\" & baseName & ".txt" For Append As #f
+    Open probe For Output As #f
     e = Err.Number
     Close #f
+    Kill probe
     Err.Clear
     If e <> 0 Then folder = CStr(Environ$("TEMP"))
     Err.Clear

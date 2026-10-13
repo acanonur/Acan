@@ -282,6 +282,8 @@ Private mLastSave As Double      ' Timer of the last save attempt
 Private mLastSaveOK As Boolean   ' the last save attempt worked
 Private mLastSaveAt As Date      ' time of the last save that worked
 Private mIdxRedo As Collection   ' Index writes Excel could not take - repeated at the end
+Private mIdxFmtOK As Boolean     ' the text formats of the Index are applied
+Private mIdxEarly As Collection  ' Index rows written BEFORE those formats - written again after them
 Private mNotLoaded As Object     ' part numbers of sub-assemblies that are not loaded in CATIA
 Private mSlow As Collection      ' Array(seconds, step) of every slow step
 Private mPump As Long            ' node counter of the tree walks
@@ -378,6 +380,8 @@ Private Sub RunBOM()
     mSaveTried = False
     mLastSaveOK = False
     Set mIdxRedo = New Collection
+    mIdxFmtOK = False
+    Set mIdxEarly = New Collection
 
     On Error GoTo Fail
 
@@ -532,7 +536,7 @@ Private Sub RunBOM()
 
         Set idxSheet = firstSheet
         Call NameSheet(idxSheet, "Index")
-        idxHdrOK = WriteIndexHeader(idxSheet, splitLevel)
+        Call WriteIndexHeader(idxSheet, splitLevel, idxHdrOK)
         idxRow = 3
 
         ' --- the components that are CATProducts of their own: own window ------
@@ -545,7 +549,7 @@ Private Sub RunBOM()
             mXlSkipAt = -1                   ' a "skip" given for an earlier component ends here
             Call CheckExcel                  ' Excel gone: stop the whole run here
             ' the Index header (and its text formats) before any more Index rows
-            If Not idxHdrOK Then idxHdrOK = WriteIndexHeader(idxSheet, splitLevel)
+            If Not (idxHdrOK And mIdxFmtOK) Then Call WriteIndexHeader(idxSheet, splitLevel, idxHdrOK)
             ' an error in here ends this component only, never the whole run
             On Error GoTo UnitFail
 
@@ -705,7 +709,7 @@ UnitNext:
 
         ' Index writes Excel could not take during the run get a second chance
         mXlSkipAt = -1
-        If Not idxHdrOK Then idxHdrOK = WriteIndexHeader(idxSheet, splitLevel)
+        If Not (idxHdrOK And mIdxFmtOK) Then Call WriteIndexHeader(idxSheet, splitLevel, idxHdrOK)
         Call RedoIndexWrites(idxSheet)
         Call FinishIndexLayout(idxSheet)
     End If
@@ -1738,6 +1742,16 @@ Private Function FlushSheet(xlSheet As Object, ByVal onlyLost As Boolean) As Lon
             Next k
         Next i
         nBlockLost = 0
+        If onlyLost And Not mXlLost Then
+            ' its long-text cells may have been set to General after the first
+            ' try - text again, so nothing is read as a formula
+            Call XlReady
+            On Error Resume Next
+            xlSheet.Range(xlSheet.Cells(i0 + 1, 4), xlSheet.Cells(i0 + n, 4)).NumberFormat = "@"
+            xlSheet.Range(xlSheet.Cells(i0 + 1, 14), xlSheet.Cells(i0 + n, 14)).NumberFormat = "@"
+            Err.Clear
+            On Error GoTo 0
+        End If
         If Not XlWriteBlock(xlSheet, i0 + 1, 1, arr) Then
             If mXlLost Or mXlLastErr = 0 Then
                 nBlockLost = n                       ' Excel gone, or the user skipped
@@ -1795,9 +1809,14 @@ Private Sub RetryLostWrites(xlSheet As Object, ByRef hdrOK As Boolean, ByRef nLo
     mXlSkipAt = -1
     If Not hdrOK Then
         hdrOK = WriteHeader(xlSheet)
-        ' the text formats came late: every row again, so part numbers that
-        ' were written as numbers become text (leading zeros) - same values
-        If hdrOK Then nLost = FlushSheet(xlSheet, False)
+        If hdrOK Then
+            ' the text formats came late: every row again, so part numbers
+            ' that were written as numbers become text (same values)
+            nLost = FlushSheet(xlSheet, False)
+        ElseIf nLost > 0 Then
+            ' header / formats still failing: at least the lost rows
+            nLost = FlushSheet(xlSheet, True)
+        End If
     ElseIf nLost > 0 Then
         nLost = FlushSheet(xlSheet, True)
     End If
@@ -1835,22 +1854,26 @@ Private Function WriteHeader(xlSheet As Object) As Boolean
     On Error Resume Next
     Err.Clear
     With xlSheet
-        .Columns("A:A").ColumnWidth = 15
-        .Columns("B:B").ColumnWidth = 8
-        .Columns("C:D").ColumnWidth = 20
         .Columns("A:A").NumberFormat = "@"
         .Columns("C:D").NumberFormat = "@"
         .Columns("L:L").NumberFormat = "@"
+        .Columns("N:N").NumberFormat = "@"
+    End With
+    fmtOK = (Err.Number = 0)              ' (an error under Resume Next stays in Err)
+    Err.Clear
+    ' looks only - a failure here does not count
+    With xlSheet
+        .Columns("A:A").ColumnWidth = 15
+        .Columns("B:B").ColumnWidth = 8
+        .Columns("C:D").ColumnWidth = 20
         .Columns("F:H").NumberFormat = "0.000000000"
         .Columns("I:K").NumberFormat = "0.0"
         .Columns("M:M").NumberFormat = "0.000"
-        .Columns("N:N").NumberFormat = "@"
         .Columns("N:N").ColumnWidth = 22
         .Columns("O:O").ColumnWidth = 10
         .Range("A1:O1").Font.Bold = True
         .Range("A1:O1").Interior.Color = RGB(220, 220, 220)
     End With
-    fmtOK = (Err.Number = 0)              ' (an error under Resume Next stays in Err)
     Err.Clear
     On Error GoTo 0
 
@@ -1892,45 +1915,63 @@ End Sub
 ' ==============================================================================
 ' HELPER: THE INDEX SHEET
 ' ==============================================================================
-Private Function WriteIndexHeader(idxSheet As Object, ByVal splitLevel As Long) As Boolean
+Private Sub WriteIndexHeader(idxSheet As Object, ByVal splitLevel As Long, ByRef blockOK As Boolean)
     Dim a(1 To 2, 1 To 12) As Variant
-    Dim fmtOK As Boolean
+    Dim it As Variant
 
-    a(1, 1) = "BOM split at level " & splitLevel & _
-              "  -  quantities on a component sheet are per ONE piece of that component; " & _
-              "column E says how many pieces the product contains"
-    a(2, 1) = "#"
-    a(2, 2) = "Component"
-    a(2, 3) = "Description"
-    a(2, 4) = "Level"
-    a(2, 5) = "Qty in product"
-    a(2, 6) = "First Level"
-    a(2, 7) = "Path"
-    a(2, 8) = "Sheet"
-    a(2, 9) = "Rows"
-    a(2, 10) = "Status"
-    a(2, 11) = "Seconds"
-    a(2, 12) = "Worked in"
+    ' 1. the text formats - once. Rows written before them are written again,
+    '    so part numbers keep their leading zeros; columns are never set to
+    '    text a second time (that would undo the General of long-text cells)
+    If Not mIdxFmtOK Then
+        Call XlReady
+        On Error Resume Next
+        Err.Clear
+        idxSheet.Columns("B:C").NumberFormat = "@"
+        idxSheet.Columns("F:G").NumberFormat = "@"
+        mIdxFmtOK = (Err.Number = 0)
+        Err.Clear
+        On Error GoTo 0
+        If mIdxFmtOK And mIdxEarly.Count > 0 Then
+            Call LogLine("Index formats came late - writing " & mIdxEarly.Count & " rows again")
+            For Each it In mIdxEarly
+                Call WriteIndexRow(idxSheet, CLng(it(0)), CLng(it(1)), CStr(it(2)), CStr(it(3)), _
+                                   CLng(it(4)), CLng(it(5)), CStr(it(6)), CStr(it(7)), CStr(it(8)), False)
+            Next it
+            Set mIdxEarly = New Collection
+        End If
+    End If
 
-    Call XlReady
-    On Error Resume Next
-    Err.Clear
-    idxSheet.Columns("B:C").NumberFormat = "@"
-    idxSheet.Columns("F:G").NumberFormat = "@"
-    fmtOK = (Err.Number = 0)
-    Err.Clear
-    On Error GoTo 0
-    WriteIndexHeader = XlWriteBlock(idxSheet, 1, 1, a) And fmtOK
-
-    Call XlReady
-    On Error Resume Next
-    With idxSheet
-        .Cells(1, 1).Font.Italic = True
-        .Range("A2:L2").Font.Bold = True
-        .Range("A2:L2").Interior.Color = RGB(220, 220, 220)
-    End With
-    Err.Clear
-End Function
+    ' 2. the title and the column headers
+    If Not blockOK Then
+        a(1, 1) = "BOM split at level " & splitLevel & _
+                  "  -  quantities on a component sheet are per ONE piece of that component; " & _
+                  "column E says how many pieces the product contains"
+        a(2, 1) = "#"
+        a(2, 2) = "Component"
+        a(2, 3) = "Description"
+        a(2, 4) = "Level"
+        a(2, 5) = "Qty in product"
+        a(2, 6) = "First Level"
+        a(2, 7) = "Path"
+        a(2, 8) = "Sheet"
+        a(2, 9) = "Rows"
+        a(2, 10) = "Status"
+        a(2, 11) = "Seconds"
+        a(2, 12) = "Worked in"
+        blockOK = XlWriteBlock(idxSheet, 1, 1, a)
+        If blockOK Then
+            Call XlReady
+            On Error Resume Next
+            With idxSheet
+                .Cells(1, 1).Font.Italic = True
+                .Range("A2:L2").Font.Bold = True
+                .Range("A2:L2").Interior.Color = RGB(220, 220, 220)
+            End With
+            Err.Clear
+            On Error GoTo 0
+        End If
+    End If
+End Sub
 
 ' withStatus = False (a replay) writes only A:G, so a result that is already
 ' in I:L is never overwritten by "waiting ..."
@@ -2007,6 +2048,9 @@ Private Sub NoteIndexRow(idxSheet As Object, ByVal idxRow As Long, ByVal no As L
                    ByVal sheetName As String)
     If Not WriteIndexRow(idxSheet, idxRow, no, pn, desc, lvl, qty, firstLevel, pathTxt, sheetName, True) Then
         mIdxRedo.Add Array("ROW", idxRow, no, pn, desc, lvl, qty, firstLevel, pathTxt, sheetName)
+    ElseIf Not mIdxFmtOK Then
+        ' written before the text formats: once more after them
+        mIdxEarly.Add Array(idxRow, no, pn, desc, lvl, qty, firstLevel, pathTxt, sheetName)
     End If
 End Sub
 
@@ -2763,7 +2807,7 @@ End Sub
 ' log file and save path of this run:  <folder>\BOM_<product>_<date>_<time>.txt/.xlsx
 Private Sub StartRunFiles(ByVal rootPN As String)
     Dim folder As String, baseName As String, bad As Variant
-    Dim k As Long, f As Integer, e As Long, ch As String, probe As String
+    Dim k As Long, f As Integer, e As Long, ch As String
 
     mLogPath = ""
     mSavePath = ""
@@ -2795,15 +2839,16 @@ Private Sub StartRunFiles(ByVal rootPN As String)
     folder = SAVE_FOLDER
     If Len(folder) = 0 Then folder = "C:\Temp"
     Call EnsureFolder(folder)
+    ' the probe is the log file itself (the run appends to it anyway); Excel's
+    ' Save As also refuses a full path of more than 218 characters
     On Error Resume Next
     Err.Clear
-    probe = folder & "\~bom_write_probe.tmp"
     f = FreeFile
-    Open probe For Output As #f
+    Open folder & "\" & baseName & ".txt" For Append As #f
     e = Err.Number
     Close #f
-    Kill probe
     Err.Clear
+    If e = 0 And Len(folder & "\" & baseName & ".xlsx") > 218 Then e = 1
     If e <> 0 Then folder = CStr(Environ$("TEMP"))
     Err.Clear
     On Error GoTo 0

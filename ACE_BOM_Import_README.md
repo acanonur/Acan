@@ -103,6 +103,11 @@ A file dialog asks for the extraction file (it starts in the folder of the ACE
 workbook). If that file is already open in Excel it is reused and left open;
 otherwise it is opened read-only and closed again straight away.
 
+The assembly extractor writes its BOM into an Excel window of its own and saves
+it automatically as `C:\Temp\catia_bom\BOM_<product>_<date>_<time>.xlsx` (the
+log of the run is the `.txt` file with the same name). Pick that file in the
+dialog — it can be imported while the extractor's Excel window is still open.
+
 **A BOM that was split by level** (the assembly extractor asks for a split level
 at its start) has one sheet per component plus an `Index` sheet. When the file
 contains more than one BOM sheet, the import asks which one to bring in and

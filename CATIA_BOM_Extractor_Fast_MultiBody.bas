@@ -19,8 +19,12 @@ Option Explicit
 '                 hidden, CATIA only loads and measures the PARTS. The assembly
 '                 rows are added up from their parts afterwards. The sheet is
 '                 complete and visible in Excel before the first picture.
-'        pass 2 - all pictures: one show / capture / hide per row, every picture
-'                 goes into Excel straight away.
+'        pass 2 - all pictures: every part (and every sub-assembly that is a
+'                 CATProduct of its own) is opened ALONE in a window of its
+'                 own, pictured in the iso view and closed again - nothing in
+'                 the product has to be hidden for that. A part number is
+'                 pictured once for the whole run. Every picture goes into
+'                 Excel straight away.
 '   4. A component that fails is marked on the Index sheet and the run goes on
 '      with the next one.
 '
@@ -150,6 +154,12 @@ Private Const CAPTURE_PART_SHOTS As Boolean = True
 ' stalling the run. Set CAPTURE_ASSEMBLY_SHOTS = False for the fastest run.
 Private Const CAPTURE_ASSEMBLY_SHOTS As Boolean = True
 Private Const MAX_ASSY_LEAVES_FOR_SHOT As Long = 400
+' True = every part (and every sub-assembly that is a CATProduct of its own)
+' is pictured in a WINDOW OF ITS OWN, where it is alone: nothing has to be
+' hidden, so this also works on read-only Teamcenter data, and every part
+' number is pictured only once for the whole run. False = only the old way:
+' hide every part, show one, capture.
+Private Const PICTURES_IN_OWN_WINDOW As Boolean = True
 ' True = after the split level the macro asks whether pictures are wanted at
 ' all. A run without pictures is the quickest way to all numbers of a big product.
 Private Const ASK_PICTURES As Boolean = True
@@ -270,6 +280,9 @@ Private mXlSkipAt As Double      ' when the user last chose to skip a write to a
 Private mXlLastErr As Long       ' error of the last failed XlWriteBlock (0 = skipped / busy)
 Private mPromoted As Object      ' part numbers already promoted to design mode in this run
 Private mBodyValCache As Object  ' part number|body -> Array(mass, vol, area, L, W, H, material, density)
+Private mShotFiles As Object     ' "P|pn" / "A|pn" / "B|pn|body" -> picture file, reused by every row
+Private mShotSigs As Object      ' same keys -> fingerprint of that picture file
+Private mShotNo As Long          ' running number of the picture files
 Private mTempDir As String
 Private mSheetNo As Long
 Private mSheetNames As Object    ' every sheet name used in the workbook
@@ -429,6 +442,9 @@ Private Sub RunBOM()
     Set mPromoted = CreateObject("Scripting.Dictionary")
     Set mNotLoaded = CreateObject("Scripting.Dictionary")
     Set mBodyValCache = CreateObject("Scripting.Dictionary")
+    Set mShotFiles = CreateObject("Scripting.Dictionary")
+    Set mShotSigs = CreateObject("Scripting.Dictionary")
+    mShotNo = 0
     Set mSheetNames = CreateObject("Scripting.Dictionary")
     mSheetNames.CompareMode = vbTextCompare
     mBBoxDisabled = False
@@ -1106,7 +1122,7 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
             hasPart = False
             Set oPart = Nothing
             Set oPartDoc = Nothing
-            hasPart = TryGetLoadedPart(oPartProd, oPart, oPartDoc)
+            hasPart = LoadPartDocument(oPartProd, oPart, oPartDoc)
 
             ' multi-body parts: the body names are cached per part number, so a
             ' part that appears on several sheets gets its body rows on every one
@@ -1130,6 +1146,10 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
             Else
                 dMass = 0: dVol = 0: dArea = 0
                 Call ReadProductProps(oPartProd, dMass, dVol, dArea)
+                ' nothing through the instance: ask the CATPart itself
+                If dMass <= 0 And dVol <= 0 And dArea <= 0 And hasPart Then
+                    Call ReadProductProps(oPartDoc.Product, dMass, dVol, dArea)
+                End If
                 propsArray = Array(dMass, dVol, dArea)
                 If dMass > 0 Or dVol > 0 Or dArea > 0 Then mPropCache.Add strPartNum, propsArray
             End If
@@ -1165,6 +1185,7 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
                 If dims(0) < 0.1 Then
                     On Error Resume Next
                     Call GetInertiaDims(oPartProd.ReferenceProduct, dims)
+                    If dims(0) < 0.1 And hasPart Then Call GetInertiaDims(oPartDoc.Product, dims)
                     Err.Clear
                     On Error GoTo 0
                 End If
@@ -1173,6 +1194,11 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
             Call PutNumber(r, 9, dims(0))
             Call PutNumber(r, 10, dims(1))
             Call PutNumber(r, 11, dims(2))
+
+            ' a part without any value: the log says what CATIA has of it
+            If propsArray(0) <= 0 And propsArray(1) <= 0 And propsArray(2) <= 0 And dims(0) <= 0 Then
+                Call LogLine(mSheetName & "  NO VALUES " & strPartNum & ": " & PartStateText(oPartProd, hasPart))
+            End If
 
             ' --- the picture of this row is taken in pass 2 ---
             If mShotParts Then
@@ -1410,6 +1436,7 @@ End Function
 ' Decided WITHOUT loading anything - every ApplyWorkMode on such a node would
 ' load its whole content in one blocking call:
 '   its CATPart is in the session                         -> a part
+'   it has a shape representation                         -> a part
 '   its shape file is a CATProduct                        -> NOT a part
 '   it has a shape file of another kind (CATPart, cgr)    -> a part
 '   its reference is the root of a CATProduct of its own  -> NOT a part
@@ -1417,7 +1444,7 @@ End Function
 ' ==============================================================================
 Private Function IsUnloadedAssembly(oProd As Product) As Boolean
     Dim oDoc As Object, tn As String, pth As String
-    Dim docPn As String, myPn As String
+    Dim docPn As String, myPn As String, hasShape As Boolean
 
     IsUnloadedAssembly = False
     On Error Resume Next
@@ -1428,6 +1455,13 @@ Private Function IsUnloadedAssembly(oProd As Product) As Boolean
     tn = ""
     If Not oDoc Is Nothing Then tn = TypeName(oDoc)
     If tn = "PartDocument" Then Exit Function
+
+    ' a node with a shape of its own (also a CATProduct whose geometry is a
+    ' CATPart "shape representation") is a part
+    hasShape = False
+    hasShape = oProd.HasAMasterShapeRepresentation
+    If Err.Number = 0 And hasShape Then Exit Function
+    Err.Clear
 
     pth = ""
     pth = LCase$(CStr(oProd.GetMasterShapeRepresentationPathName))
@@ -1462,19 +1496,29 @@ End Sub
 
 ' ==============================================================================
 ' PASS 2 - ALL PICTURES OF ONE SHEET (after all its numbers are written)
-' 1. scene: every node of the sheet visible, every leaf hidden
-' 2. per picture: show -> reframe -> capture to a JPEG file -> hide, the file
-'    goes into Excel at once and is deleted (Excel repaint off meanwhile)
+'   1. the component as it is - the picture of its own row
+'   2. every part, and every sub-assembly that is a CATProduct of its own, in
+'      a WINDOW OF ITS OWN: it is alone there, nothing has to be hidden. A part
+'      number is pictured once for the whole run, every further row reuses it.
+'   3. the rest (a part CATIA has only as cgr, an assembly inside another file)
+'      the old way: hide every part, show one, capture. If hiding does not
+'      change the view in this window, those rows get "No Preview" instead of
+'      a picture of the whole component.
+' Every picture goes into Excel straight away.
 ' ==============================================================================
 Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
-    Dim j As Long, rowNo As Long
-    Dim kind As String, key As String, bodyName As String
-    Dim picPath As String, what As String
+    Dim j As Long, i As Long, rowNo As Long
+    Dim kind As String, key As String, bodyName As String, pn As String
+    Dim picPath As String, what As String, shotKey As String
+    Dim fullPath As String, basePath As String
+    Dim fullSig As String, baseSig As String, sig As String
     Dim oProd As Product, colNode As Collection
-    Dim oPart As Part, oPartDoc As PartDocument, partSel As Selection
-    Dim oBody As Body, bodyNames As Variant
+    Dim oPart As Part, oPartDoc As PartDocument
+    Dim oDoc As Object, homeWin As Object, homeDoc As Document
+    Dim bodyNames As Variant
     Dim colWasShown As Collection, colWasHidden As Collection
-    Dim t As Double, hasFile As Boolean
+    Dim colFb As Collection
+    Dim t As Double, sceneOK As Boolean
 
     If mJobRow.Count = 0 Then Exit Sub
 
@@ -1486,116 +1530,81 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
     End If
 
     Call LogLine(mSheetName & ": " & mJobRow.Count & " pictures")
+    On Error Resume Next
+    Set homeWin = Nothing
+    Set homeWin = CATIA.ActiveWindow
+    Set homeDoc = Nothing
+    Set homeDoc = CATIA.ActiveDocument
+    Err.Clear
+    On Error GoTo 0
+    Set colFb = New Collection
 
-    ' --- 1. the scene ---
-    If PRESERVE_VISIBILITY Then
-        Set colWasShown = New Collection
-        Set colWasHidden = New Collection
-        Call SplitByShowState(sel, mAllNodes, colWasShown, colWasHidden)
-    End If
-    ' every assembly visible (a hidden one hides its whole subtree), every part
-    ' hidden - showing the parts first only to hide them again is wasted work
-    Call SetShowCollection(sel, mAssyNodes, 0)
-    Call SetShowCollection(sel, mLeaves, 1)
-    Call Settle(100)
+    ' --- 1. the component as it is ---
+    fullPath = mTempDir & "\s" & mSheetNo & "_full.jpg"
+    fullSig = ""
+    If CaptureViewToFile(oViewer, fullPath) Then fullSig = FileSignature(fullPath)
 
-    ' (Excel keeps repainting here: one repaint per picture costs nothing next to
-    '  a capture, and a run that is stopped or killed must not leave it frozen)
-
-    ' --- 2. per picture: capture into a file, put it into Excel, delete it ---
-    '        (so there is only ever one picture file on disk)
+    ' --- 2. windows of their own ---
     For j = 1 To mJobRow.Count
         Call CheckExcel                       ' no hour of pictures into a closed Excel
         rowNo = mJobRow(j)
         kind = mJobKind(j)
         key = mJobKey(j)
         bodyName = mJobBody(j)
-        picPath = mTempDir & "\s" & mSheetNo & "_r" & rowNo & ".jpg"
-
-        what = kind
+        pn = ""
         If Len(key) > 0 Then
-            If mPartNum.Exists(key) Then what = kind & " " & mPartNum(key)
+            If mPartNum.Exists(key) Then pn = mPartNum(key)
         End If
+        what = kind
+        If Len(pn) > 0 Then what = kind & " " & pn
         If Len(bodyName) > 0 Then what = what & " / " & bodyName
         Call SetStatus("BOM " & mSheetName & ": picture " & j & " of " & mJobRow.Count & " - " & what)
         Call LogLine(mSheetName & "  picture " & j & "/" & mJobRow.Count & "  " & what)
         t = Timer
-
-        ' a skipped job must never pick up an old file
-        On Error Resume Next
-        If mFso.FileExists(picPath) Then mFso.DeleteFile picPath, True
-        Err.Clear
-        On Error GoTo 0
+        picPath = ""
 
         Select Case kind
+            Case "UNIT"
+                If Len(fullSig) > 0 Then picPath = fullPath
 
-            Case "UNIT"                     ' the whole component of the sheet
-                If mLeaves.Count > 0 And mLeaves.Count <= MAX_ASSY_LEAVES_FOR_SHOT * 5 Then
-                    Call SetShowCollection(sel, mLeaves, 0)
-                    Call Settle(ASSY_SETTLE_MS)
-                    Call CaptureViewToFile(oViewer, picPath)
-                    Call SetShowCollection(sel, mLeaves, 1)
-                End If
-
-            Case "ASSY"                     ' a sub-assembly: all leaves below it
-                Set colNode = Nothing
-                If mNodeLeaves.Exists(key) Then Set colNode = mNodeLeaves(key)
-                If Not colNode Is Nothing Then
-                    If colNode.Count > 0 And colNode.Count <= MAX_ASSY_LEAVES_FOR_SHOT Then
-                        Call SetShowCollection(sel, colNode, 0)
-                        Call Settle(ASSY_SETTLE_MS)
-                        Call CaptureViewToFile(oViewer, picPath)
-                        Call SetShowCollection(sel, colNode, 1)
+            Case "PART"
+                shotKey = "P|" & pn
+                picPath = CachedShot(shotKey)
+                If Len(picPath) = 0 And PICTURES_IN_OWN_WINDOW Then
+                    Set oProd = mRef(key)
+                    If TryGetLoadedPart(oProd, oPart, oPartDoc) Then
+                        picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, Nothing, Empty, "", "")
                     End If
                 End If
 
-            Case "PART"                     ' one part
-                Set oProd = mRef(key)
-                Call SetShowSingle(sel, oProd, 0)
-                Call Settle(PART_SETTLE_MS)
-                Call CaptureViewToFile(oViewer, picPath)
-                Call SetShowSingle(sel, oProd, 1)
+            Case "BODY"
+                shotKey = "B|" & pn & "|" & bodyName
+                picPath = CachedShot(shotKey)
+                If Len(picPath) = 0 And mBodies.Exists(pn) Then
+                    Set oProd = mRef(key)
+                    If TryGetLoadedPart(oProd, oPart, oPartDoc) Then
+                        bodyNames = mBodies(pn)
+                        picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, oPart, bodyNames, _
+                                                  bodyName, "P|" & pn)
+                    End If
+                End If
 
-            Case "BODY"                     ' one body of a multi-body part
-                Set oProd = mRef(key)
-                Set oPart = Nothing
-                Set oPartDoc = Nothing
-                If TryGetLoadedPart(oProd, oPart, oPartDoc) Then
-                    Set oBody = GetBodyByName(oPart, bodyName)
-                    If Not oBody Is Nothing And mBodies.Exists(mPartNum(key)) Then
-                        bodyNames = mBodies(mPartNum(key))
-                        Set partSel = oPartDoc.Selection
-                        Call SetShowSingle(sel, oProd, 0)
-                        Call SetShowBodyList(oPart, partSel, bodyNames, 1)
-                        On Error Resume Next
-                        partSel.Clear
-                        partSel.Add oBody
-                        partSel.VisProperties.SetShow 0
-                        partSel.Clear
-                        Err.Clear
-                        On Error GoTo 0
-                        Call Settle(PART_SETTLE_MS)
-                        Call CaptureViewToFile(oViewer, picPath)
-                        Call SetShowBodyList(oPart, partSel, bodyNames, 0)
-                        Call SetShowSingle(sel, oProd, 1)
+            Case "ASSY"
+                shotKey = "A|" & pn
+                picPath = CachedShot(shotKey)
+                If Len(picPath) = 0 And PICTURES_IN_OWN_WINDOW And Not homeDoc Is Nothing Then
+                    Set oProd = mRef(key)
+                    Set oDoc = OwnDocumentOf(oProd, pn, homeDoc)
+                    If Not oDoc Is Nothing Then
+                        picPath = ShotInOwnWindow(oDoc, homeWin, shotKey, Nothing, Empty, "", "")
                     End If
                 End If
         End Select
 
-        ' --- into Excel straight away ---
-        hasFile = False
-        On Error Resume Next
-        hasFile = mFso.FileExists(picPath)
-        Err.Clear
-        On Error GoTo 0
-        If hasFile Then
-            If Not XlInsertPicture(xlSheet, rowNo, picPath) Then
-                Call XlPutCell(xlSheet, rowNo, 1, "No Preview")
-            End If
-            On Error Resume Next
-            mFso.DeleteFile picPath, True
-            Err.Clear
-            On Error GoTo 0
+        If Len(picPath) > 0 Then
+            If Not XlInsertPicture(xlSheet, rowNo, picPath) Then Call XlPutCell(xlSheet, rowNo, 1, "No Preview")
+        ElseIf kind = "PART" Or kind = "ASSY" Then
+            colFb.Add j                       ' tried below, by show / hide
         Else
             Call XlPutCell(xlSheet, rowNo, 1, "No Preview")
         End If
@@ -1607,15 +1616,233 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
         DoEvents
     Next j
 
-    ' --- back to normal ---
-    Call RestoreVisibility(sel, mLeaves, colWasShown, colWasHidden)
+    ' --- 3. the rest by show / hide ---
+    If colFb.Count > 0 Then
+        Call LogLine(mSheetName & ": " & colFb.Count & " pictures by show / hide")
+        If PRESERVE_VISIBILITY Then
+            Set colWasShown = New Collection
+            Set colWasHidden = New Collection
+            Call SplitByShowState(sel, mAllNodes, colWasShown, colWasHidden)
+        End If
+        ' every assembly visible (a hidden one hides its whole subtree), every
+        ' part hidden
+        Call SetShowCollection(sel, mAssyNodes, 0)
+        Call SetShowCollection(sel, mLeaves, 1)
+        Call Settle(100)
+
+        ' with every part hidden the view must differ from the whole component -
+        ' if it does not, hiding has no effect in this window and every picture
+        ' would show the whole component
+        sceneOK = True
+        baseSig = ""
+        basePath = mTempDir & "\s" & mSheetNo & "_base.jpg"
+        If CaptureViewToFile(oViewer, basePath) Then baseSig = FileSignature(basePath)
+        If Len(fullSig) > 0 And baseSig = fullSig Then
+            sceneOK = False
+            Call LogLine(mSheetName & ": hiding the parts does not change the view - " & _
+                         colFb.Count & " pictures left out (No Preview)")
+        End If
+
+        For i = 1 To colFb.Count
+            Call CheckExcel
+            j = colFb(i)
+            rowNo = mJobRow(j)
+            kind = mJobKind(j)
+            key = mJobKey(j)
+            pn = ""
+            If mPartNum.Exists(key) Then pn = mPartNum(key)
+            picPath = ""
+            t = Timer
+
+            If sceneOK Then
+                Call SetStatus("BOM " & mSheetName & ": picture (show / hide) " & i & " of " & colFb.Count)
+                Call LogLine(mSheetName & "  picture (show / hide) " & i & "/" & colFb.Count & "  " & kind & " " & pn)
+                mShotNo = mShotNo + 1
+                picPath = mTempDir & "\shot" & mShotNo & ".jpg"
+                If kind = "ASSY" Then
+                    Set colNode = Nothing
+                    If mNodeLeaves.Exists(key) Then Set colNode = mNodeLeaves(key)
+                    If Not colNode Is Nothing Then
+                        If colNode.Count > 0 And colNode.Count <= MAX_ASSY_LEAVES_FOR_SHOT Then
+                            Call SetShowCollection(sel, colNode, 0)
+                            Call Settle(ASSY_SETTLE_MS)
+                            Call CaptureViewToFile(oViewer, picPath)
+                            Call SetShowCollection(sel, colNode, 1)
+                        End If
+                    End If
+                Else
+                    Set oProd = mRef(key)
+                    Call SetShowSingle(sel, oProd, 0)
+                    Call Settle(PART_SETTLE_MS)
+                    Call CaptureViewToFile(oViewer, picPath)
+                    Call SetShowSingle(sel, oProd, 1)
+                End If
+
+                If mFso.FileExists(picPath) Then
+                    ' nothing or everything visible: no picture of THIS row
+                    sig = FileSignature(picPath)
+                    If sig = baseSig Or sig = fullSig Then
+                        On Error Resume Next
+                        mFso.DeleteFile picPath, True
+                        Err.Clear
+                        On Error GoTo 0
+                        picPath = ""
+                    Else
+                        If kind = "ASSY" Then shotKey = "A|" & pn Else shotKey = "P|" & pn
+                        If Not mShotFiles.Exists(shotKey) Then
+                            mShotFiles.Add shotKey, picPath
+                            mShotSigs.Add shotKey, sig
+                        End If
+                    End If
+                Else
+                    picPath = ""
+                End If
+            End If
+
+            If Len(picPath) > 0 Then
+                If Not XlInsertPicture(xlSheet, rowNo, picPath) Then Call XlPutCell(xlSheet, rowNo, 1, "No Preview")
+            Else
+                Call XlPutCell(xlSheet, rowNo, 1, "No Preview")
+            End If
+            If Elapsed(t) >= SLOW_STEP_SECONDS Then
+                Call NoteSlow(Elapsed(t), mSheetName & "  picture of row " & rowNo & "  " & kind & " " & pn)
+            End If
+            Call SaveWorkbook(False)
+            DoEvents
+        Next i
+
+        ' --- back to normal ---
+        Call RestoreVisibility(sel, mLeaves, colWasShown, colWasHidden)
+    End If
 
     On Error Resume Next
-    mXlApp.ScreenUpdating = True
+    If mFso.FileExists(fullPath) Then mFso.DeleteFile fullPath, True
+    If Len(basePath) > 0 Then
+        If mFso.FileExists(basePath) Then mFso.DeleteFile basePath, True
+    End If
     CATIA.StatusBar = ""
     Err.Clear
     On Error GoTo 0
 End Sub
+
+
+' ==============================================================================
+' HELPER: ONE PICTURE IN A WINDOW OF ITS OWN
+' The document (a CATPart, or a sub-assembly's CATProduct) is opened in a new
+' window - it is alone there, so nothing in the product has to be hidden.
+' For a body picture the other bodies of the part are hidden in that window.
+' refKey: the picture a body picture must differ from (the whole part).
+' Returns the picture file, or "" when there is none.
+' ==============================================================================
+Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKey As String, _
+                                 oPart As Part, bodyNames As Variant, ByVal bodyName As String, _
+                                 ByVal refKey As String) As String
+    Dim w As Object, v As Viewer, partSel As Selection, oBody As Body
+    Dim picPath As String, sig As String, ok As Boolean, isolated As Boolean
+
+    ShotInOwnWindow = ""
+    mShotNo = mShotNo + 1
+    picPath = mTempDir & "\shot" & mShotNo & ".jpg"
+
+    On Error Resume Next
+    Set w = Nothing
+    Set w = oDoc.NewWindow
+    If w Is Nothing Then
+        Err.Clear
+        Exit Function
+    End If
+    w.Activate
+    Set v = Nothing
+    Set v = w.ActiveViewer
+    w.Layout = catWindowGeomOnly             ' no specification tree in the picture
+    Err.Clear
+
+    If Len(bodyName) > 0 And Not oPart Is Nothing Then
+        Set partSel = oDoc.Selection
+        Call SetShowBodyList(oPart, partSel, bodyNames, 1)
+        Set oBody = GetBodyByName(oPart, bodyName)
+        partSel.Clear
+        partSel.Add oBody
+        partSel.VisProperties.SetShow 0
+        partSel.Clear
+        isolated = True
+        Err.Clear
+    End If
+
+    If Not v Is Nothing Then
+        If SET_ISO_VIEW Then Call SetIsoViewpoint(v)
+        Call Settle(ASSY_SETTLE_MS)
+        ok = CaptureViewToFile(v, picPath)
+    End If
+
+    If isolated Then Call SetShowBodyList(oPart, partSel, bodyNames, 0)
+    w.Close
+    Err.Clear
+    If Not homeWin Is Nothing Then homeWin.Activate
+    Err.Clear
+    On Error GoTo 0
+    If Not ok Then Exit Function
+
+    sig = FileSignature(picPath)
+    ' a body picture equal to the picture of the whole part: hiding the other
+    ' bodies had no effect - no picture rather than a wrong one
+    If Len(refKey) > 0 Then
+        If mShotSigs.Exists(refKey) Then
+            If mShotSigs(refKey) = sig Then
+                On Error Resume Next
+                mFso.DeleteFile picPath, True
+                Err.Clear
+                On Error GoTo 0
+                Exit Function
+            End If
+        End If
+    End If
+
+    If Not mShotFiles.Exists(shotKey) Then
+        mShotFiles.Add shotKey, picPath
+        mShotSigs.Add shotKey, sig
+    End If
+    ShotInOwnWindow = picPath
+End Function
+
+' the picture file of a part / body / assembly that was already taken in this run
+Private Function CachedShot(ByVal shotKey As String) As String
+    CachedShot = ""
+    If mShotFiles Is Nothing Then Exit Function
+    If Not mShotFiles.Exists(shotKey) Then Exit Function
+    If mFso.FileExists(CStr(mShotFiles(shotKey))) Then CachedShot = CStr(mShotFiles(shotKey))
+End Function
+
+' a fingerprint of a picture file: two captures of an unchanged view are the
+' same file, byte for byte
+Private Function FileSignature(ByVal path As String) As String
+    Dim f As Integer, n As Long, i As Long
+    Dim b() As Byte, h1 As Double, h2 As Double
+
+    FileSignature = ""
+    On Error Resume Next
+    f = FreeFile
+    Err.Clear
+    Open path For Binary Access Read As #f
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    n = LOF(f)
+    If n > 0 Then
+        ReDim b(0 To n - 1)
+        Get #f, 1, b
+        For i = 0 To n - 1
+            h1 = h1 * 31# + b(i)
+            h1 = h1 - Int(h1 / 2147483647#) * 2147483647#
+            h2 = h2 * 37# + b(i)
+            h2 = h2 - Int(h2 / 2147483629#) * 2147483629#
+        Next i
+    End If
+    Close #f
+    Err.Clear
+    FileSignature = n & ":" & h1 & ":" & h2
+End Function
 
 
 ' ==============================================================================
@@ -3080,25 +3307,51 @@ End Sub
 
 ' ==============================================================================
 ' HELPER: BATCHED SHOW / HIDE FOR A COLLECTION OF PRODUCTS
-' One Selection.Add per item but only ONE SetShow call (= one visual update)
+' One Selection.Add per item but only ONE SetShow call (= one visual update).
+' CATIA refuses the whole SetShow when ONE element cannot be shown or hidden
+' (e.g. a component that is not loaded) - then the list is done again in
+' blocks of 50, and a refused block one by one.
 ' In CATIA: SetShow(0) = SHOW, SetShow(1) = HIDE
 ' ==============================================================================
 Sub SetShowCollection(sel As Selection, colItems As Collection, ByVal showMode As Integer)
-    On Error Resume Next
-    Dim i As Long
+    Dim n As Long, i As Long, i2 As Long, k As Long
 
     If colItems Is Nothing Then Exit Sub
-    If colItems.Count = 0 Then Exit Sub
+    n = colItems.Count
+    If n = 0 Then Exit Sub
+    If SetShowRange(sel, colItems, 1, n, showMode) Then Exit Sub
 
+    For i = 1 To n Step 50
+        i2 = i + 49
+        If i2 > n Then i2 = n
+        If Not SetShowRange(sel, colItems, i, i2, showMode) Then
+            For k = i To i2
+                Call SetShowRange(sel, colItems, k, k, showMode)
+            Next k
+        End If
+        DoEvents
+    Next i
+End Sub
+
+' items i1..i2 of the list in one selection and one SetShow; False = refused
+Private Function SetShowRange(sel As Selection, colItems As Collection, ByVal i1 As Long, _
+                              ByVal i2 As Long, ByVal showMode As Integer) As Boolean
+    Dim i As Long, ok As Boolean
+
+    On Error Resume Next
     sel.Clear
-    For i = 1 To colItems.Count
+    For i = i1 To i2
         sel.Add colItems.Item(i)
         If i Mod 200 = 0 Then DoEvents     ' a long list must not freeze CATIA
     Next i
+    Err.Clear
     sel.VisProperties.SetShow showMode
+    ok = (Err.Number = 0)
+    Err.Clear
     sel.Clear
     Err.Clear
-End Sub
+    SetShowRange = ok
+End Function
 
 ' ==============================================================================
 ' HELPER: PUT THE VISIBILITY BACK
@@ -3593,6 +3846,58 @@ Private Function TryGetLoadedPart(oProd As Product, ByRef oPart As Part, ByRef o
         If Not oPart Is Nothing Then TryGetLoadedPart = True
     End If
     On Error GoTo 0
+End Function
+
+' ==============================================================================
+' HELPER: THE CATPART OF A PART ROW, ALSO WHEN ApplyWorkMode DID NOT BRING IT
+' 1. the reference is a loaded CATPart (the usual case after design mode)
+' 2. the node's shape representation - for a CATProduct whose geometry is a
+'    CATPart, or when design mode did not load it; this loads that ONE file
+' ==============================================================================
+Private Function LoadPartDocument(oProd As Product, ByRef oPart As Part, _
+                                  ByRef oPartDoc As PartDocument) As Boolean
+    Dim d As Object, ok As Boolean
+
+    ok = TryGetLoadedPart(oProd, oPart, oPartDoc)
+    If Not ok Then
+        On Error Resume Next
+        Set d = Nothing
+        Set d = oProd.ReferenceProduct.GetMasterShapeRepresentation(True)
+        If d Is Nothing Then
+            Err.Clear
+            Set d = oProd.GetMasterShapeRepresentation(True)
+        End If
+        Err.Clear
+        If Not d Is Nothing Then
+            If TypeName(d) = "PartDocument" Then
+                Set oPartDoc = d
+                Set oPart = oPartDoc.Part
+                ok = Not (oPart Is Nothing)
+            End If
+        End If
+        Err.Clear
+        On Error GoTo 0
+    End If
+    LoadPartDocument = ok
+End Function
+
+' what CATIA has of a part that gave no values - for the log
+Private Function PartStateText(oProd As Product, ByVal hasPart As Boolean) As String
+    Dim tn As String, pth As String, hasShape As String
+
+    On Error Resume Next
+    tn = "?"
+    tn = TypeName(oProd.ReferenceProduct.Parent)
+    Err.Clear
+    hasShape = "?"
+    hasShape = CStr(oProd.HasAMasterShapeRepresentation)
+    Err.Clear
+    pth = "?"
+    pth = CStr(oProd.GetMasterShapeRepresentationPathName)
+    Err.Clear
+    On Error GoTo 0
+    PartStateText = "reference document = " & tn & ", shape = " & hasShape & _
+                    ", shape file = " & pth & ", CATPart loaded = " & CStr(hasPart)
 End Function
 
 ' ==============================================================================

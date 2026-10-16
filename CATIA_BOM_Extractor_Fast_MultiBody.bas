@@ -1,37 +1,80 @@
 Option Explicit
 
 ' ==============================================================================
-' MACRO: MASTER BOM v3 (FAST SCREENSHOTS + MULTI-PARTBODY SUPPORT)
+' MACRO: MASTER BOM v5 (SPLIT BY LEVEL + NUMBERS FIRST, PICTURES LAST,
+'                       NO LONG FREEZES, OWN EXCEL, AUTO-SAVE AND LOG)
 '
-' WHY THIS VERSION IS FAST AND QUIET:
-'   - NO temporary geometry is created in the CATParts any more (MEASURE_MODE).
-'     Creating a bounding box, running the update engine on it and deleting it
-'     again is what made CATIA show an error panel for EVERY component - VBA
-'     cannot suppress those panels, they come from CATIA itself. The dimensions
-'     now come from the inertia, which only reads.
+' HOW A RUN GOES:
+'   1. You are asked at which level the BOM is split. The question shows how
+'      many components and sub-assemblies every level of the product has.
+'        0 = no split: one sheet for the whole product
+'        n = one worksheet per sub-assembly on level n. Each one is opened in a
+'            window of its own, so CATIA only has to draw that sub-assembly while
+'            it is measured and pictured. Parts that are not inside any of them
+'            get one extra sheet, and the "Index" sheet links to every sheet and
+'            shows its level, quantity, path, number of rows, status and time.
+'   2. You are asked whether pictures are wanted. "No" is the fastest run.
+'   3. Every sheet is filled in TWO PASSES:
+'        pass 1 - all numbers: the display is frozen and nothing is shown or
+'                 hidden, CATIA only loads and measures the PARTS. The assembly
+'                 rows are added up from their parts afterwards. The sheet is
+'                 complete and visible in Excel before the first picture.
+'        pass 2 - all pictures: every part (and every sub-assembly that is a
+'                 CATProduct of its own) is opened ALONE in a window of its
+'                 own, pictured in the iso view and closed again - nothing in
+'                 the product has to be hidden for that. A part number is
+'                 pictured once for the whole run. Every picture goes into
+'                 Excel straight away.
+'   4. A component that fails is marked on the Index sheet and the run goes on
+'      with the next one.
+'
+' WHERE THE RESULT IS:
+'   - a NEW Excel window of its own (your own Excel stays free while it runs)
+'   - saved automatically as  C:\Temp\catia_bom\BOM_<product>_<date>_<time>.xlsx
+'     during the run and at the end - also when the run stops with an error
+'   - the log of the run next to it (.txt, same name): one line per row and per
+'     picture, so if CATIA ever hangs, the LAST line says on what. The "Log" sheet
+'     lists every step that took longer than SLOW_STEP_SECONDS.
+'
+' WHY THIS VERSION DOES NOT FREEZE FOR HOURS:
+'   - Product.ApplyWorkMode is RECURSIVE. The old version called it on whole
+'     sub-assemblies (the component of a sheet, every assembly row), which loads
+'     every CATPart below in ONE call: CATIA "not responding" for as long as that
+'     takes. Now only PARTS are promoted, one per row, with the message queue
+'     pumped in between.
+'   - Mass / volume / area of an assembly row are the SUM of its parts. The old
+'     version let CATIA integrate the whole subtree again (Analyze.Volume and
+'     WetArea over hundreds of parts) - in ONE call per assembly row.
+'   - Nothing is loaded while the levels are counted, and no file alert can wait
+'     hidden behind the windows (DisplayFileAlerts is off from the start).
+'   - A sub-assembly that is NOT LOADED in CATIA is not loaded by the macro
+'     either (that would again be one huge blocking call): it gets a row marked
+'     "NOT LOADED" and the final message lists it - load it and run again if
+'     its content is needed.
+'   - The tree walks pump the message queue every few nodes.
+'   - Error 50290 means "Excel is busy" (a cell in edit mode, an open dialog).
+'     The macro writes into an Excel of its own, waits while it is busy and
+'     never ends the run because of one write that failed.
+'
+' WHY IT IS FAST AND QUIET:
+'   - NO temporary geometry is created in the CATParts (MEASURE_MODE). The
+'     dimensions come from the inertia, which only reads.
 '   - The specification tree is switched off through the WINDOW LAYOUT, which
-'     works in every language. The old StartCommand "Specification Tree Display"
-'     only works on an English CATIA and silently did nothing anywhere else,
-'     which is why the tree was still in every picture.
-'   - Every wait pumps the message queue (Settle) instead of blocking the thread
-'     with the kernel32 Sleep, so CATIA stays responsive and actually redraws
-'     the view before it is captured.
-'   - Selection.Add is used thousands of times, so HSOSynchronized is switched
-'     off for the run - without that every single Add repaints the tree.
-'   - Design mode is applied ONCE to the root, not once per node.
-'   - Material and dimensions are measured ONCE per part number and cached.
-'   - All leaf parts are hidden ONCE with a single batched SetShow call; per
-'     part only the target is shown and hidden again.
-'   - Excel ScreenUpdating is off while rows are written.
+'     works in every language and immediately.
+'   - Every wait pumps the message queue (Settle) instead of blocking the thread.
+'   - HSOSynchronized is off for the run, so Selection.Add does not repaint the
+'     tree every time.
+'   - The rows of a sheet are collected in memory and go into Excel in a few
+'     big blocks instead of one call per cell.
+'   - Mass, material, dimensions and body names are read ONCE per part number
+'     for the whole run, over all sheets.
 '
-' IF IT IS TOO SLOW, the settings block below has the switches - each of them
-' trades content for speed:
+' IF IT IS STILL TOO SLOW: split at a deeper level first, or answer "No" to
+' the pictures. The settings block below has more switches:
 '   CAPTURE_ASSEMBLY_SHOTS = False  no pictures on the assembly rows
-'   CAPTURE_PART_SHOTS = False      no pictures at all - the biggest single win
-'   ASSEMBLY_VOLUME_AREA = False    assembly rows keep the mass, lose volume/area
-'   ASSEMBLY_METRICS = False        assembly rows have no mass/volume/area
+'   CAPTURE_PART_SHOTS = False      no pictures at all
+'   ASSY_DIMS_MAX_PARTS = 0         no length/width/height on assembly rows
 '   DETECT_MULTIBODY = False        no extra row per body of a multi-body part
-'   MEASURE_MODE = "BOX"           (the opposite: exact box, but slow and noisy)
 '
 ' TWO VERSIONS - PICK THE ONE YOU NEED (Tools > Macro > Macros):
 '
@@ -56,7 +99,7 @@ Option Explicit
 '   - Column O "Type": Assembly / Part / Body
 '   - Columns A..M unchanged, so both sheets import into the ACE cost model
 '
-' NEW FEATURE (multi-body CATPart):
+' MULTI-BODY CATPart:
 '   - If a leaf CATPart contains MORE THAN ONE solid Body (PartBody), each
 '     body is treated as an extra sub-part of the product tree:
 '       * one extra row per body, Level = part level + 1
@@ -106,13 +149,22 @@ Private Const MEASURE_MODE As String = "SAFE"
 
 ' --- SCREENSHOTS ------------------------------------------------------------
 Private Const CAPTURE_PART_SHOTS As Boolean = True
-' Assembly thumbnails have to show and hide every leaf below the node. That is
-' the most expensive single thing in the run, but without it the assembly rows
-' have no picture at all - so it stays ON, with a cap: a node with more leaves
-' than the limit is listed without a picture instead of stalling the run.
-' Set CAPTURE_ASSEMBLY_SHOTS = False if you want the run as fast as possible.
+' Assembly thumbnails have to show and hide every leaf below the node, so a
+' node with more leaves than the limit is listed without a picture instead of
+' stalling the run. Set CAPTURE_ASSEMBLY_SHOTS = False for the fastest run.
 Private Const CAPTURE_ASSEMBLY_SHOTS As Boolean = True
 Private Const MAX_ASSY_LEAVES_FOR_SHOT As Long = 400
+' True = every part (and every sub-assembly that is a CATProduct of its own)
+' is pictured in a WINDOW OF ITS OWN, where it is alone: nothing has to be
+' hidden, so this also works on read-only Teamcenter data, and every part
+' number is pictured only once for the whole run. False = parts and
+' sub-assemblies only the old way: hide every part, show one, capture.
+' (The pictures of the single bodies of a multi-body part are always taken in
+' the part's own window.)
+Private Const PICTURES_IN_OWN_WINDOW As Boolean = True
+' True = after the split level the macro asks whether pictures are wanted at
+' all. A run without pictures is the quickest way to all numbers of a big product.
+Private Const ASK_PICTURES As Boolean = True
 ' One fixed isometric viewpoint for all pictures instead of whatever camera the
 ' session happened to be left in.
 Private Const SET_ISO_VIEW As Boolean = True
@@ -129,19 +181,17 @@ Private Const ASSY_SETTLE_MS As Long = 120
 
 ' --- SPEED ------------------------------------------------------------------
 ' Multi-body detection has to load every leaf CATPart. Switch it off when you do
-' not need one row per body: on a big tree that alone saves most of the loading.
+' not need one row per body.
 Private Const DETECT_MULTIBODY As Boolean = True
-' Product.ApplyWorkMode is RECURSIVE: one call on the root promotes every
-' CATPart of the assembly in a single blocking COM call - that is the long
-' "CATIA not responding" phase before the first row appears. Parts are promoted
-' one at a time in the row loop instead, which spreads the same work over a
-' responsive UI. Set this to True only if your parts must all be loaded first.
+' Product.ApplyWorkMode is RECURSIVE: one call on the root loads every CATPart
+' of the product in a single blocking COM call - hours of "CATIA not responding"
+' on a big product. Parts are promoted one at a time in the row loop instead.
+' Set this to True only if your parts must all be loaded first.
 Private Const FORCE_DESIGN_MODE As Boolean = False
-' Sub-assembly rows are promoted too, because their mass/volume/area and their
-' inertia box are 0 otherwise. ApplyWorkMode is recursive, so the first level 1
-' assembly row loads its whole branch in one blocking call - set this to False
-' if you would rather have empty assembly rows than that wait.
-Private Const PROMOTE_ASSEMBLY_ROWS As Boolean = True
+' A sub-assembly that is NOT LOADED (unloaded in the tree) looks like an empty
+' node. True = load its structure while the levels are counted. That can load a
+' lot from Teamcenter before the first question even appears, so it is off.
+Private Const EXPAND_UNLOADED As Boolean = False
 
 ' A component in NoShow hides its WHOLE subtree in the 3D view, whatever the
 ' children say. So a leaf below a sub-assembly that the user had hidden would be
@@ -152,29 +202,113 @@ Private Const PROMOTE_ASSEMBLY_ROWS As Boolean = True
 ' selection round trip per node before the first row.
 Private Const PRESERVE_VISIBILITY As Boolean = False
 
-' Mass / volume / area of a sub-assembly row. Reading them means a recursive
-' evaluation over the whole subtree, so they are the expensive part of the
-' assembly structure version - but without them the assembly rows are empty,
-' so they stay ON.
+' --- ASSEMBLY ROWS ----------------------------------------------------------
+' Mass / volume / area of a sub-assembly row are the SUM of the part rows below
+' it (quantities included). Nothing is loaded or integrated for that, so it is
+' cheap. Parts without values count as 0.
 Private Const ASSEMBLY_METRICS As Boolean = True
-' ... of the three, Volume and WetArea are the costly ones (a full B-Rep
-' integration over the subtree). Set this to False to keep only the mass on
-' assembly rows if the run is too slow.
-Private Const ASSEMBLY_VOLUME_AREA As Boolean = True
+' Length / width / height of an assembly row come from CATIA's inertia of the
+' whole assembly, which IS computed over everything below it. Only assemblies
+' with at most this many part instances get them; bigger ones show "N/A".
+' 0 = never.
+Private Const ASSY_DIMS_MAX_PARTS As Long = 200
 
-' --- caches (filled during the run) ------------------------------------------
+' --- SPLITTING THE BOM BY LEVEL ----------------------------------------------
+' At the start the macro asks at which level the BOM is split, and shows how
+' many components and sub-assemblies every level has:
+'   0 = no split - one sheet for the whole product
+'   n = one worksheet per sub-assembly on level n. Each of them is opened in a
+'       window of its own, so CATIA only has to draw that sub-assembly while it
+'       is measured and pictured. Parts that are not inside any of them get one
+'       extra sheet, and an "Index" sheet links to every component sheet.
+' A sub-assembly on level n that is used several times gets ONE sheet; its
+' quantities are per piece and the Index says how many pieces there are.
+Private Const ASK_SPLIT_LEVEL As Boolean = True
+' False = every component is done in the main window (no extra windows).
+' A component that is not the root of its own CATProduct file (e.g. a
+' "Product1" inserted inside another assembly) is always done there.
+Private Const OPEN_UNITS_IN_NEW_WINDOW As Boolean = True
+
+' --- EXCEL, SAVING AND LOG ---------------------------------------------------
+' True = the BOM goes into an Excel of its OWN (a separate Excel window). Your
+' own Excel stays free while the macro runs, and nothing you do there can make
+' a write fail. False = the Excel that is already open is used, as before.
+Private Const OWN_EXCEL_INSTANCE As Boolean = True
+' When the macro's Excel is busy anyway (somebody left a cell in edit mode or a
+' dialog open there), it waits this long before it skips that one write.
+Private Const EXCEL_WAIT_SECONDS As Long = 120
+' The workbook is saved here during the run (after a component sheet, at most
+' every SAVE_EVERY_SECONDS) and at the end - also when the run stops with an
+' error. "" = no automatic saving. The log of the run is written next to it.
+Private Const SAVE_FOLDER As String = "C:\Temp\catia_bom"
+Private Const SAVE_EVERY_SECONDS As Long = 300
+' Steps that take at least this long are listed on the "Log" sheet
+Private Const SLOW_STEP_SECONDS As Double = 5
+
+' --- caches (whole run, keyed by part number) --------------------------------
+' A part that appears on several sheets is read only once.
 Private mDimCache As Object      ' part number -> Array(L, W, H)
 Private mMatCache As Object      ' part number -> Array(material, density)
-Private mBodyCache As Object     ' part number -> Variant array of body names
+Private mBodyCache As Object     ' part number -> body names, or Empty for one body
 Private mPropCache As Object     ' part number -> Array(mass, volume, area)
-Private mAllNodes As Collection  ' every visited instance: assemblies AND leaves
+Private mAssyKids As Object      ' assembly part number -> Collection of Array(child part number, is assembly)
+Private mRollCache As Object     ' assembly part number -> Array(mass, volume, area, parts, parts without values)
 Private mBBoxDisabled As Boolean ' the temp geometry path failed once - stop it
+
+' --- the sheet being written (reset for every sheet) --------------------------
+Private mQty As Object, mRef As Object, mDesc As Object, mProps As Object
+Private mLevel As Object, mBodies As Object, mPartNum As Object, mFirst As Object
+Private mIsAssy As Object, mNodeLeaves As Object
+Private mLeaves As Collection    ' every leaf instance of the sheet
+Private mAllNodes As Collection  ' every instance of the sheet: assemblies AND leaves
+Private mAssyNodes As Collection ' only the assembly instances of the sheet
+Private mJobRow As Collection    ' pictures to take in pass 2: row ...
+Private mJobKind As Collection   ' ... "PART" / "ASSY" / "BODY" / "UNIT"
+Private mJobKey As Collection    ' ... row key
+Private mJobBody As Collection   ' ... body name for "BODY"
+Private mBuf() As Variant        ' the rows of the sheet: mBuf(column, sheet row - 1)
+Private mBufRows As Long         ' rows used in mBuf
+Private mFlushed As Boolean      ' mBuf is already in Excel
+Private mLostBlocks As Object    ' first buffer row of every block Excel did not take
+Private mBoldRows As Collection  ' sheet rows written in bold (assemblies)
+Private mAssyRows As Collection  ' Array(sheet row, part number, product) of every assembly row
+Private mSheetName As String     ' name of the sheet being written
+
+' --- the whole run -------------------------------------------------------------
+Private mXlApp As Object, mXlBook As Object, mFso As Object
+Private mOwnXl As Boolean        ' mXlApp was started by this run
+Private mXlLost As Boolean       ' Excel was closed or crashed - nothing can be written any more
+Private mXlSkipAt As Double      ' when the user last chose to skip a write to a busy Excel (-1 = never)
+Private mXlLastErr As Long       ' error of the last failed XlWriteBlock (0 = skipped / busy)
+Private mPromoted As Object      ' part numbers already promoted to design mode in this run
+Private mBodyValCache As Object  ' part number|body -> Array(mass, vol, area, L, W, H, material, density)
+Private mShotFiles As Object     ' "P|pn" / "A|pn" / "B|pn|body" -> picture file, reused by every row
+Private mShotSigs As Object      ' same keys -> fingerprint of that picture file
+Private mShotNo As Long          ' running number of the picture files
+Private mPartDocs As Object      ' part number -> the CATPart document pass 1 found for it
+Private mCompassToggled As Boolean ' the compass was switched off for the pictures
+Private mTempDir As String
+Private mSheetNo As Long
+Private mSheetNames As Object    ' every sheet name used in the workbook
+Private mShotParts As Boolean    ' pictures of the part (and body) rows in this run
+Private mShotAssy As Boolean     ' pictures of the assembly rows in this run
+Private mLogPath As String, mSavePath As String
+Private mSavedOnce As Boolean    ' the workbook has been saved at least once
+Private mSaveTried As Boolean    ' a save has been attempted (throttles retries of a failing save)
+Private mLastSave As Double      ' Timer of the last save attempt
+Private mLastSaveOK As Boolean   ' the last save attempt worked
+Private mLastSaveAt As Date      ' time of the last save that worked
+Private mIdxRedo As Collection   ' Index writes Excel could not take - repeated at the end
+Private mIdxFmtOK As Boolean     ' the text formats of the Index are applied
+Private mIdxEarly As Collection  ' Index rows written BEFORE those formats - written again after them
+Private mNotLoaded As Object     ' part numbers of sub-assemblies that are not loaded in CATIA
+Private mSlow As Collection      ' Array(seconds, step) of every slow step
+Private mPump As Long            ' node counter of the tree walks
 
 
 ' ==============================================================================
-' ENTRY POINT 1: PART LIST  (the classic BOM - same result as before)
-' One row per part number, Qty = instances in the whole product, no assembly
-' rows. Column N lists the first level branch(es) the part is used in.
+' ENTRY POINT 1: PART LIST  (the classic BOM)
+' One row per part number, Qty = instances, no assembly rows.
 ' ==============================================================================
 Sub GenerateMasterBOM()
     mIncludeSubassemblies = False
@@ -184,8 +318,7 @@ End Sub
 
 ' ==============================================================================
 ' ENTRY POINT 2: ASSEMBLY STRUCTURE
-' Sub-assemblies get their own row and every assembly lists its own content,
-' so a part can be located inside the tree. Longer list, same columns.
+' Sub-assemblies get their own row and every assembly lists its own content.
 ' ==============================================================================
 Sub GenerateAssemblyBOM()
     mIncludeSubassemblies = True
@@ -196,177 +329,1811 @@ End Sub
 
 ' ==============================================================================
 ' THE WORKER USED BY BOTH ENTRY POINTS
+'
+'   1. asks at which level the BOM is split (0 = one sheet, as before) and
+'      whether pictures are wanted
+'   2. split level 0:  one sheet for the whole product
+'      split level n:  one sheet per sub-assembly on level n, each worked in its
+'                      own CATIA window; parts above level n on an extra sheet;
+'                      an "Index" sheet with a link to every component sheet
+'   3. every sheet is filled in two passes: first ALL numbers (display frozen,
+'      no show/hide), then all pictures
 ' ==============================================================================
 Private Sub RunBOM()
 
-    ' --- 1. SETUP & VARIABLES ---
     Dim catDoc As Document
     Dim rootProd As Product
-    Dim sel As Selection
+    Dim rootSel As Selection
+    Dim rootWin As Object
+    Dim rootViewer As Viewer
+    Dim rootLayout As Long, rootLayoutSet As Boolean
+    Dim compassToggled As Boolean
 
-    ' Dictionaries (all keyed by the row key: first level + part number)
-    Dim dictQty As Object, dictRef As Object, dictDesc As Object, dictProps As Object
-    Dim dictLevel As Object, dictBodies As Object
-    Dim dictPartNum As Object, dictFirst As Object
-    Dim dictIsAssy As Object, dictNodeLeaves As Object
+    Dim splitLevel As Long, ans As Long
+    Dim rootPN As String, modeName As String
+    Dim xlSheet As Object, idxSheet As Object, firstSheet As Object
+    Dim startTime As Double, unitStart As Double
+    Dim nRows As Long, nAssy As Long, nParts As Long
+    Dim totRows As Long, totAssy As Long, totParts As Long
+    Dim nUnits As Long, nUnitsOK As Long
+    Dim statusTxt As String, unitOK As Boolean, failMsg As String
 
-    ' Every leaf instance in the tree (needed to hide them all in one shot)
-    Dim colLeaves As Collection
-    Dim colWasShown As Collection, colWasHidden As Collection
+    ' components on the split level, keyed by part number
+    Dim dUnitQty As Object, dUnitRef As Object, dUnitFirst As Object
+    Dim dUnitDesc As Object, dUnitPath As Object
+    Dim colUnitInst As Collection      ' every instance on the split level
+    Dim colAbove As Collection         ' every assembly instance above it
+    Dim colLooseInst As Collection     ' rows of the extra sheet: parts in no component
+                                       ' (+ the assemblies above, in the structure mode)
+    Dim colLooseLevel As Collection, colLooseFirst As Collection
+    Dim colLooseKey As Collection, colLooseIsAssy As Collection
+    Dim colLooseParts As Collection    ' only the PARTS of it - they are what gets hidden
 
-    ' Excel
-    Dim xlApp As Object, xlBook As Object, xlSheet As Object
+    ' components that cannot get their own window (they are defined inside
+    ' another CATProduct file) are done afterwards in the main window
+    Dim colFbKey As Collection, colFbSheet As Collection, colFbIdxRow As Collection
 
-    ' Loop Vars
-    Dim uniqueKey As Variant, r As Long, strPartNum As String
-    Dim oPartProd As Product
-    Dim propsArray As Variant
-    Dim isAssy As Boolean
-    Dim colNodeLeaves As Collection
-    Dim nAssyRows As Long, nPartRows As Long
-    Dim cacheArr As Variant
-    Dim solidNames() As String
-    Dim nSolid As Integer
-    Dim dMass As Double, dVol As Double, dArea As Double
+    Dim unitKey As Variant, idxRow As Long, i As Long
+    Dim unitInst As Product, unitRoot As Product
+    Dim unitDoc As Object, unitWin As Object
+    Dim unitViewer As Viewer, unitSel As Selection
+    Dim unitLayout As Long, unitLayoutSet As Boolean
+    Dim ownWindow As Boolean
+    Dim rootSceneSet As Boolean
+    Dim idxHdrOK As Boolean
 
-    ' Part data
-    Dim oPart As Part
-    Dim oPartDoc As PartDocument
-    Dim hasPart As Boolean
-    Dim dims(2) As Double
-    Dim strMatName As String, dDensity As Double
-
-    ' Body sub-rows
-    Dim bodyNames As Variant
-    Dim bi As Integer
-    Dim oBody As Body
-    Dim partSel As Selection
-    Dim bMass As Double, bVol As Double, bArea As Double
-    Dim bDens As Double, bDensInertia As Double
-    Dim bMat As String
-
-    ' Screenshot
-    Dim tempPicPath As String, fso As Object
-    Dim oViewer As Viewer
-
-    ' Timing
-    Dim startTime As Double
     startTime = Timer
 
-    ' Window handling: the spec tree is switched off through the layout, so the
-    ' handler has to know the previous layout to put it back
-    Dim oWin As Object
-    Dim savedLayout As Long
-    Dim viewToggled As Boolean, compassToggled As Boolean
+    ' nothing of an earlier run may be used by this one - not even by the
+    ' error handler (log file, workbook, save path)
+    Set mXlApp = Nothing
+    Set mXlBook = Nothing
+    mOwnXl = False
+    mXlLost = False
+    mXlSkipAt = -1
+    mLogPath = ""
+    mSavePath = ""
+    mSavedOnce = False
+    mSaveTried = False
+    mLastSaveOK = False
+    Set mIdxRedo = New Collection
+    mIdxFmtOK = False
+    Set mIdxEarly = New Collection
 
-    ' Any unexpected error must not leave the model completely hidden
     On Error GoTo Fail
 
-    ' --- 2. INITIALIZATION ---
+    ' --- 1. DOCUMENT ------------------------------------------------------------
     On Error Resume Next
     Set catDoc = CATIA.ActiveDocument
-    If Err.Number <> 0 Then MsgBox "No Document.", vbCritical: Exit Sub
+    If Err.Number <> 0 Or catDoc Is Nothing Then
+        On Error GoTo 0
+        MsgBox "No document open.", vbCritical
+        Exit Sub
+    End If
     On Error GoTo Fail
 
-    If InStr(catDoc.Name, ".CATProduct") = 0 Then MsgBox "Open Assembly.", vbExclamation: Exit Sub
+    If InStr(1, catDoc.Name, ".CATProduct", vbTextCompare) = 0 Then
+        MsgBox "Please open an assembly (CATProduct) first.", vbExclamation
+        Exit Sub
+    End If
 
     Set rootProd = catDoc.Product
-    Set sel = catDoc.Selection
+    Set rootSel = catDoc.Selection
+    Set rootWin = CATIA.ActiveWindow
 
-    ' Suppress CATIA alert dialogs during the run (restored at the end)
+    ' a file alert (missing / locked document) is a MODAL panel that can sit
+    ' hidden behind the windows and stop everything - none from here on
+    rootPN = ""
     On Error Resume Next
     CATIA.DisplayFileAlerts = False
+    rootPN = rootProd.PartNumber
+    Err.Clear
     On Error GoTo Fail
+    If Len(rootPN) = 0 Then rootPN = "product"
+    If mIncludeSubassemblies Then modeName = "Assembly structure" Else modeName = "Part list"
 
-    Set fso = CreateObject("Scripting.FileSystemObject")
-    tempPicPath = "C:\Temp\catia_bom_shot.jpg"
-    If Not fso.FolderExists("C:\Temp") Then fso.CreateFolder ("C:\Temp")
+    ' --- 2. LOG FILE, SAVE PATH, CACHES ------------------------------------------
+    Set mFso = CreateObject("Scripting.FileSystemObject")
+    Call StartRunFiles(rootPN)
+    Call LogLine("BOM run on " & catDoc.Name & "  (" & modeName & ")")
 
-    Set dictQty = CreateObject("Scripting.Dictionary")
-    Set dictRef = CreateObject("Scripting.Dictionary")
-    Set dictDesc = CreateObject("Scripting.Dictionary")
-    Set dictProps = CreateObject("Scripting.Dictionary")
-    Set dictLevel = CreateObject("Scripting.Dictionary")
-    Set dictBodies = CreateObject("Scripting.Dictionary")
-    Set dictPartNum = CreateObject("Scripting.Dictionary")
-    Set dictFirst = CreateObject("Scripting.Dictionary")
-    Set dictIsAssy = CreateObject("Scripting.Dictionary")
-    Set dictNodeLeaves = CreateObject("Scripting.Dictionary")
-    Set colLeaves = New Collection
-
-    ' caches: the same part number is measured once, however often it is listed
     Set mDimCache = CreateObject("Scripting.Dictionary")
     Set mMatCache = CreateObject("Scripting.Dictionary")
     Set mBodyCache = CreateObject("Scripting.Dictionary")
     Set mPropCache = CreateObject("Scripting.Dictionary")
-    Set mAllNodes = New Collection
+    Set mAssyKids = CreateObject("Scripting.Dictionary")
+    Set mRollCache = CreateObject("Scripting.Dictionary")
+    Set mPromoted = CreateObject("Scripting.Dictionary")
+    Set mNotLoaded = CreateObject("Scripting.Dictionary")
+    Set mBodyValCache = CreateObject("Scripting.Dictionary")
+    Set mShotFiles = CreateObject("Scripting.Dictionary")
+    Set mShotSigs = CreateObject("Scripting.Dictionary")
+    Set mPartDocs = CreateObject("Scripting.Dictionary")
+    mShotNo = 0
+    mCompassToggled = False
+    Set mSheetNames = CreateObject("Scripting.Dictionary")
+    mSheetNames.CompareMode = vbTextCompare
     mBBoxDisabled = False
+    mSheetNo = 0
+    mPump = 0
 
-    ' Selection.Add is used thousands of times; without this every single one
-    ' repaints the tree and the highlight, which is what makes CATIA crawl
+    ' --- 3. THE QUESTIONS ----------------------------------------------------------
+    splitLevel = AskSplitLevel(rootProd)
+    If splitLevel < 0 Then
+        Call LogLine("cancelled at the split level question")
+        On Error Resume Next
+        CATIA.DisplayFileAlerts = True
+        CATIA.StatusBar = ""
+        Err.Clear
+        Exit Sub
+    End If
+
+    mShotParts = CAPTURE_PART_SHOTS
+    mShotAssy = CAPTURE_ASSEMBLY_SHOTS
+    If ASK_PICTURES And (mShotParts Or mShotAssy) Then
+        ans = MsgBox("Take the pictures too?" & vbCrLf & vbCrLf & _
+                     "Yes = all numbers first, then one picture per row" & vbCrLf & _
+                     "No  = numbers only - the fastest run", _
+                     vbYesNoCancel + vbQuestion, "BOM - pictures")
+        If ans = vbCancel Then
+            Call LogLine("cancelled at the pictures question")
+            On Error Resume Next
+            CATIA.DisplayFileAlerts = True
+            Err.Clear
+            Exit Sub
+        End If
+        If ans = vbNo Then
+            mShotParts = False
+            mShotAssy = False
+        End If
+    End If
+    Call LogLine("split level " & splitLevel & ", pictures: " & IIf(mShotParts Or mShotAssy, "yes", "no"))
+
+    ' --- 4. SESSION --------------------------------------------------------------
     On Error Resume Next
-    CATIA.HSOSynchronized = False
-    ' design mode ONCE for the whole tree instead of once per node
+    CATIA.HSOSynchronized = False    ' otherwise every Selection.Add repaints the tree
     If FORCE_DESIGN_MODE Then rootProd.ApplyWorkMode 2
     Err.Clear
     On Error GoTo Fail
 
-    ' --- 3. TRAVERSE TREE (Count Parts, Calc Mass, Detect Multi-Body Parts) ---
+    mTempDir = "C:\Temp\catia_bom_pictures"
+    Call EnsureFolder(mTempDir)
+    ' leftovers of an aborted run must never end up in a new sheet
     On Error Resume Next
-    CATIA.RefreshDisplay = False
+    mFso.DeleteFile mTempDir & "\*.*", True
+    Err.Clear
     On Error GoTo Fail
 
-    Call TraverseTree(rootProd, dictQty, dictRef, dictDesc, dictProps, dictLevel, _
-                      dictBodies, dictPartNum, dictFirst, dictIsAssy, dictNodeLeaves, _
-                      colLeaves, 1, "", "")
+    ' --- 5. EXCEL ------------------------------------------------------------------
+    ' An Excel of its own: what the user does in his own Excel during the run
+    ' (a cell in edit mode, an open dialog) can then never make a write fail.
+    If Not StartExcel(firstSheet) Then Err.Raise vbObjectError + 513, , "Excel could not be started"
+    Call KeepOneSheet(mXlBook)
+
+    ' --- 6. MAIN WINDOW: geometry only, fixed camera ----------------------------
+    Call PrepareWindow(rootWin, rootViewer, rootLayout, rootLayoutSet)
+    compassToggled = ToggleCompass()
+    mCompassToggled = compassToggled
+
+    If splitLevel = 0 Then
+
+        ' ===== ONE SHEET FOR THE WHOLE PRODUCT ==================================
+        Set xlSheet = firstSheet
+        Call NameSheet(xlSheet, "BOM")
+        unitStart = Timer
+        unitOK = ProcessTree(rootProd, rootSel, rootViewer, xlSheet, 0, "", "", 0, _
+                             nRows, nAssy, nParts, statusTxt)
+        totRows = nRows: totAssy = nAssy: totParts = nParts
+        Call LogLine("sheet BOM: " & statusTxt & ", " & nRows & " rows, " & _
+                     Format(Elapsed(unitStart), "0") & " s")
+        ' (a failure is reported in the final message - AFTER CATIA is restored
+        '  and the workbook is saved, never before)
+
+    Else
+
+        ' ===== ONE SHEET PER SUB-ASSEMBLY ON THE SPLIT LEVEL =====================
+        Set dUnitQty = CreateObject("Scripting.Dictionary")
+        Set dUnitRef = CreateObject("Scripting.Dictionary")
+        Set dUnitFirst = CreateObject("Scripting.Dictionary")
+        Set dUnitDesc = CreateObject("Scripting.Dictionary")
+        Set dUnitPath = CreateObject("Scripting.Dictionary")
+        Set colUnitInst = New Collection
+        Set colAbove = New Collection
+        Set colLooseInst = New Collection
+        Set colLooseLevel = New Collection
+        Set colLooseFirst = New Collection
+        Set colLooseKey = New Collection
+        Set colLooseIsAssy = New Collection
+        Set colLooseParts = New Collection
+        Set colFbKey = New Collection
+        Set colFbSheet = New Collection
+        Set colFbIdxRow = New Collection
+
+        Call SetStatus("BOM: collecting the components on level " & splitLevel & " ...")
+        Call CollectUnits(rootProd, 1, splitLevel, "", "", "", dUnitQty, dUnitRef, dUnitFirst, _
+                          dUnitDesc, dUnitPath, colUnitInst, colAbove, _
+                          colLooseInst, colLooseLevel, colLooseFirst, colLooseKey, _
+                          colLooseIsAssy, colLooseParts)
+        Call LogLine(dUnitQty.Count & " components on level " & splitLevel & ", " & _
+                     colLooseParts.Count & " parts above it")
+
+        Set idxSheet = firstSheet
+        Call NameSheet(idxSheet, "Index")
+        Call WriteIndexHeader(idxSheet, splitLevel, idxHdrOK)
+        idxRow = 3
+
+        ' --- the components that are CATProducts of their own: own window ------
+        For Each unitKey In dUnitQty.Keys
+            nUnits = nUnits + 1
+            unitStart = Timer
+            nRows = 0: nAssy = 0: nParts = 0
+            statusTxt = "not started"
+            Set xlSheet = Nothing
+            mXlSkipAt = -1                   ' a "skip" given for an earlier component ends here
+            Call CheckExcel                  ' Excel gone: stop the whole run here
+            ' the Index header (and its text formats) before any more Index rows
+            If Not (idxHdrOK And mIdxFmtOK) Then Call WriteIndexHeader(idxSheet, splitLevel, idxHdrOK)
+            ' an error in here ends this component only, never the whole run
+            On Error GoTo UnitFail
+
+            Set unitInst = dUnitRef(unitKey)
+            Call LogLine("=== component " & nUnits & " of " & dUnitQty.Count & ": " & CStr(unitKey))
+            Set xlSheet = AddSheet(mXlBook, Format(nUnits, "00") & " " & CStr(unitKey))
+            If xlSheet Is Nothing Then Err.Raise vbObjectError + 514, , "Excel could not add a sheet"
+
+            Call NoteIndexRow(idxSheet, idxRow, nUnits, CStr(unitKey), CStr(dUnitDesc(unitKey)), _
+                               splitLevel, CLng(dUnitQty(unitKey)), CStr(dUnitFirst(unitKey)), _
+                               CStr(dUnitPath(unitKey)), mSheetName)
+
+            ' NO ApplyWorkMode on the component here: it is recursive and would
+            ' load every CATPart of the component in ONE blocking call. Its parts
+            ' are promoted one per row while the numbers are read.
+            Call SetStatus("BOM: component " & nUnits & " of " & dUnitQty.Count & _
+                           " - opening " & CStr(unitKey) & " ...")
+            ownWindow = False
+            Set unitDoc = Nothing
+            Set unitWin = Nothing
+            If OPEN_UNITS_IN_NEW_WINDOW Then Set unitDoc = OwnDocumentOf(unitInst, CStr(unitKey), catDoc)
+
+            If Not unitDoc Is Nothing Then
+                On Error Resume Next
+                Set unitWin = unitDoc.NewWindow
+                If Not unitWin Is Nothing Then unitWin.Activate
+                Err.Clear
+                On Error GoTo UnitFail
+                ownWindow = Not (unitWin Is Nothing)
+            End If
+
+            If ownWindow Then
+                Set unitViewer = Nothing
+                Call PrepareWindow(unitWin, unitViewer, unitLayout, unitLayoutSet)
+                ' every new window starts with its own compass - hide it there too
+                If compassToggled Then compassToggled = ToggleCompass()
+                Set unitSel = unitDoc.Selection
+                Set unitRoot = unitDoc.Product
+
+                unitOK = ProcessTree(unitRoot, unitSel, unitViewer, xlSheet, splitLevel, _
+                                     CStr(dUnitFirst(unitKey)), CStr(unitKey), CLng(dUnitQty(unitKey)), _
+                                     nRows, nAssy, nParts, statusTxt)
+
+                ' close the component window and go back to the product
+                On Error Resume Next
+                unitWin.Close
+                rootWin.Activate
+                Err.Clear
+                On Error GoTo UnitFail
+                Set unitWin = Nothing
+
+                Call NoteIndexResult(idxSheet, idxRow, nRows, statusTxt, Elapsed(unitStart), "own window")
+                Call LogLine("component " & CStr(unitKey) & ": " & statusTxt & ", " & nRows & " rows, " & _
+                             Format(Elapsed(unitStart), "0") & " s")
+                totRows = totRows + nRows: totAssy = totAssy + nAssy: totParts = totParts + nParts
+                If unitOK Then nUnitsOK = nUnitsOK + 1
+            Else
+                ' done later in the main window, once the rest of the scene is hidden
+                colFbKey.Add unitKey
+                colFbSheet.Add xlSheet
+                colFbIdxRow.Add idxRow
+                Call LogLine("component " & CStr(unitKey) & ": no file of its own - done in the main window")
+            End If
+
+            Call SaveWorkbook(False)
+            GoTo UnitNext
+
+UnitCleanup:
+            ' (reached from UnitFail below, after the error is cleared)
+            On Error Resume Next
+            Call LogLine("component " & CStr(unitKey) & " " & statusTxt)
+            If Not unitWin Is Nothing Then unitWin.Close
+            Set unitWin = Nothing
+            rootWin.Activate
+            If xlSheet Is Nothing Then
+                Call NoteIndexRow(idxSheet, idxRow, nUnits, CStr(unitKey), CStr(dUnitDesc(unitKey)), _
+                                   splitLevel, CLng(dUnitQty(unitKey)), CStr(dUnitFirst(unitKey)), _
+                                   CStr(dUnitPath(unitKey)), "")
+            End If
+            Call NoteIndexResult(idxSheet, idxRow, nRows, statusTxt, Elapsed(unitStart), "-")
+            Err.Clear
+
+UnitNext:
+            On Error GoTo Fail
+            idxRow = idxRow + 1
+            DoEvents
+        Next unitKey
+
+        ' --- the rest is done in the main window ---------------------------------
+        If colFbKey.Count > 0 Or colLooseInst.Count > 0 Then
+            ' scene: every assembly above the split level visible, every component
+            ' and every loose part hidden - then one thing at a time is shown
+            Call SetShowCollection(rootSel, colAbove, 0)
+            Call SetShowCollection(rootSel, colUnitInst, 1)
+            Call SetShowCollection(rootSel, colLooseParts, 1)
+            rootSceneSet = True
+
+            For i = 1 To colFbKey.Count
+                mXlSkipAt = -1
+                Call CheckExcel
+                unitKey = colFbKey(i)
+                unitStart = Timer
+                Set unitInst = dUnitRef(unitKey)
+
+                Set xlSheet = colFbSheet(i)
+                mSheetName = SheetNameOf(xlSheet)
+                Call LogLine("=== component " & CStr(unitKey) & " (main window)")
+                Call SetShowSingle(rootSel, unitInst, 0)         ' only this branch
+                unitOK = ProcessTree(unitInst, rootSel, rootViewer, xlSheet, splitLevel, _
+                                     CStr(dUnitFirst(unitKey)), CStr(unitKey), CLng(dUnitQty(unitKey)), _
+                                     nRows, nAssy, nParts, statusTxt)
+                Call SetShowSingle(rootSel, unitInst, 1)
+
+                Call NoteIndexResult(idxSheet, CLng(colFbIdxRow(i)), nRows, statusTxt, _
+                                      Elapsed(unitStart), "main window")
+                Call LogLine("component " & CStr(unitKey) & ": " & statusTxt & ", " & nRows & " rows, " & _
+                             Format(Elapsed(unitStart), "0") & " s")
+                totRows = totRows + nRows: totAssy = totAssy + nAssy: totParts = totParts + nParts
+                If unitOK Then nUnitsOK = nUnitsOK + 1
+                Call SaveWorkbook(False)
+                DoEvents
+            Next i
+
+            If colLooseInst.Count > 0 Then
+                mXlSkipAt = -1
+                Call CheckExcel
+                unitStart = Timer
+                Call LogLine("=== above level " & splitLevel)
+                Set xlSheet = AddSheet(mXlBook, "Above level " & splitLevel)
+                If Not xlSheet Is Nothing Then
+                    Call NoteIndexRow(idxSheet, idxRow, 0, "(above level " & splitLevel & ")", _
+                                       "parts that are not inside any component of level " & splitLevel & _
+                                       IIf(mIncludeSubassemblies, ", and the assemblies above it", ""), _
+                                       0, colLooseParts.Count, "", "", mSheetName)
+                    unitOK = ProcessLoose(colLooseInst, colLooseLevel, colLooseFirst, colLooseKey, _
+                                          colLooseIsAssy, rootSel, rootViewer, xlSheet, _
+                                          nRows, nAssy, nParts, statusTxt)
+                    Call NoteIndexResult(idxSheet, idxRow, nRows, statusTxt, Elapsed(unitStart), "main window")
+                    Call LogLine("above level " & splitLevel & ": " & statusTxt & ", " & nRows & " rows, " & _
+                                 Format(Elapsed(unitStart), "0") & " s")
+                    totRows = totRows + nRows: totAssy = totAssy + nAssy: totParts = totParts + nParts
+                Else
+                    Call LogLine("above level " & splitLevel & ": no sheet - Excel could not add one")
+                    Call NoteIndexRow(idxSheet, idxRow, 0, "(above level " & splitLevel & ")", _
+                                "parts that are not inside any component of level " & splitLevel, _
+                                0, colLooseParts.Count, "", "", "")
+                    Call NoteIndexResult(idxSheet, idxRow, 0, "stopped: Excel could not add the sheet", _
+                                   Elapsed(unitStart), "-")
+                End If
+            End If
+
+            ' everything visible again
+            Call SetShowCollection(rootSel, colUnitInst, 0)
+            Call SetShowCollection(rootSel, colLooseParts, 0)
+            rootSceneSet = False
+        End If
+
+        ' Index writes Excel could not take during the run get a second chance
+        mXlSkipAt = -1
+        If Not (idxHdrOK And mIdxFmtOK) Then Call WriteIndexHeader(idxSheet, splitLevel, idxHdrOK)
+        Call RedoIndexWrites(idxSheet)
+        Call FinishIndexLayout(idxSheet)
+    End If
+
+    ' --- 7. RESTORE THE SESSION --------------------------------------------------
+    On Error Resume Next
+    rootWin.Activate
+    If rootLayoutSet Then rootWin.Layout = rootLayout
+    If compassToggled Then CATIA.StartCommand COMPASS_COMMAND
+    If Not rootViewer Is Nothing Then rootViewer.Reframe
+    CATIA.RefreshDisplay = True
+    CATIA.HSOSynchronized = True
+    CATIA.DisplayFileAlerts = True
+    CATIA.StatusBar = ""
+    rootSel.Clear
+    Err.Clear
+    On Error GoTo Fail
+
+    Call LogLine("finished after " & Format(Elapsed(startTime), "0") & " s, " & totRows & " rows")
+    Call WriteLogSheet(modeName & ", split level " & splitLevel & ", " & totRows & " rows, " & _
+                       Format(Elapsed(startTime) / 60#, "0.0") & " min")
+    Call ShowSheet(firstSheet)
+    Call SaveWorkbook(True)
+    Call XlRestore
+
+    If splitLevel = 0 Then
+        If Not unitOK Then
+            If Left$(statusTxt, 10) = "INCOMPLETE" Then
+                failMsg = "BOM exported, but the sheet is INCOMPLETE"
+            Else
+                failMsg = "The run stopped early"
+            End If
+            MsgBox failMsg & "  (" & modeName & ")" & vbCrLf & statusTxt & vbCrLf & vbCrLf & _
+                   "Rows written:     " & totRows & vbCrLf & _
+                   "Time: " & Format(Elapsed(startTime) / 60#, "0.0") & " min" & vbCrLf & vbCrLf & _
+                   NotLoadedText() & SavedText(), vbExclamation
+            Exit Sub
+        End If
+        MsgBox "BOM exported  (" & modeName & ")" & vbCrLf & vbCrLf & _
+               "Rows written:     " & totRows & vbCrLf & _
+               "  sub-assemblies: " & totAssy & vbCrLf & _
+               "  parts:          " & totParts & vbCrLf & _
+               "Time: " & Format(Elapsed(startTime) / 60#, "0.0") & " min" & vbCrLf & vbCrLf & _
+               NotLoadedText() & SavedText(), vbInformation
+    Else
+        MsgBox "BOM exported  (" & modeName & ", split at level " & splitLevel & ")" & vbCrLf & vbCrLf & _
+               "Component sheets: " & nUnits & "  (" & nUnitsOK & " complete)" & vbCrLf & _
+               "Rows written:     " & totRows & vbCrLf & _
+               "Time: " & Format(Elapsed(startTime) / 60#, "0.0") & " min" & vbCrLf & vbCrLf & _
+               "The Index sheet links to every component sheet." & vbCrLf & vbCrLf & _
+               NotLoadedText() & SavedText(), vbInformation
+    End If
+    Exit Sub
+
+' ------------------------------------------------------------------------------
+' An error inside one component: noted, then the run goes on with the next one
+' ------------------------------------------------------------------------------
+UnitFail:
+    statusTxt = "stopped: " & Err.Number & " - " & Err.Description
+    Resume UnitCleanup
+
+' ------------------------------------------------------------------------------
+' Something went wrong outside a component: put CATIA and Excel back into a
+' usable state and save what is there before reporting.
+' ------------------------------------------------------------------------------
+Fail:
+    failMsg = "The BOM run stopped with error " & Err.Number & " - " & Err.Description
+    Resume FailCleanup
+
+FailCleanup:
+    On Error Resume Next
+    Call LogLine(failMsg)
+    If Not unitWin Is Nothing Then unitWin.Close
+    If Not rootWin Is Nothing Then rootWin.Activate
+    If rootSceneSet Then
+        Call SetShowCollection(rootSel, colUnitInst, 0)
+        Call SetShowCollection(rootSel, colLooseParts, 0)
+    End If
+    If rootLayoutSet Then rootWin.Layout = rootLayout
+    If compassToggled Then CATIA.StartCommand COMPASS_COMMAND
+    If Not rootViewer Is Nothing Then rootViewer.Reframe
+    CATIA.HSOSynchronized = True
+    CATIA.RefreshDisplay = True
+    CATIA.DisplayFileAlerts = True
+    CATIA.StatusBar = ""
+    If Not rootSel Is Nothing Then rootSel.Clear
+    Call SaveWorkbook(True)
+    Call XlRestore
+    Err.Clear
+
+    If mXlLost Then
+        MsgBox failMsg & vbCrLf & vbCrLf & _
+               "Visibility, spec tree and compass were restored." & vbCrLf & _
+               "Excel was closed during the run." & vbCrLf & vbCrLf & _
+               SavedText(), vbCritical
+    Else
+        MsgBox failMsg & vbCrLf & vbCrLf & _
+               "Visibility, spec tree and compass were restored." & vbCrLf & _
+               "The rows written so far are in the Excel workbook." & vbCrLf & vbCrLf & _
+               SavedText(), vbCritical
+    End If
+
+End Sub
+
+
+' ==============================================================================
+' ONE SHEET FROM A (SUB)TREE
+'   treeRoot     the product whose content goes on the sheet
+'   levelOffset  0 for the whole product; n when the sheet is a component on
+'                level n - the component itself becomes the first row and its
+'                content is written with the levels it has in the product
+' Returns False if the sheet could not be finished; statusTxt says why.
+' An error here never stops the whole run - it only ends this sheet.
+' ==============================================================================
+Private Function ProcessTree(treeRoot As Product, sel As Selection, oViewer As Viewer, _
+                             xlSheet As Object, ByVal levelOffset As Long, _
+                             ByVal firstLevel As String, ByVal unitPartNum As String, _
+                             ByVal unitQty As Long, ByRef nRows As Long, ByRef nAssy As Long, _
+                             ByRef nParts As Long, ByRef statusTxt As String) As Boolean
+    Dim r As Long, t0 As Double
+    Dim hdrOK As Boolean, nLost As Long
+
+    ProcessTree = False
+    nRows = 0: nAssy = 0: nParts = 0
+    r = 2
+    statusTxt = ""
+    t0 = Timer
+    On Error GoTo SheetFail
+
+    Call ResetSheetData
+    hdrOK = WriteHeader(xlSheet)
+
+    ' --- the tree of this sheet (numbers are NOT read here) ---
+    Call SetStatus("BOM: reading the tree of " & mSheetName & " ...")
+    Call LogLine(mSheetName & ": reading the tree")
+    Call TraverseTree(treeRoot, mQty, mRef, mDesc, mProps, mLevel, mBodies, mPartNum, mFirst, _
+                      mIsAssy, mNodeLeaves, mLeaves, levelOffset + 1, firstLevel, unitPartNum)
+    Call LogLine(mSheetName & ": " & mQty.Count & " rows, " & mLeaves.Count & " part instances")
+
+    ' --- the component itself is the first row of its sheet ---
+    ' (quantity 1: the whole sheet describes ONE piece - the Index has the count.
+    '  The part list promises no assembly rows, so it has no component row.)
+    If levelOffset > 0 And mIncludeSubassemblies Then
+        Call WriteUnitRow(treeRoot, r, levelOffset, unitPartNum, 1, firstLevel)
+        nAssy = nAssy + 1
+        r = r + 1
+    End If
+
+    ' --- PASS 1: all numbers, display frozen, nothing shown or hidden ---
+    Call WriteDataRows(r, nAssy, nParts)
+    nRows = r - 2
+    Call FillAssemblyRows
+    nLost = FlushSheet(xlSheet, False)
+    Call RetryLostWrites(xlSheet, hdrOK, nLost)
+
+    ' the numbers are complete - make them visible before the pictures start
+    Call FinishSheetLayout(xlSheet)
+    Call LogLine(mSheetName & ": numbers done after " & Format(Elapsed(t0), "0") & " s")
+    Call SaveWorkbook(False)
+
+    ' --- PASS 2: the pictures ---
+    Call CheckExcel
+    Call TakePictures(sel, oViewer, xlSheet)
+
+    ' rows Excel never took: the sheet is NOT reported as complete
+    If Not hdrOK Or nLost > 0 Then
+        nRows = nRows - nLost
+        statusTxt = SheetLostText(hdrOK, nLost)
+        Call LogLine(mSheetName & " " & statusTxt)
+        Call MarkSheetIncomplete(xlSheet, statusTxt)
+        Exit Function
+    End If
+
+    ProcessTree = True
+    statusTxt = "OK"
+    Exit Function
+
+SheetFail:
+    statusTxt = "stopped: " & Err.Number & " - " & Err.Description
+    nRows = r - 2
+    Resume SheetCleanup
+
+SheetCleanup:
+    On Error Resume Next
+    Call LogLine(mSheetName & " " & statusTxt)
+    Call SetShowCollection(sel, mLeaves, 0)
+    CATIA.RefreshDisplay = True
+    ' whatever was read so far still goes into the sheet
+    If Not mFlushed Then Call FlushSheet(xlSheet, False)
+    Call MarkSheetIncomplete(xlSheet, statusTxt)
+    Err.Clear
+End Function
+
+
+' ==============================================================================
+' THE SHEET OF THE PARTS ABOVE THE SPLIT LEVEL
+' (parts that do not sit inside any component of the split level)
+' ==============================================================================
+Private Function ProcessLoose(colInst As Collection, colLevel As Collection, _
+                              colFirst As Collection, colKey As Collection, _
+                              colIsAssy As Collection, sel As Selection, oViewer As Viewer, _
+                              xlSheet As Object, ByRef nRows As Long, ByRef nAssy As Long, _
+                              ByRef nParts As Long, ByRef statusTxt As String) As Boolean
+    Dim i As Long, r As Long
+    Dim oProd As Product, pn As String, sKey As String
+    Dim isAssembly As Boolean
+    Dim hdrOK As Boolean, nLost As Long
+
+    ProcessLoose = False
+    nRows = 0: nAssy = 0: nParts = 0
+    r = 2
+    statusTxt = ""
+    On Error GoTo LooseFail
+
+    Call ResetSheetData
+    hdrOK = WriteHeader(xlSheet)
+
+    ' the rows are keyed like everywhere else (MakeRowKey), so the part list
+    ' groups by part number and the assembly structure by parent path
+    For i = 1 To colInst.Count
+        Set oProd = colInst(i)
+        isAssembly = colIsAssy(i)
+        pn = ""
+        On Error Resume Next
+        pn = oProd.PartNumber
+        Err.Clear
+        On Error GoTo LooseFail
+        If Len(pn) = 0 Then pn = oProd.Name
+
+        If Not isAssembly Then
+            mLeaves.Add oProd
+            mAllNodes.Add oProd
+        End If
+
+        sKey = CStr(colKey(i))
+        If mQty.Exists(sKey) Then
+            mQty(sKey) = mQty(sKey) + 1
+            Call AddFirstLevel(mFirst, sKey, CStr(colFirst(i)))
+        Else
+            Call AddBomRow(mQty, mRef, mDesc, mProps, mLevel, mPartNum, mFirst, mIsAssy, _
+                           sKey, oProd, pn, CStr(colFirst(i)), CInt(colLevel(i)), isAssembly)
+        End If
+        Call Pump
+    Next i
+
+    Call WriteDataRows(r, nAssy, nParts)
+    nRows = r - 2
+    Call FillAssemblyRows
+    nLost = FlushSheet(xlSheet, False)
+    Call RetryLostWrites(xlSheet, hdrOK, nLost)
+    Call FinishSheetLayout(xlSheet)
+    Call SaveWorkbook(False)
+    Call CheckExcel
+    ' RunBOM has hidden these parts for the main-window scene - visible again,
+    ' so the first picture (and the reference of the show / hide check) has them
+    Call SetShowCollection(sel, mLeaves, 0)
+    Call TakePictures(sel, oViewer, xlSheet)
+
+    If Not hdrOK Or nLost > 0 Then
+        nRows = nRows - nLost
+        statusTxt = SheetLostText(hdrOK, nLost)
+        Call LogLine(mSheetName & " " & statusTxt)
+        Call MarkSheetIncomplete(xlSheet, statusTxt)
+        Exit Function
+    End If
+
+    ProcessLoose = True
+    statusTxt = "OK"
+    Exit Function
+
+LooseFail:
+    statusTxt = "stopped: " & Err.Number & " - " & Err.Description
+    nRows = r - 2
+    Resume LooseCleanup
+
+LooseCleanup:
+    On Error Resume Next
+    Call LogLine(mSheetName & " " & statusTxt)
+    CATIA.RefreshDisplay = True
+    If Not mFlushed Then Call FlushSheet(xlSheet, False)
+    Call MarkSheetIncomplete(xlSheet, statusTxt)
+    Err.Clear
+End Function
+
+
+
+' ==============================================================================
+' PASS 1 - ALL NUMBERS OF ONE SHEET (into the row buffer, not into Excel yet)
+' Nothing is shown, hidden or captured here and the display is frozen, so CATIA
+' only loads and measures. Only PARTS are loaded: an assembly row is added up
+' from its parts afterwards (FillAssemblyRows). Every picture that will be
+' needed is noted as a job.
+' Errors are not handled here on purpose: they go up to the sheet's handler.
+' ==============================================================================
+Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As Long)
+    Dim uniqueKey As Variant, strPartNum As String
+    Dim oPartProd As Product, isAssy As Boolean
+    Dim oPart As Part, oPartDoc As PartDocument, hasPart As Boolean
+    Dim propsArray As Variant, cacheArr As Variant
+    Dim dMass As Double, dVol As Double, dArea As Double
+    Dim dims(2) As Double
+    Dim strMatName As String, dDensity As Double
+    Dim solidNames() As String, nSolid As Integer
+    Dim bodyNames As Variant, bi As Integer, oBody As Body
+    Dim bMass As Double, bVol As Double, bArea As Double
+    Dim bDens As Double, bDensInertia As Double, bMat As String
+    Dim nDone As Long, nTotal As Long
+    Dim tRow As Double, tLoad As Double, tRowAll As Double
+    Dim notLoaded As Boolean, bodyKey As String, bv As Variant
+
+    On Error Resume Next
+    CATIA.RefreshDisplay = False
+    Err.Clear
+    On Error GoTo 0
+
+    nTotal = mQty.Count
+    For Each uniqueKey In mQty.Keys
+
+        nDone = nDone + 1
+        strPartNum = mPartNum(uniqueKey)
+        Set oPartProd = mRef(uniqueKey)
+        isAssy = mIsAssy(uniqueKey)
+
+        Call BufSet(r, 2, mLevel(uniqueKey))
+        Call BufSet(r, 3, strPartNum)
+        Call BufSet(r, 4, mDesc(uniqueKey))
+        Call BufSet(r, 5, mQty(uniqueKey))
+        Call BufSet(r, 14, mFirst(uniqueKey))
+
+        If isAssy Then
+            ' ---------- SUB-ASSEMBLY: nothing is loaded or measured here ----------
+            ' (ApplyWorkMode / Analyze on an assembly work on its WHOLE subtree in
+            '  one blocking call - the values are added up from its parts instead)
+            nAssy = nAssy + 1
+            Call BufSet(r, 15, "Assembly")
+            mBoldRows.Add r
+            mAssyRows.Add Array(r, strPartNum, oPartProd)
+            ' (the extra sheet above the split level has no leaf lists - no picture there)
+            If mShotAssy And mNodeLeaves.Exists(CStr(uniqueKey)) Then
+                Call AddJob(r, "ASSY", CStr(uniqueKey), "")
+            Else
+                Call BufSet(r, 1, "-")
+            End If
+
+        Else
+            ' ---------- PART (or a sub-assembly that is not loaded) ----------
+            Call SetStatus("BOM " & mSheetName & ": numbers, row " & nDone & " of " & _
+                           nTotal & " - " & strPartNum)
+            ' written BEFORE the part is loaded: if CATIA hangs, the last line of
+            ' the log names the part
+            Call LogLine(mSheetName & "  row " & nDone & "/" & nTotal & "  " & strPartNum)
+            tRow = Timer
+
+            ' A sub-assembly that is NOT LOADED has no children and looks like a
+            ' part. ApplyWorkMode 2 on it would load its whole content in ONE
+            ' blocking call - so it is neither loaded nor measured: it gets an
+            ' "Assembly" row marked NOT LOADED, and the final message lists it.
+            notLoaded = mNotLoaded.Exists(strPartNum)
+            If Not notLoaded And Not mPromoted.Exists(strPartNum) Then
+                notLoaded = IsUnloadedAssembly(oPartProd)
+                If notLoaded Then
+                    mNotLoaded.Add strPartNum, True
+                    Call LogLine(mSheetName & "  NOT LOADED sub-assembly: " & strPartNum & _
+                                 " - its content is missing in the BOM")
+                End If
+            End If
+        End If
+
+        If notLoaded And Not isAssy Then
+            nAssy = nAssy + 1
+            Call BufSet(r, 15, "Assembly")
+            mBoldRows.Add r
+            Call BufSet(r, 1, "-")
+            For bi = 6 To 11
+                Call BufSet(r, bi, "N/A")
+            Next bi
+            Call BufSet(r, 12, "NOT LOADED or empty - content missing")
+            Call BufSet(r, 13, "N/A")
+
+        ElseIf Not isAssy Then
+            nParts = nParts + 1
+            Call BufSet(r, 15, "Part")
+
+            ' promote THIS part to design mode first - mass, volume, area and the
+            ' inertia box are all 0 on a component in visualization mode. The
+            ' CATPart document is shared by all instances of the part, so once
+            ' per part number is enough.
+            If Not mPromoted.Exists(strPartNum) Then
+                On Error Resume Next
+                oPartProd.ApplyWorkMode 2
+                Err.Clear
+                On Error GoTo 0
+                mPromoted.Add strPartNum, True
+            End If
+            tLoad = Elapsed(tRow)
+
+            hasPart = False
+            Set oPart = Nothing
+            Set oPartDoc = Nothing
+            hasPart = LoadPartDocument(oPartProd, oPart, oPartDoc)
+            ' the picture pass needs the same CATPart - also when it was only
+            ' found through the shape representation
+            If hasPart Then
+                If Not mPartDocs.Exists(strPartNum) Then mPartDocs.Add strPartNum, oPartDoc
+            End If
+
+            ' multi-body parts: the body names are cached per part number, so a
+            ' part that appears on several sheets gets its body rows on every one
+            If hasPart And DETECT_MULTIBODY Then
+                If Not mBodyCache.Exists(strPartNum) Then
+                    nSolid = GetSolidBodyNames(oPart, solidNames)
+                    If nSolid > 1 Then
+                        mBodyCache.Add strPartNum, solidNames
+                    Else
+                        mBodyCache.Add strPartNum, Empty
+                    End If
+                End If
+                If IsArray(mBodyCache(strPartNum)) Then
+                    If Not mBodies.Exists(strPartNum) Then mBodies.Add strPartNum, mBodyCache(strPartNum)
+                End If
+            End If
+
+            ' --- MASS / VOLUME / AREA (once per part number; a zero is not cached) ---
+            If mPropCache.Exists(strPartNum) Then
+                propsArray = mPropCache(strPartNum)
+            Else
+                dMass = 0: dVol = 0: dArea = 0
+                Call ReadProductProps(oPartProd, dMass, dVol, dArea)
+                ' nothing through the instance: ask the CATPart itself
+                If dMass <= 0 And dVol <= 0 And dArea <= 0 And hasPart Then
+                    Call ReadProductProps(oPartDoc.Product, dMass, dVol, dArea)
+                End If
+                propsArray = Array(dMass, dVol, dArea)
+                If dMass > 0 Or dVol > 0 Or dArea > 0 Then mPropCache.Add strPartNum, propsArray
+            End If
+            Call PutNumber(r, 6, propsArray(0))
+            Call PutNumber(r, 7, propsArray(1))
+            Call PutNumber(r, 8, propsArray(2))
+
+            ' --- MATERIAL & DENSITY (once per part number) ---
+            strMatName = "N/A"
+            dDensity = 0
+            If hasPart Then
+                If mMatCache.Exists(strPartNum) Then
+                    cacheArr = mMatCache(strPartNum)
+                    strMatName = CStr(cacheArr(0))
+                    dDensity = CDbl(cacheArr(1))
+                Else
+                    Call GetMaterialAndDensity(oPart, strMatName, dDensity)
+                    If dDensity > 0 Or strMatName <> "N/A" Then _
+                        mMatCache.Add strPartNum, Array(strMatName, dDensity)
+                End If
+            End If
+            Call BufSet(r, 12, strMatName)
+            Call PutNumber(r, 13, dDensity)
+
+            ' --- DIMENSIONS (once per part number) ---
+            dims(0) = 0: dims(1) = 0: dims(2) = 0
+            If mDimCache.Exists(strPartNum) Then
+                cacheArr = mDimCache(strPartNum)
+                dims(0) = CDbl(cacheArr(0)): dims(1) = CDbl(cacheArr(1)): dims(2) = CDbl(cacheArr(2))
+            Else
+                ' only in "BOX" mode: this creates temporary geometry in the CATPart
+                If hasPart And UCase$(MEASURE_MODE) = "BOX" Then Call GetBoundingBoxDims(oPart, dims)
+                If dims(0) < 0.1 Then
+                    On Error Resume Next
+                    Call GetInertiaDims(oPartProd.ReferenceProduct, dims)
+                    If dims(0) < 0.1 And hasPart Then Call GetInertiaDims(oPartDoc.Product, dims)
+                    Err.Clear
+                    On Error GoTo 0
+                End If
+                If dims(0) > 0 Then mDimCache.Add strPartNum, Array(dims(0), dims(1), dims(2))
+            End If
+            Call PutNumber(r, 9, dims(0))
+            Call PutNumber(r, 10, dims(1))
+            Call PutNumber(r, 11, dims(2))
+
+            ' a part without any value: the log says what CATIA has of it
+            If propsArray(0) <= 0 And propsArray(1) <= 0 And propsArray(2) <= 0 And dims(0) <= 0 Then
+                Call LogLine(mSheetName & "  NO VALUES " & strPartNum & ": " & PartStateText(oPartProd, hasPart))
+            End If
+
+            ' --- the picture of this row is taken in pass 2 ---
+            If mShotParts Then
+                Call AddJob(r, "PART", CStr(uniqueKey), "")
+            Else
+                Call BufSet(r, 1, "-")
+            End If
+
+            ' --- MULTI-BODY SUB-ROWS ---
+            If hasPart And mBodies.Exists(strPartNum) Then
+                bodyNames = mBodies(strPartNum)
+                For bi = LBound(bodyNames) To UBound(bodyNames)
+                    Set oBody = GetBodyByName(oPart, CStr(bodyNames(bi)))
+                    If Not oBody Is Nothing Then
+                        r = r + 1
+
+                        Call BufSet(r, 2, mLevel(uniqueKey) + 1)
+                        Call BufSet(r, 3, "    " & CStr(bodyNames(bi)))
+                        Call BufSet(r, 4, "Body of " & strPartNum)
+                        Call BufSet(r, 5, mQty(uniqueKey))
+                        Call BufSet(r, 14, mFirst(uniqueKey))
+                        Call BufSet(r, 15, "Body")
+
+                        ' body values: once per part number and body for the whole run
+                        bodyKey = strPartNum & "|" & CStr(bodyNames(bi))
+                        If mBodyValCache.Exists(bodyKey) Then
+                            bv = mBodyValCache(bodyKey)
+                        Else
+                            bMass = 0: bVol = 0: bArea = 0
+                            bDens = 0: bDensInertia = 0
+                            bMat = "N/A"
+
+                            Call GetBodyMaterial(oPart, oBody, bMat, bDens)
+                            Call GetBodyMassAndDensity(oPartDoc, oBody, bMass, bDensInertia)
+                            If bDens <= 0 Then bDens = bDensInertia
+                            Call GetBodyVolumeArea(oPartDoc, oPart, oBody, bVol, bArea)
+                            If bMass <= 0 And bDens > 0 And bVol > 0 Then bMass = bVol * bDens
+
+                            dims(0) = 0: dims(1) = 0: dims(2) = 0
+                            If UCase$(MEASURE_MODE) = "BOX" Then
+                                If Not MeasureTarget(oPart, oBody, dims) Then
+                                    Call MeasureAABBExtremum(oPart, oPartDoc, oBody, dims)
+                                End If
+                            End If
+                            If dims(0) < 0.1 Then Call GetBodyInertiaDims(oPartDoc, oBody, dims)
+
+                            bv = Array(bMass, bVol, bArea, dims(0), dims(1), dims(2), bMat, bDens)
+                            If bMass > 0 Or bVol > 0 Or bArea > 0 Then mBodyValCache.Add bodyKey, bv
+                            DoEvents                     ' a part with many bodies takes a while
+                        End If
+
+                        Call PutNumber(r, 6, bv(0))
+                        Call PutNumber(r, 7, bv(1))
+                        Call PutNumber(r, 8, bv(2))
+                        Call PutNumber(r, 9, bv(3))
+                        Call PutNumber(r, 10, bv(4))
+                        Call PutNumber(r, 11, bv(5))
+                        Call BufSet(r, 12, CStr(bv(6)))
+                        Call PutNumber(r, 13, bv(7))
+
+                        If mShotParts Then
+                            Call AddJob(r, "BODY", CStr(uniqueKey), CStr(bodyNames(bi)))
+                        Else
+                            Call BufSet(r, 1, "-")
+                        End If
+                    End If
+                    Set oBody = Nothing
+                Next bi
+            End If
+
+            tRowAll = Elapsed(tRow)
+            If tRowAll >= SLOW_STEP_SECONDS Then
+                Call NoteSlow(tRowAll, mSheetName & "  row " & nDone & "  " & strPartNum & _
+                              "  (loading " & Format(tLoad, "0.0") & " s)")
+            End If
+        End If
+
+        r = r + 1
+        DoEvents
+    Next uniqueKey
 
     On Error Resume Next
     CATIA.RefreshDisplay = True
-    On Error GoTo Fail
+    Err.Clear
+    On Error GoTo 0
+End Sub
 
-    If dictQty.Count = 0 Then
-        ' nothing to write - but the two SESSION flags this run changed must be
-        ' put back, otherwise CATIA stays without file alerts and without HSO
-        ' synchronisation until it is restarted
-        On Error Resume Next
-        CATIA.HSOSynchronized = True
-        CATIA.DisplayFileAlerts = True
+
+' ==============================================================================
+' THE FIRST ROW OF A COMPONENT SHEET: THE COMPONENT ITSELF
+' (its numbers are added up with the other assembly rows - FillAssemblyRows)
+' ==============================================================================
+Private Sub WriteUnitRow(treeRoot As Product, ByVal r As Long, ByVal lvl As Long, _
+                         ByVal pn As String, ByVal qty As Long, ByVal firstLevel As String)
+    Dim sDesc As String
+
+    sDesc = ""
+    On Error Resume Next
+    sDesc = treeRoot.DescriptionRef
+    Err.Clear
+    On Error GoTo 0
+
+    Call BufSet(r, 2, lvl)
+    Call BufSet(r, 3, pn)
+    Call BufSet(r, 4, sDesc)
+    Call BufSet(r, 5, qty)
+    Call BufSet(r, 14, firstLevel)
+    Call BufSet(r, 15, "Assembly")
+    mBoldRows.Add r
+    mAssyRows.Add Array(r, pn, treeRoot)
+
+    ' the whole component, pictured in pass 2
+    If mShotAssy Then
+        Call AddJob(r, "UNIT", "", "")
+    Else
+        Call BufSet(r, 1, "-")
+    End If
+End Sub
+
+
+' ==============================================================================
+' PASS 1b - THE ASSEMBLY ROWS OF THE SHEET
+' Mass / volume / area of an assembly are the sum over its content, so they are
+' added up from the part values that pass 1 has just read: CATIA does not have
+' to evaluate the whole subtree a second time. Length / width / height need
+' CATIA's inertia of the assembly - only for assemblies up to
+' ASSY_DIMS_MAX_PARTS part instances.
+' ==============================================================================
+Private Sub FillAssemblyRows()
+    Dim it As Variant, r As Long, pn As String
+    Dim v As Variant, cacheArr As Variant
+    Dim dims(2) As Double
+    Dim oProd As Product, t As Double
+
+    For Each it In mAssyRows
+        r = it(0)
+        pn = CStr(it(1))
+        Set oProd = it(2)
+
+        v = RollUp(pn, 0)
+        If ASSEMBLY_METRICS Then
+            Call PutNumber(r, 6, v(0))
+            Call PutNumber(r, 7, v(1))
+            Call PutNumber(r, 8, v(2))
+        Else
+            Call BufSet(r, 6, "N/A")
+            Call BufSet(r, 7, "N/A")
+            Call BufSet(r, 8, "N/A")
+        End If
+
+        dims(0) = 0: dims(1) = 0: dims(2) = 0
+        If mDimCache.Exists(pn) Then
+            cacheArr = mDimCache(pn)
+            dims(0) = CDbl(cacheArr(0)): dims(1) = CDbl(cacheArr(1)): dims(2) = CDbl(cacheArr(2))
+        ElseIf ASSY_DIMS_MAX_PARTS > 0 And v(3) > 0 And v(3) <= ASSY_DIMS_MAX_PARTS And v(5) = 0 Then
+            ' (only when the whole content is known - otherwise the inertia
+            '  would run over parts nobody has counted)
+            Call SetStatus("BOM " & mSheetName & ": size of the assembly " & pn)
+            Call LogLine(mSheetName & "  assembly size " & pn & "  (" & v(3) & " parts)")
+            t = Timer
+            On Error Resume Next
+            Call GetInertiaDims(oProd.ReferenceProduct, dims)
+            Err.Clear
+            On Error GoTo 0
+            If Elapsed(t) >= SLOW_STEP_SECONDS Then
+                Call NoteSlow(Elapsed(t), mSheetName & "  assembly size " & pn & "  (" & v(3) & " parts)")
+            End If
+            If dims(0) > 0 Then mDimCache.Add pn, Array(dims(0), dims(1), dims(2))
+        End If
+        Call PutNumber(r, 9, dims(0))
+        Call PutNumber(r, 10, dims(1))
+        Call PutNumber(r, 11, dims(2))
+
+        If v(5) > 0 Then
+            Call BufSet(r, 12, "sum incomplete - content missing")
+        Else
+            Call BufSet(r, 12, "N/A")
+        End If
+        Call BufSet(r, 13, "N/A")
+        Set oProd = Nothing
+        DoEvents
+    Next it
+End Sub
+
+
+' ==============================================================================
+' HELPER: MASS / VOLUME / AREA OF ONE PIECE OF AN ASSEMBLY, ADDED UP
+' Returns Array(mass, volume, area, part instances, part instances without
+' values, pieces of unknown content) over every part instance below it. Unknown
+' content = a sub-assembly whose sheet failed, or one CATIA has not loaded. Pure bookkeeping - nothing is asked from
+' CATIA. The content of every assembly part number is noted while the trees are
+' walked (mAssyKids); the part values are the ones pass 1 has read (mPropCache).
+' ==============================================================================
+Private Function RollUp(ByVal pn As String, ByVal depth As Long) As Variant
+    Dim kids As Collection, k As Variant, v As Variant, res As Variant
+    Dim m As Double, vo As Double, a As Double
+    Dim np As Long, nm As Long, nu As Long
+
+    If mRollCache.Exists(pn) Then
+        RollUp = mRollCache(pn)
+        Exit Function
+    End If
+    If depth > 60 Or Not mAssyKids.Exists(pn) Then
+        RollUp = Array(0#, 0#, 0#, 0&, 0&, 1&)       ' content unknown
+        Exit Function
+    End If
+
+    Set kids = mAssyKids(pn)
+    For Each k In kids
+        If k(1) Then
+            v = RollUp(CStr(k(0)), depth + 1)
+            m = m + v(0): vo = vo + v(1): a = a + v(2)
+            np = np + v(3): nm = nm + v(4): nu = nu + v(5)
+        ElseIf mNotLoaded.Exists(CStr(k(0))) Then
+            nu = nu + 1                                ' a sub-assembly CATIA has not loaded
+        Else
+            np = np + 1
+            If mPropCache.Exists(CStr(k(0))) Then
+                v = mPropCache(CStr(k(0)))
+                m = m + v(0): vo = vo + v(1): a = a + v(2)
+            Else
+                nm = nm + 1
+            End If
+        End If
+    Next k
+
+    res = Array(m, vo, a, np, nm, nu)
+    ' a complete sum never changes again; an incomplete one may, later in the run
+    If nm = 0 And nu = 0 Then mRollCache.Add pn, res
+    RollUp = res
+End Function
+
+' ==============================================================================
+' HELPER: IS A CHILDLESS NODE A SUB-ASSEMBLY THAT IS NOT LOADED (OR EMPTY)?
+' Decided WITHOUT loading anything - every ApplyWorkMode on such a node would
+' load its whole content in one blocking call:
+'   its CATPart is in the session                         -> a part
+'   it has a shape representation                         -> a part
+'   its shape file is a CATProduct                        -> NOT a part
+'   it has a shape file of another kind (CATPart, cgr)    -> a part
+'   its reference is the root of a CATProduct of its own  -> NOT a part
+'   no evidence either way                                -> a part (as before)
+' ==============================================================================
+Private Function IsUnloadedAssembly(oProd As Product) As Boolean
+    Dim oDoc As Object, tn As String, pth As String
+    Dim docPn As String, myPn As String, hasShape As Boolean
+
+    IsUnloadedAssembly = False
+    On Error Resume Next
+
+    Set oDoc = Nothing
+    Set oDoc = oProd.ReferenceProduct.Parent
+    Err.Clear
+    tn = ""
+    If Not oDoc Is Nothing Then tn = TypeName(oDoc)
+    If tn = "PartDocument" Then Exit Function
+
+    ' a node with a shape of its own (also a CATProduct whose geometry is a
+    ' CATPart "shape representation") is a part
+    hasShape = False
+    hasShape = oProd.HasAMasterShapeRepresentation
+    If Err.Number = 0 And hasShape Then Exit Function
+    Err.Clear
+
+    pth = ""
+    pth = LCase$(CStr(oProd.GetMasterShapeRepresentationPathName))
+    Err.Clear
+    If Right$(pth, 11) = ".catproduct" Then
+        IsUnloadedAssembly = True
+        Exit Function
+    End If
+    If Len(pth) > 0 Then Exit Function
+
+    ' its reference is a CATProduct document whose root IS this node (and not
+    ' the assembly the node sits in) - a sub-assembly without children
+    If tn = "ProductDocument" Then
+        docPn = ""
+        docPn = oDoc.Product.PartNumber
+        myPn = ""
+        myPn = oProd.PartNumber
         Err.Clear
-        On Error GoTo Fail
-        MsgBox "No parts found.", vbInformation
+        If Len(myPn) > 0 And StrComp(docPn, myPn, vbTextCompare) = 0 Then IsUnloadedAssembly = True
+    End If
+    Err.Clear
+End Function
+
+' notes the content of an assembly part number once (all its instances share it)
+Private Sub NoteAssemblyContent(ByVal pn As String, kids As Collection)
+    If Len(pn) = 0 Then Exit Sub
+    If mAssyKids Is Nothing Then Exit Sub
+    If Not mAssyKids.Exists(pn) Then mAssyKids.Add pn, kids
+End Sub
+
+
+
+' ==============================================================================
+' PASS 2 - ALL PICTURES OF ONE SHEET (after all its numbers are written)
+'   1. the component as it is - the picture of its own row
+'   2. every part, and every sub-assembly that is a CATProduct of its own, in
+'      a WINDOW OF ITS OWN: it is alone there, nothing has to be hidden. A part
+'      number is pictured once for the whole run, every further row reuses it.
+'   3. the rest (a part CATIA has only as cgr, an assembly inside another file)
+'      the old way: hide every part, show one, capture. If hiding does not
+'      change the view in this window, those rows get "No Preview" instead of
+'      a picture of the whole component.
+' Every picture goes into Excel straight away.
+' ==============================================================================
+Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
+    Dim j As Long, i As Long, rowNo As Long
+    Dim kind As String, key As String, bodyName As String, pn As String
+    Dim picPath As String, what As String, shotKey As String
+    Dim fullPath As String, basePath As String
+    Dim fullSig As String, baseSig As String, sig As String
+    Dim oProd As Product, colNode As Collection
+    Dim oPart As Part, oPartDoc As PartDocument
+    Dim oDoc As Object, homeWin As Object, homeDoc As Document
+    Dim bodyNames As Variant
+    Dim colWasShown As Collection, colWasHidden As Collection
+    Dim colFb As Collection
+    Dim t As Double, sceneOK As Boolean, isAll As Boolean
+
+    If mJobRow.Count = 0 Then Exit Sub
+
+    If oViewer Is Nothing Then
+        For j = 1 To mJobRow.Count
+            Call XlPutCell(xlSheet, mJobRow(j), 1, "No Viewer")
+        Next j
         Exit Sub
     End If
 
-    ' --- 4. EXCEL SETUP ---
+    Call LogLine(mSheetName & ": " & mJobRow.Count & " pictures")
     On Error Resume Next
-    Set xlApp = GetObject(, "Excel.Application")
-    If Err.Number <> 0 Then Set xlApp = CreateObject("Excel.Application")
-    On Error GoTo Fail
+    Set homeWin = Nothing
+    Set homeWin = CATIA.ActiveWindow
+    Set homeDoc = Nothing
+    Set homeDoc = CATIA.ActiveDocument
+    Err.Clear
+    On Error GoTo 0
+    Set colFb = New Collection
 
-    xlApp.Visible = True
-    xlApp.ScreenUpdating = False
-    Set xlBook = xlApp.Workbooks.Add
-    Set xlSheet = xlBook.Sheets(1)
+    ' --- 1. the component as it is ---
+    fullPath = mTempDir & "\s" & mSheetNo & "_full.jpg"
+    fullSig = ""
+    If CaptureViewToFile(oViewer, fullPath) Then fullSig = FileSignature(fullPath)
 
+    ' --- 2. windows of their own ---
+    For j = 1 To mJobRow.Count
+        Call CheckExcel                       ' no hour of pictures into a closed Excel
+        rowNo = mJobRow(j)
+        kind = mJobKind(j)
+        key = mJobKey(j)
+        bodyName = mJobBody(j)
+        pn = ""
+        If Len(key) > 0 Then
+            If mPartNum.Exists(key) Then pn = mPartNum(key)
+        End If
+        what = kind
+        If Len(pn) > 0 Then what = kind & " " & pn
+        If Len(bodyName) > 0 Then what = what & " / " & bodyName
+        Call SetStatus("BOM " & mSheetName & ": picture " & j & " of " & mJobRow.Count & " - " & what)
+        Call LogLine(mSheetName & "  picture " & j & "/" & mJobRow.Count & "  " & what)
+        t = Timer
+        picPath = ""
+
+        Select Case kind
+            Case "UNIT"
+                If Len(fullSig) > 0 Then picPath = fullPath
+
+            Case "PART"
+                shotKey = "P|" & pn
+                picPath = CachedShot(shotKey)
+                If Len(picPath) = 0 And PICTURES_IN_OWN_WINDOW Then
+                    Set oProd = mRef(key)
+                    If PartDocOf(oProd, pn, oPart, oPartDoc) Then
+                        picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, Nothing, Empty, "", "")
+                    End If
+                End If
+
+            Case "BODY"
+                shotKey = "B|" & pn & "|" & bodyName
+                picPath = CachedShot(shotKey)
+                If Len(picPath) = 0 And mBodies.Exists(pn) Then
+                    Set oProd = mRef(key)
+                    If PartDocOf(oProd, pn, oPart, oPartDoc) Then
+                        bodyNames = mBodies(pn)
+                        picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, oPart, bodyNames, _
+                                                  bodyName, "P|" & pn)
+                    End If
+                End If
+
+            Case "ASSY"
+                shotKey = "A|" & pn
+                picPath = CachedShot(shotKey)
+                If Len(picPath) = 0 And PICTURES_IN_OWN_WINDOW And Not homeDoc Is Nothing Then
+                    Set oProd = mRef(key)
+                    Set oDoc = OwnDocumentOf(oProd, pn, homeDoc)
+                    If Not oDoc Is Nothing Then
+                        picPath = ShotInOwnWindow(oDoc, homeWin, shotKey, Nothing, Empty, "", "")
+                    End If
+                End If
+        End Select
+
+        If Len(picPath) > 0 Then
+            If Not XlInsertPicture(xlSheet, rowNo, picPath) Then Call XlPutCell(xlSheet, rowNo, 1, "No Preview")
+        ElseIf kind = "PART" Or kind = "ASSY" Then
+            colFb.Add j                       ' tried below, by show / hide
+        Else
+            Call XlPutCell(xlSheet, rowNo, 1, "No Preview")
+        End If
+
+        If Elapsed(t) >= SLOW_STEP_SECONDS Then
+            Call NoteSlow(Elapsed(t), mSheetName & "  picture of row " & rowNo & "  " & what)
+        End If
+        Call SaveWorkbook(False)                  ' at most every SAVE_EVERY_SECONDS
+        DoEvents
+    Next j
+
+    ' --- 3. the rest by show / hide ---
+    If colFb.Count > 0 Then
+        Call LogLine(mSheetName & ": " & colFb.Count & " pictures by show / hide")
+        If PRESERVE_VISIBILITY Then
+            Set colWasShown = New Collection
+            Set colWasHidden = New Collection
+            Call SplitByShowState(sel, mAllNodes, colWasShown, colWasHidden)
+        End If
+        ' every assembly visible (a hidden one hides its whole subtree), every
+        ' part hidden
+        Call SetShowCollection(sel, mAssyNodes, 0)
+        Call SetShowCollection(sel, mLeaves, 1)
+        Call Settle(100)
+
+        ' with every part hidden the view must differ from the whole component -
+        ' if it does not, hiding has no effect in this window and every picture
+        ' would show the whole component
+        sceneOK = True
+        baseSig = ""
+        basePath = mTempDir & "\s" & mSheetNo & "_base.jpg"
+        If CaptureViewToFile(oViewer, basePath) Then baseSig = FileSignature(basePath)
+        If Len(fullSig) > 0 And baseSig = fullSig Then
+            sceneOK = False
+            Call LogLine(mSheetName & ": hiding the parts does not change the view - " & _
+                         colFb.Count & " pictures left out (No Preview)")
+        End If
+
+        For i = 1 To colFb.Count
+            Call CheckExcel
+            j = colFb(i)
+            rowNo = mJobRow(j)
+            kind = mJobKind(j)
+            key = mJobKey(j)
+            pn = ""
+            If mPartNum.Exists(key) Then pn = mPartNum(key)
+            picPath = ""
+            t = Timer
+
+            If sceneOK Then
+                Call SetStatus("BOM " & mSheetName & ": picture (show / hide) " & i & " of " & colFb.Count)
+                Call LogLine(mSheetName & "  picture (show / hide) " & i & "/" & colFb.Count & "  " & kind & " " & pn)
+                mShotNo = mShotNo + 1
+                picPath = mTempDir & "\shot" & mShotNo & ".jpg"
+                isAll = False                 ' does this row show the whole component?
+                If kind = "ASSY" Then
+                    Set colNode = Nothing
+                    If mNodeLeaves.Exists(key) Then Set colNode = mNodeLeaves(key)
+                    If Not colNode Is Nothing Then
+                        isAll = (colNode.Count >= mLeaves.Count)
+                        If colNode.Count > 0 And colNode.Count <= MAX_ASSY_LEAVES_FOR_SHOT Then
+                            Call SetShowCollection(sel, colNode, 0)
+                            Call Settle(ASSY_SETTLE_MS)
+                            Call CaptureViewToFile(oViewer, picPath)
+                            Call SetShowCollection(sel, colNode, 1)
+                        End If
+                    End If
+                Else
+                    isAll = (mLeaves.Count <= 1)
+                    Set oProd = mRef(key)
+                    Call SetShowSingle(sel, oProd, 0)
+                    Call Settle(PART_SETTLE_MS)
+                    Call CaptureViewToFile(oViewer, picPath)
+                    Call SetShowSingle(sel, oProd, 1)
+                End If
+
+                If mFso.FileExists(picPath) Then
+                    ' nothing visible, or the whole component for a row that is
+                    ' only a piece of it: no picture of THIS row
+                    sig = FileSignature(picPath)
+                    If sig = baseSig Or (sig = fullSig And Not isAll) Then
+                        On Error Resume Next
+                        mFso.DeleteFile picPath, True
+                        Err.Clear
+                        On Error GoTo 0
+                        picPath = ""
+                    Else
+                        If kind = "ASSY" Then shotKey = "A|" & pn Else shotKey = "P|" & pn
+                        If Not mShotFiles.Exists(shotKey) Then
+                            mShotFiles.Add shotKey, picPath
+                            mShotSigs.Add shotKey, sig
+                        End If
+                    End If
+                Else
+                    picPath = ""
+                End If
+            End If
+
+            If Len(picPath) > 0 Then
+                If Not XlInsertPicture(xlSheet, rowNo, picPath) Then Call XlPutCell(xlSheet, rowNo, 1, "No Preview")
+            Else
+                Call XlPutCell(xlSheet, rowNo, 1, "No Preview")
+            End If
+            If Elapsed(t) >= SLOW_STEP_SECONDS Then
+                Call NoteSlow(Elapsed(t), mSheetName & "  picture of row " & rowNo & "  " & kind & " " & pn)
+            End If
+            Call SaveWorkbook(False)
+            DoEvents
+        Next i
+
+        ' --- back to normal ---
+        Call RestoreVisibility(sel, mLeaves, colWasShown, colWasHidden)
+    End If
+
+    On Error Resume Next
+    If mFso.FileExists(fullPath) Then mFso.DeleteFile fullPath, True
+    If Len(basePath) > 0 Then
+        If mFso.FileExists(basePath) Then mFso.DeleteFile basePath, True
+    End If
+    CATIA.StatusBar = ""
+    Err.Clear
+    On Error GoTo 0
+End Sub
+
+
+' ==============================================================================
+' HELPER: ONE PICTURE IN A WINDOW OF ITS OWN
+' The document (a CATPart, or a sub-assembly's CATProduct) is opened in a new
+' window - it is alone there, so nothing in the product has to be hidden.
+' For a body picture the other bodies of the part are hidden in that window.
+' refKey: the picture a body picture must differ from (the whole part).
+' Returns the picture file, or "" when there is none.
+' ==============================================================================
+Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKey As String, _
+                                 oPart As Part, bodyNames As Variant, ByVal bodyName As String, _
+                                 ByVal refKey As String) As String
+    Dim w As Object, v As Viewer, partSel As Selection, oBody As Body
+    Dim picPath As String, sig As String, ok As Boolean, isolated As Boolean
+
+    ShotInOwnWindow = ""
+    mShotNo = mShotNo + 1
+    picPath = mTempDir & "\shot" & mShotNo & ".jpg"
+
+    On Error Resume Next
+    Set w = Nothing
+    Set w = oDoc.NewWindow
+    If w Is Nothing Then
+        Err.Clear
+        Exit Function
+    End If
+    w.Activate
+    Set v = Nothing
+    Set v = w.ActiveViewer
+    w.Layout = catWindowGeomOnly             ' no specification tree in the picture
+    ' every new window starts with its own compass (the window is closed
+    ' again, so nothing has to be put back)
+    If mCompassToggled Then Call ToggleCompass
+    Err.Clear
+
+    If Len(bodyName) > 0 And Not oPart Is Nothing Then
+        Set partSel = oDoc.Selection
+        Call SetShowBodyList(oPart, partSel, bodyNames, 1)
+        Set oBody = GetBodyByName(oPart, bodyName)
+        partSel.Clear
+        partSel.Add oBody
+        partSel.VisProperties.SetShow 0
+        partSel.Clear
+        isolated = True
+        Err.Clear
+    End If
+
+    If Not v Is Nothing Then
+        If SET_ISO_VIEW Then Call SetIsoViewpoint(v)
+        Call Settle(ASSY_SETTLE_MS)
+        ok = CaptureViewToFile(v, picPath)
+    End If
+
+    If isolated Then Call SetShowBodyList(oPart, partSel, bodyNames, 0)
+    w.Close
+    Err.Clear
+    If Not homeWin Is Nothing Then homeWin.Activate
+    Err.Clear
+    On Error GoTo 0
+    If Not ok Then Exit Function
+
+    sig = FileSignature(picPath)
+    ' a body picture equal to the picture of the whole part: hiding the other
+    ' bodies had no effect - no picture rather than a wrong one
+    If Len(refKey) > 0 Then
+        If mShotSigs.Exists(refKey) Then
+            If mShotSigs(refKey) = sig Then
+                On Error Resume Next
+                mFso.DeleteFile picPath, True
+                Err.Clear
+                On Error GoTo 0
+                Exit Function
+            End If
+        End If
+    End If
+
+    If Not mShotFiles.Exists(shotKey) Then
+        mShotFiles.Add shotKey, picPath
+        mShotSigs.Add shotKey, sig
+    End If
+    ShotInOwnWindow = picPath
+End Function
+
+' the picture file of a part / body / assembly that was already taken in this run
+Private Function CachedShot(ByVal shotKey As String) As String
+    CachedShot = ""
+    If mShotFiles Is Nothing Then Exit Function
+    If Not mShotFiles.Exists(shotKey) Then Exit Function
+    If mFso.FileExists(CStr(mShotFiles(shotKey))) Then CachedShot = CStr(mShotFiles(shotKey))
+End Function
+
+' the CATPart of a picture row: the one pass 1 found, else found again
+Private Function PartDocOf(oProd As Product, ByVal pn As String, ByRef oPart As Part, _
+                           ByRef oPartDoc As PartDocument) As Boolean
+    Dim ok As Boolean
+
+    ok = False
+    Set oPart = Nothing
+    Set oPartDoc = Nothing
+    If Not mPartDocs Is Nothing Then
+        If mPartDocs.Exists(pn) Then
+            On Error Resume Next
+            Set oPartDoc = mPartDocs(pn)
+            Set oPart = oPartDoc.Part
+            ok = (Err.Number = 0) And Not (oPart Is Nothing)
+            Err.Clear
+            On Error GoTo 0
+        End If
+    End If
+    If Not ok Then ok = LoadPartDocument(oProd, oPart, oPartDoc)
+    PartDocOf = ok
+End Function
+
+' a fingerprint of a picture file: two captures of an unchanged view are the
+' same file, byte for byte
+Private Function FileSignature(ByVal path As String) As String
+    Dim f As Integer, n As Long, i As Long
+    Dim b() As Byte, h1 As Double, h2 As Double
+
+    FileSignature = ""
+    On Error Resume Next
+    f = FreeFile
+    Err.Clear
+    Open path For Binary Access Read As #f
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    n = LOF(f)
+    If n > 0 Then
+        ReDim b(0 To n - 1)
+        Get #f, 1, b
+        For i = 0 To n - 1
+            h1 = h1 * 31# + b(i)
+            h1 = h1 - Int(h1 / 2147483647#) * 2147483647#
+            h2 = h2 * 37# + b(i)
+            h2 = h2 - Int(h2 / 2147483629#) * 2147483629#
+        Next i
+    End If
+    Close #f
+    Err.Clear
+    FileSignature = n & ":" & h1 & ":" & h2
+End Function
+
+
+' ==============================================================================
+' HELPER: REFRAME + CAPTURE THE CURRENT VIEW INTO A FILE
+' ==============================================================================
+Private Function CaptureViewToFile(oViewer As Viewer, ByVal picPath As String) As Boolean
+    On Error Resume Next
+    CaptureViewToFile = False
+    If oViewer Is Nothing Then Exit Function
+
+    oViewer.Reframe
+    oViewer.Update
+    Call Settle(PART_SETTLE_MS)
+
+    If mFso.FileExists(picPath) Then mFso.DeleteFile picPath
+    ' 5 = JPEG (small file, fast to insert); 4 = BMP as fallback for releases
+    ' that refuse JPEG - a BMP of a full viewer is several MB
+    oViewer.CaptureToFile 5, picPath
+    If Not mFso.FileExists(picPath) Then
+        Err.Clear
+        oViewer.CaptureToFile 4, picPath
+    End If
+    CaptureViewToFile = mFso.FileExists(picPath)
+    Err.Clear
+End Function
+
+
+' ==============================================================================
+' HELPER: NOTE A PICTURE THAT PASS 2 HAS TO TAKE
+' ==============================================================================
+Private Sub AddJob(ByVal rowNo As Long, ByVal kind As String, ByVal key As String, _
+                   ByVal bodyName As String)
+    mJobRow.Add rowNo
+    mJobKind.Add kind
+    mJobKey.Add key
+    mJobBody.Add bodyName
+End Sub
+
+
+' ==============================================================================
+' HELPER: FRESH ROW DATA FOR A NEW SHEET
+' ==============================================================================
+Private Sub ResetSheetData()
+    Set mQty = CreateObject("Scripting.Dictionary")
+    Set mRef = CreateObject("Scripting.Dictionary")
+    Set mDesc = CreateObject("Scripting.Dictionary")
+    Set mProps = CreateObject("Scripting.Dictionary")
+    Set mLevel = CreateObject("Scripting.Dictionary")
+    Set mBodies = CreateObject("Scripting.Dictionary")
+    Set mPartNum = CreateObject("Scripting.Dictionary")
+    Set mFirst = CreateObject("Scripting.Dictionary")
+    Set mIsAssy = CreateObject("Scripting.Dictionary")
+    Set mNodeLeaves = CreateObject("Scripting.Dictionary")
+    Set mLeaves = New Collection
+    Set mAllNodes = New Collection
+    Set mAssyNodes = New Collection
+    Set mJobRow = New Collection
+    Set mJobKind = New Collection
+    Set mJobKey = New Collection
+    Set mJobBody = New Collection
+    Set mBoldRows = New Collection
+    Set mAssyRows = New Collection
+    ReDim mBuf(1 To 15, 1 To 256)
+    mBufRows = 0
+    mFlushed = False
+    Set mLostBlocks = CreateObject("Scripting.Dictionary")
+    mSheetNo = mSheetNo + 1
+End Sub
+
+
+' ==============================================================================
+' HELPER: THE ROW BUFFER OF THE SHEET BEING WRITTEN
+' The rows are collected in memory and go into Excel in a few big blocks
+' (FlushSheet) instead of one cross-process call per cell.
+' ==============================================================================
+Private Sub BufSet(ByVal r As Long, ByVal c As Long, ByVal v As Variant)
+    Dim i As Long, n As Long
+    i = r - 1                                   ' sheet row 2 = buffer row 1
+    If i < 1 Or c < 1 Or c > 15 Then Exit Sub
+    n = UBound(mBuf, 2)
+    If i > n Then
+        Do While n < i
+            n = n * 2
+        Loop
+        ReDim Preserve mBuf(1 To 15, 1 To n)
+    End If
+    mBuf(c, i) = v
+    If i > mBufRows Then mBufRows = i
+End Sub
+
+' a value > 0, otherwise "N/A"
+Private Sub PutNumber(ByVal r As Long, ByVal c As Long, ByVal v As Variant)
+    If IsNumeric(v) Then
+        If CDbl(v) > 0 Then
+            Call BufSet(r, c, CDbl(v))
+            Exit Sub
+        End If
+    End If
+    Call BufSet(r, c, "N/A")
+End Sub
+
+' writes the buffer to the sheet (rows 2 ...) in blocks of 500 rows
+' onlyLost = True writes only the blocks an earlier flush could not write.
+' Returns the number of rows Excel did not take.
+Private Function FlushSheet(xlSheet As Object, ByVal onlyLost As Boolean) As Long
+    Const BLOCK_ROWS As Long = 500
+    Dim arr() As Variant, rowArr() As Variant
+    Dim i0 As Long, n As Long, i As Long, c As Variant, k As Long
+    Dim rr As Variant, nLost As Long, nBlockLost As Long, v As Variant
+
+    mFlushed = True
+    FlushSheet = 0
+    If mBufRows = 0 Then Exit Function
+
+    Call SetStatus("BOM " & mSheetName & ": writing " & mBufRows & " rows to Excel ...")
+    For i0 = 1 To mBufRows Step BLOCK_ROWS
+        If onlyLost And Not mLostBlocks.Exists(i0) Then GoTo NextBlock
+        n = mBufRows - i0 + 1
+        If n > BLOCK_ROWS Then n = BLOCK_ROWS
+        ReDim arr(1 To n, 1 To 15)
+        For i = 1 To n
+            For k = 1 To 15
+                arr(i, k) = mBuf(k, i0 + i - 1)
+            Next k
+        Next i
+        nBlockLost = 0
+        If onlyLost And Not mXlLost Then
+            ' its long-text cells may have been set to General after the first
+            ' try - text again, so nothing is read as a formula
+            Call XlReady
+            On Error Resume Next
+            xlSheet.Range(xlSheet.Cells(i0 + 1, 4), xlSheet.Cells(i0 + n, 4)).NumberFormat = "@"
+            xlSheet.Range(xlSheet.Cells(i0 + 1, 14), xlSheet.Cells(i0 + n, 14)).NumberFormat = "@"
+            Err.Clear
+            On Error GoTo 0
+        End If
+        If Not XlWriteBlock(xlSheet, i0 + 1, 1, arr) Then
+            If mXlLost Or mXlLastErr = 0 Then
+                nBlockLost = n                       ' Excel gone, or the user skipped
+            Else
+                ' Excel refused a VALUE: row by row, so it costs one row, not 500
+                Call LogLine(mSheetName & ": block from row " & (i0 + 1) & " refused - writing it row by row")
+                ReDim rowArr(1 To 1, 1 To 15)
+                For i = 1 To n
+                    For k = 1 To 15
+                        rowArr(1, k) = mBuf(k, i0 + i - 1)
+                    Next k
+                    If Not XlWriteBlock(xlSheet, i0 + i, 1, rowArr) Then nBlockLost = nBlockLost + 1
+                Next i
+            End If
+        End If
+        If nBlockLost > 0 Then
+            If Not mLostBlocks.Exists(i0) Then mLostBlocks.Add i0, True
+        ElseIf mLostBlocks.Exists(i0) Then
+            mLostBlocks.Remove i0
+        End If
+        nLost = nLost + nBlockLost
+NextBlock:
+    Next i0
+
+    If Not mXlLost Then
+        Call XlReady
+        On Error Resume Next
+        ' assembly rows in bold - only looks, so a failure here is ignored
+        For Each rr In mBoldRows
+            xlSheet.Range(xlSheet.Cells(rr, 2), xlSheet.Cells(rr, 15)).Font.Bold = True
+        Next rr
+        ' a text cell shows more than 255 characters only as #####: back to
+        ' General (the value stays the text it is)
+        For i = 1 To mBufRows
+            For Each c In Array(4, 14)
+                v = mBuf(c, i)
+                If VarType(v) = vbString Then
+                    If Len(v) > 255 Then xlSheet.Cells(i + 1, c).NumberFormat = "General"
+                End If
+            Next c
+        Next i
+        Err.Clear
+        On Error GoTo 0
+    End If
+    FlushSheet = nLost
+End Function
+
+' a header or rows Excel did not take: one more try before the pictures (the
+' user may have freed Excel meanwhile). The whole buffer is written again -
+' the same values, so nothing is doubled.
+Private Sub RetryLostWrites(xlSheet As Object, ByRef hdrOK As Boolean, ByRef nLost As Long)
+    If hdrOK And nLost = 0 Then Exit Sub
+    If mXlLost Then Exit Sub
+    Call LogLine(mSheetName & ": writing again what Excel did not take")
+    mXlSkipAt = -1
+    If Not hdrOK Then
+        hdrOK = WriteHeader(xlSheet)
+        If hdrOK Then
+            ' the text formats came late: every row again, so part numbers
+            ' that were written as numbers become text (same values)
+            nLost = FlushSheet(xlSheet, False)
+        ElseIf nLost > 0 Then
+            ' header / formats still failing: at least the lost rows
+            nLost = FlushSheet(xlSheet, True)
+        End If
+    ElseIf nLost > 0 Then
+        nLost = FlushSheet(xlSheet, True)
+    End If
+End Sub
+
+Private Function SheetLostText(ByVal hdrOK As Boolean, ByVal nLost As Long) As String
+    Dim s As String
+    s = "INCOMPLETE: "
+    If Not hdrOK Then s = s & "the header row"
+    If Not hdrOK And nLost > 0 Then s = s & " and "
+    If nLost > 0 Then s = s & nLost & " rows"
+    SheetLostText = s & " could not be written to Excel"
+End Function
+
+
+' ==============================================================================
+' HELPER: THE COLUMN HEADERS OF A BOM SHEET
+' (identical on every sheet, so every sheet imports into the ACE cost model)
+' ==============================================================================
+Private Function WriteHeader(xlSheet As Object) As Boolean
+    Dim h As Variant, a(1 To 1, 1 To 15) As Variant
+    Dim i As Long, fmtOK As Boolean
+
+    h = Array("Thumbnail", "Level", "Part Number", "Description", "Qty", _
+              "Mass (kg)", "Volume (m3)", "Area (m2)", "Length (mm)", "Width (mm)", _
+              "Height (mm)", "Material", "Density (kg/m3)", "First Level", "Type")
+    For i = 0 To 14
+        a(1, i + 1) = h(i)
+    Next i
+
+    ' the formats first: every text column stays TEXT - part numbers keep
+    ' leading zeros, "1E5" stays "1E5", and a description like "+X PANEL" or
+    ' "-Y WALL" is not taken for a formula (#NAME? or a refused block)
+    Call XlReady
+    On Error Resume Next
+    Err.Clear
     With xlSheet
-        .Cells(1, 1).Value = "Thumbnail"
-        .Cells(1, 2).Value = "Level"
-        .Cells(1, 3).Value = "Part Number"
-        .Cells(1, 4).Value = "Description"
-        .Cells(1, 5).Value = "Qty"
-        .Cells(1, 6).Value = "Mass (kg)"
-        .Cells(1, 7).Value = "Volume (m3)"
-        .Cells(1, 8).Value = "Area (m2)"
-        .Cells(1, 9).Value = "Length (mm)"
-        .Cells(1, 10).Value = "Width (mm)"
-        .Cells(1, 11).Value = "Height (mm)"
-        .Cells(1, 12).Value = "Material"
-        .Cells(1, 13).Value = "Density (kg/m3)"
-        .Cells(1, 14).Value = "First Level"
-        .Cells(1, 15).Value = "Type"
-
-        .Range("A1:O1").Font.Bold = True
-        .Range("A1:O1").Interior.Color = RGB(220, 220, 220)
+        .Columns("A:A").NumberFormat = "@"
+        .Columns("C:D").NumberFormat = "@"
+        .Columns("L:L").NumberFormat = "@"
+        .Columns("N:N").NumberFormat = "@"
+    End With
+    fmtOK = (Err.Number = 0)              ' (an error under Resume Next stays in Err)
+    Err.Clear
+    ' looks only - a failure here does not count
+    With xlSheet
         .Columns("A:A").ColumnWidth = 15
         .Columns("B:B").ColumnWidth = 8
         .Columns("C:D").ColumnWidth = 20
@@ -375,362 +2142,1162 @@ Private Sub RunBOM()
         .Columns("M:M").NumberFormat = "0.000"
         .Columns("N:N").ColumnWidth = 22
         .Columns("O:O").ColumnWidth = 10
+        .Range("A1:O1").Font.Bold = True
+        .Range("A1:O1").Interior.Color = RGB(220, 220, 220)
     End With
-    r = 2
-
-    ' --- 5. SCREENSHOT SESSION SETUP (done ONCE, not per part) ---
-    ' The specification tree is switched off through the window LAYOUT. The old
-    ' StartCommand "Specification Tree Display" only works on an English CATIA -
-    ' on any other language it silently does nothing and the tree stays in every
-    ' picture.
-    Set oViewer = Nothing
-    On Error Resume Next
-    Set oWin = CATIA.ActiveWindow
-    Set oViewer = oWin.ActiveViewer
-
-    savedLayout = -1
-    savedLayout = oWin.Layout
-    oWin.Layout = catWindowGeomOnly            ' geometry only - no spec tree
-    viewToggled = (Err.Number = 0)
     Err.Clear
+    On Error GoTo 0
 
-    ' the compass has no automation property, only a translated command name
-    If Len(COMPASS_COMMAND) > 0 Then
-        CATIA.StartCommand COMPASS_COMMAND
-        compassToggled = (Err.Number = 0)
-        Err.Clear
-    End If
+    ' success = the formats AND the header row: rows written before the text
+    ' formats would lose leading zeros, so a late format means a new flush
+    WriteHeader = XlWriteBlock(xlSheet, 1, 1, a) And fmtOK
+End Function
 
-    If SET_ISO_VIEW Then Call SetIsoViewpoint(oViewer)
-    Call Settle(100)
-    On Error GoTo Fail
 
-    ' Visibility baseline for the whole run:
-    '   1. remember the previous state, if the user wants it back afterwards
-    '   2. SHOW every node - a hidden sub-assembly would blank out every picture
-    '      of the parts below it, whatever their own state says
-    '   3. HIDE every leaf, so the scene is empty and one leaf can be shown at
-    '      a time
-    If PRESERVE_VISIBILITY Then
-        Set colWasShown = New Collection
-        Set colWasHidden = New Collection
-        Call SplitByShowState(sel, mAllNodes, colWasShown, colWasHidden)
-    End If
-    Call SetShowCollection(sel, mAllNodes, 0)
-    Call SetShowCollection(sel, colLeaves, 1)
-    Call Settle(100)
-
-    ' --- 6. PROCESS UNIQUE ROWS (sub-assemblies and parts, in tree order) ---
-    For Each uniqueKey In dictQty.Keys
-
-        strPartNum = dictPartNum(uniqueKey)
-        Set oPartProd = dictRef(uniqueKey)
-        isAssy = dictIsAssy(uniqueKey)
-
-        If isAssy Then nAssyRows = nAssyRows + 1 Else nPartRows = nPartRows + 1
-
-        ' Write Level + Basic Data + Pre-Calculated Mass
-        xlSheet.Cells(r, 2).Value = dictLevel(uniqueKey)
-        xlSheet.Cells(r, 3).Value = strPartNum
-        xlSheet.Cells(r, 4).Value = dictDesc(uniqueKey)
-        xlSheet.Cells(r, 5).Value = dictQty(uniqueKey)
-        xlSheet.Cells(r, 14).Value = dictFirst(uniqueKey)
-        If isAssy Then
-            xlSheet.Cells(r, 15).Value = "Assembly"
-            xlSheet.Range(xlSheet.Cells(r, 2), xlSheet.Cells(r, 15)).Font.Bold = True
-        Else
-            xlSheet.Cells(r, 15).Value = "Part"
-        End If
-
-        ' Promote THIS node to design mode FIRST: mass, volume, area and the
-        ' inertia box all come back as 0 on a component that is still in
-        ' visualization mode. On an assembly node the call is recursive, so the
-        ' first one can take a while - that is the price of having the numbers,
-        ' and PROMOTE_ASSEMBLY_ROWS switches it off.
-        If (Not isAssy) Or PROMOTE_ASSEMBLY_ROWS Then
-            On Error Resume Next
-            CATIA.StatusBar = "BOM: loading " & strPartNum & " ..."
-            oPartProd.ApplyWorkMode 2
-            Err.Clear
-            On Error GoTo Fail
-        End If
-
-        ' Try to read part data without opening any window
-        ' (a sub-assembly has no CATPart of its own)
-        hasPart = False
-        Set oPart = Nothing
-        Set oPartDoc = Nothing
-        If Not isAssy Then hasPart = TryGetLoadedPart(oPartProd, oPart, oPartDoc)
-
-        ' multi-body detection moved out of the traversal: it needs a loaded
-        ' CATPart, and doing it here keeps the traversal free of any loading
-        If hasPart And DETECT_MULTIBODY And Not mBodyCache.Exists(strPartNum) Then
-            mBodyCache.Add strPartNum, True
-            nSolid = GetSolidBodyNames(oPart, solidNames)
-            If nSolid > 1 Then
-                If Not dictBodies.Exists(strPartNum) Then dictBodies.Add strPartNum, solidNames
-            End If
-        End If
-
-        ' --- MASS / VOLUME / AREA (now that the node is loaded) ---
-        ' A zero result is NOT cached: it usually means "this instance could not
-        ' be loaded", and caching it would condemn every other row that shares
-        ' the part number.
-        If mPropCache.Exists(strPartNum) Then
-            propsArray = mPropCache(strPartNum)
-        Else
-            dMass = 0: dVol = 0: dArea = 0
-            If (Not isAssy) Or ASSEMBLY_METRICS Then
-                Call ReadProductProps(oPartProd, dMass, dVol, dArea, isAssy)
-            End If
-            propsArray = Array(dMass, dVol, dArea)
-            If dMass > 0 Or dVol > 0 Or dArea > 0 Then mPropCache.Add strPartNum, propsArray
-        End If
-
-        If propsArray(0) > 0 Then xlSheet.Cells(r, 6).Value = propsArray(0) Else xlSheet.Cells(r, 6).Value = "N/A"
-        If propsArray(1) > 0 Then xlSheet.Cells(r, 7).Value = propsArray(1) Else xlSheet.Cells(r, 7).Value = "N/A"
-        If propsArray(2) > 0 Then xlSheet.Cells(r, 8).Value = propsArray(2) Else xlSheet.Cells(r, 8).Value = "N/A"
-
-        ' --- MATERIAL & DENSITY (measured once per part number) ---
-        strMatName = "N/A"
-        dDensity = 0
-        If hasPart Then
-            If mMatCache.Exists(strPartNum) Then
-                cacheArr = mMatCache(strPartNum)
-                strMatName = CStr(cacheArr(0))
-                dDensity = CDbl(cacheArr(1))
-            Else
-                Call GetMaterialAndDensity(oPart, strMatName, dDensity)
-                If dDensity > 0 Or strMatName <> "N/A" Then _
-                    mMatCache.Add strPartNum, Array(strMatName, dDensity)
-            End If
-        End If
-
-        xlSheet.Cells(r, 12).Value = strMatName
-        If dDensity > 0 Then
-            xlSheet.Cells(r, 13).Value = dDensity
-        Else
-            xlSheet.Cells(r, 13).Value = "N/A"
-        End If
-
-        ' --- DIMENSIONS (measured once per part number) ---
-        dims(0) = 0: dims(1) = 0: dims(2) = 0
-
-        If mDimCache.Exists(strPartNum) Then
-            cacheArr = mDimCache(strPartNum)
-            dims(0) = CDbl(cacheArr(0)): dims(1) = CDbl(cacheArr(1)): dims(2) = CDbl(cacheArr(2))
-        Else
-            ' only in "BOX" mode: this creates temporary geometry in the CATPart
-            If hasPart And UCase$(MEASURE_MODE) = "BOX" Then Call GetBoundingBoxDims(oPart, dims)
-
-            If dims(0) < 0.1 Then
-                ' equivalent box from the inertia - reads only, creates nothing.
-                ' ReferenceProduct itself can raise on a node that is not loaded,
-                ' and that would abort the whole run with everything still hidden
-                On Error Resume Next
-                Call GetInertiaDims(oPartProd.ReferenceProduct, dims)
-                Err.Clear
-                On Error GoTo Fail
-            End If
-            If dims(0) > 0 Then mDimCache.Add strPartNum, Array(dims(0), dims(1), dims(2))
-        End If
-
-        ' numbers, not Format() strings - otherwise the columns are text
-        If dims(0) > 0 Then xlSheet.Cells(r, 9).Value = dims(0) Else xlSheet.Cells(r, 9).Value = "N/A"
-        If dims(1) > 0 Then xlSheet.Cells(r, 10).Value = dims(1) Else xlSheet.Cells(r, 10).Value = "N/A"
-        If dims(2) > 0 Then xlSheet.Cells(r, 11).Value = dims(2) Else xlSheet.Cells(r, 11).Value = "N/A"
-
-        ' --- SCREENSHOT ------------------------------------------------------
-        ' Part: show only that instance. Sub-assembly: show all leaf instances
-        ' below it (they were hidden one by one, so the node alone stays empty).
-        If isAssy Then
-            Set colNodeLeaves = Nothing
-            If dictNodeLeaves.Exists(uniqueKey) Then Set colNodeLeaves = dictNodeLeaves(uniqueKey)
-
-            If Not CAPTURE_ASSEMBLY_SHOTS Then
-                xlSheet.Cells(r, 1).Value = "-"
-            ElseIf colNodeLeaves Is Nothing Then
-                xlSheet.Cells(r, 1).Value = "No Preview"
-            ElseIf colNodeLeaves.Count = 0 Then
-                ' nothing with geometry below this node - the scene would be empty
-                xlSheet.Cells(r, 1).Value = "No Preview"
-            ElseIf colNodeLeaves.Count > MAX_ASSY_LEAVES_FOR_SHOT Then
-                ' showing and hiding thousands of leaves for one picture would
-                ' cost more than the whole rest of the run
-                xlSheet.Cells(r, 1).Value = colNodeLeaves.Count & " parts"
-            Else
-                Call SetShowCollection(sel, colNodeLeaves, 0)   ' 0 = SHOW
-                Call Settle(ASSY_SETTLE_MS)                     ' a whole branch has to redraw
-                Call CaptureViewToExcel(oViewer, xlSheet, r, tempPicPath, fso)
-                Call SetShowCollection(sel, colNodeLeaves, 1)   ' 1 = HIDE again
-            End If
-        ElseIf Not CAPTURE_PART_SHOTS Then
-            xlSheet.Cells(r, 1).Value = "-"
-        ElseIf Not oPartProd Is Nothing Then
-            Call SetShowSingle(sel, oPartProd, 0)   ' 0 = SHOW
-            Call Settle(PART_SETTLE_MS)
-            Call CaptureViewToExcel(oViewer, xlSheet, r, tempPicPath, fso)
-        Else
-            xlSheet.Cells(r, 1).Value = "No Preview"
-        End If
-
-        ' --- MULTI-BODY SUB-ROWS (part stays visible while its bodies cycle) ---
-        If hasPart And dictBodies.Exists(strPartNum) And Not oPartProd Is Nothing Then
-
-            bodyNames = dictBodies(strPartNum)
-            Set partSel = oPartDoc.Selection
-
-            ' Hide all solid bodies of this part in one shot
-            Call SetShowBodyList(oPart, partSel, bodyNames, 1)
-
-            For bi = LBound(bodyNames) To UBound(bodyNames)
-                Set oBody = GetBodyByName(oPart, CStr(bodyNames(bi)))
-                If Not oBody Is Nothing Then
-                    r = r + 1
-
-                    ' Tree info: body behaves like a sub-part, one level deeper
-                    xlSheet.Cells(r, 2).Value = dictLevel(uniqueKey) + 1
-                    xlSheet.Cells(r, 3).Value = "    " & CStr(bodyNames(bi))
-                    xlSheet.Cells(r, 4).Value = "Body of " & strPartNum
-                    xlSheet.Cells(r, 5).Value = dictQty(uniqueKey)
-                    xlSheet.Cells(r, 14).Value = dictFirst(uniqueKey)
-                    xlSheet.Cells(r, 15).Value = "Body"
-
-                    ' Show ONLY this body and capture it
-                    ' (it stays visible until measurements are done - the
-                    '  bounding box cannot be built on a hidden body)
-                    partSel.Clear
-                    partSel.Add oBody
-                    partSel.VisProperties.SetShow 0   ' 0 = SHOW
-                    Call Settle(PART_SETTLE_MS)
-                    Call CaptureViewToExcel(oViewer, xlSheet, r, tempPicPath, fso)
-
-                    ' --- BODY MEASUREMENTS ---
-                    bMass = 0: bVol = 0: bArea = 0
-                    bDens = 0: bDensInertia = 0
-                    bMat = "N/A"
-
-                    Call GetBodyMaterial(oPart, oBody, bMat, bDens)
-                    Call GetBodyMassAndDensity(oPartDoc, oBody, bMass, bDensInertia)
-                    If bDens <= 0 Then bDens = bDensInertia
-                    Call GetBodyVolumeArea(oPartDoc, oPart, oBody, bVol, bArea)
-                    If bMass <= 0 And bDens > 0 And bVol > 0 Then bMass = bVol * bDens
-
-                    If bMass > 0 Then xlSheet.Cells(r, 6).Value = bMass Else xlSheet.Cells(r, 6).Value = "N/A"
-                    If bVol > 0 Then xlSheet.Cells(r, 7).Value = bVol Else xlSheet.Cells(r, 7).Value = "N/A"
-                    If bArea > 0 Then xlSheet.Cells(r, 8).Value = bArea Else xlSheet.Cells(r, 8).Value = "N/A"
-
-                    dims(0) = 0: dims(1) = 0: dims(2) = 0
-                    If UCase$(MEASURE_MODE) = "BOX" Then
-                        If Not MeasureTarget(oPart, oBody, dims) Then
-                            ' Fallback: true axis-aligned box from extremum points
-                            Call MeasureAABBExtremum(oPart, oPartDoc, oBody, dims)
-                        End If
-                    End If
-                    ' equivalent box from the body inertia - creates nothing
-                    If dims(0) < 0.1 Then Call GetBodyInertiaDims(oPartDoc, oBody, dims)
-
-                    If dims(0) > 0 Then xlSheet.Cells(r, 9).Value = dims(0) Else xlSheet.Cells(r, 9).Value = "N/A"
-                    If dims(1) > 0 Then xlSheet.Cells(r, 10).Value = dims(1) Else xlSheet.Cells(r, 10).Value = "N/A"
-                    If dims(2) > 0 Then xlSheet.Cells(r, 11).Value = dims(2) Else xlSheet.Cells(r, 11).Value = "N/A"
-
-                    xlSheet.Cells(r, 12).Value = bMat
-                    If bDens > 0 Then
-                        xlSheet.Cells(r, 13).Value = bDens
-                    Else
-                        xlSheet.Cells(r, 13).Value = "N/A"
-                    End If
-
-                    ' Hide this body again before moving to the next one
-                    partSel.Clear
-                    partSel.Add oBody
-                    partSel.VisProperties.SetShow 1   ' 1 = HIDE
-                End If
-                Set oBody = Nothing
-            Next bi
-
-            ' Restore all bodies of this part to visible
-            Call SetShowBodyList(oPart, partSel, bodyNames, 0)
-        End If
-
-        ' Hide the part again before moving to the next one.
-        ' A sub-assembly node is NOT hidden here - its leaves were already
-        ' hidden again right after the screenshot, and hiding the node itself
-        ' would leave it invisible in the session.
-        If Not isAssy And Not oPartProd Is Nothing Then
-            Call SetShowSingle(sel, oPartProd, 1)   ' 1 = HIDE
-        End If
-
-        r = r + 1
-
-        ' keep CATIA alive and show progress - a run without this looks hung
-        On Error Resume Next
-        CATIA.StatusBar = "BOM: row " & (r - 2) & " of " & dictQty.Count & " ..."
-        Err.Clear
-        On Error GoTo Fail
-        DoEvents
-    Next uniqueKey
-
-    ' --- 7. RESTORE SCENE (done ONCE) ---
-    Call RestoreVisibility(sel, colLeaves, colWasShown, colWasHidden)
-
+' ==============================================================================
+' HELPER: FINISH A BOM SHEET (column widths + filter) AND SHOW IT
+' ==============================================================================
+Private Sub FinishSheetLayout(xlSheet As Object)
+    Call XlReady
     On Error Resume Next
-    If viewToggled And savedLayout >= 0 Then oWin.Layout = savedLayout
-    If compassToggled And Len(COMPASS_COMMAND) > 0 Then CATIA.StartCommand COMPASS_COMMAND
-    If Not oViewer Is Nothing Then oViewer.Reframe
-    CATIA.HSOSynchronized = True
-    CATIA.DisplayFileAlerts = True
-    CATIA.StatusBar = ""
-    Err.Clear
-    On Error GoTo Fail
-    sel.Clear
-
-    ' --- 8. FINALIZE EXCEL ---
-    xlApp.ScreenUpdating = True
     xlSheet.Columns("B:O").AutoFit
     xlSheet.Columns("A:A").ColumnWidth = 15
     xlSheet.Columns("N:N").ColumnWidth = 22
+    If Not xlSheet.AutoFilterMode Then xlSheet.Range("B1:O1").AutoFilter
+    xlSheet.Activate
+    mXlApp.ScreenUpdating = True
+    DoEvents
+    Err.Clear
+End Sub
 
-    ' filter on the header row: column N = first level, column O = Assembly/Part
+' the note of a sheet that could not be finished - in column Q, outside the
+' columns the ACE import reads
+Private Sub MarkSheetIncomplete(xlSheet As Object, ByVal statusTxt As String)
+    Call XlPutCell(xlSheet, 1, 17, "!! INCOMPLETE - " & statusTxt)
+    Call XlReady
     On Error Resume Next
-    xlSheet.Range("B1:O1").AutoFilter
-    On Error GoTo Fail
+    xlSheet.Cells(1, 17).Font.Color = RGB(200, 0, 0)
+    xlSheet.Tab.Color = RGB(255, 150, 120)
+    mXlApp.ScreenUpdating = True
+    Err.Clear
+End Sub
 
-    Dim modeName As String
-    If mIncludeSubassemblies Then modeName = "Assembly structure" Else modeName = "Part list"
 
-    MsgBox "BOM Exported Successfully!  (" & modeName & ")" & vbCrLf & _
-           "Rows written:     " & (r - 2) & vbCrLf & _
-           "  sub-assemblies: " & nAssyRows & vbCrLf & _
-           "  parts:          " & nPartRows & vbCrLf & _
-           "Time elapsed: " & Format(Timer - startTime, "0.0") & " seconds", vbInformation
-    Exit Sub
+' ==============================================================================
+' HELPER: THE INDEX SHEET
+' ==============================================================================
+Private Sub WriteIndexHeader(idxSheet As Object, ByVal splitLevel As Long, ByRef blockOK As Boolean)
+    Dim a(1 To 2, 1 To 12) As Variant
+    Dim it As Variant
 
-' ------------------------------------------------------------------------------
-' Something went wrong: put the model, CATIA and Excel back into a usable state
-' before reporting. Without this the run would leave every part hidden.
-' ------------------------------------------------------------------------------
-Fail:
-    Dim failMsg As String
-    failMsg = "The BOM run stopped with error " & Err.Number & " - " & Err.Description
+    ' 1. the text formats - once. Rows written before them are written again,
+    '    so part numbers keep their leading zeros; columns are never set to
+    '    text a second time (that would undo the General of long-text cells)
+    If Not mIdxFmtOK Then
+        Call XlReady
+        On Error Resume Next
+        Err.Clear
+        idxSheet.Columns("B:C").NumberFormat = "@"
+        idxSheet.Columns("F:G").NumberFormat = "@"
+        mIdxFmtOK = (Err.Number = 0)
+        Err.Clear
+        On Error GoTo 0
+        If mIdxFmtOK And mIdxEarly.Count > 0 Then
+            Call LogLine("Index formats came late - writing " & mIdxEarly.Count & " rows again")
+            For Each it In mIdxEarly
+                Call WriteIndexRow(idxSheet, CLng(it(0)), CLng(it(1)), CStr(it(2)), CStr(it(3)), _
+                                   CLng(it(4)), CLng(it(5)), CStr(it(6)), CStr(it(7)), CStr(it(8)), False)
+            Next it
+            Set mIdxEarly = New Collection
+        End If
+    End If
+
+    ' 2. the title and the column headers
+    If Not blockOK Then
+        a(1, 1) = "BOM split at level " & splitLevel & _
+                  "  -  quantities on a component sheet are per ONE piece of that component; " & _
+                  "column E says how many pieces the product contains"
+        a(2, 1) = "#"
+        a(2, 2) = "Component"
+        a(2, 3) = "Description"
+        a(2, 4) = "Level"
+        a(2, 5) = "Qty in product"
+        a(2, 6) = "First Level"
+        a(2, 7) = "Path"
+        a(2, 8) = "Sheet"
+        a(2, 9) = "Rows"
+        a(2, 10) = "Status"
+        a(2, 11) = "Seconds"
+        a(2, 12) = "Worked in"
+        blockOK = XlWriteBlock(idxSheet, 1, 1, a)
+        If blockOK Then
+            Call XlReady
+            On Error Resume Next
+            With idxSheet
+                .Cells(1, 1).Font.Italic = True
+                .Range("A2:L2").Font.Bold = True
+                .Range("A2:L2").Interior.Color = RGB(220, 220, 220)
+            End With
+            Err.Clear
+            On Error GoTo 0
+        End If
+    End If
+End Sub
+
+' withStatus = False (a replay) writes only A:G, so a result that is already
+' in I:L is never overwritten by "waiting ..."
+Private Function WriteIndexRow(idxSheet As Object, ByVal idxRow As Long, ByVal no As Long, _
+                               ByVal pn As String, ByVal desc As String, ByVal lvl As Long, _
+                               ByVal qty As Long, ByVal firstLevel As String, ByVal pathTxt As String, _
+                               ByVal sheetName As String, ByVal withStatus As Boolean) As Boolean
+    Dim a() As Variant
+    Dim ok As Boolean, c As Variant
+
+    If withStatus Then
+        ReDim a(1 To 1, 1 To 10)
+        a(1, 10) = "waiting ..."
+    Else
+        ReDim a(1 To 1, 1 To 7)
+    End If
+    If no > 0 Then a(1, 1) = no
+    a(1, 2) = pn
+    a(1, 3) = desc
+    If lvl > 0 Then a(1, 4) = lvl
+    a(1, 5) = qty
+    a(1, 6) = firstLevel
+    a(1, 7) = pathTxt
+    ok = XlWriteBlock(idxSheet, idxRow, 1, a)
+    WriteIndexRow = ok
+    If Not ok Then Exit Function
+
+    ' a text cell shows more than 255 characters only as #####: those cells go
+    ' back to General (the value stays the text it is)
+    If Len(desc) > 255 Or Len(firstLevel) > 255 Or Len(pathTxt) > 255 Then
+        Call XlReady
+        On Error Resume Next
+        For Each c In Array(3, 6, 7)
+            If Len(CStr(a(1, c))) > 255 Then idxSheet.Cells(idxRow, c).NumberFormat = "General"
+        Next c
+        Err.Clear
+        On Error GoTo 0
+    End If
+
+    If Len(sheetName) = 0 Then Exit Function
+    Call XlReady
+    On Error Resume Next
+    idxSheet.Hyperlinks.Add idxSheet.Cells(idxRow, 8), "", _
+                            "'" & Replace(sheetName, "'", "''") & "'!A1", "", sheetName
+    Err.Clear
+End Function
+
+Private Function WriteIndexResult(idxSheet As Object, ByVal idxRow As Long, ByVal nRows As Long, _
+                                  ByVal statusTxt As String, ByVal secs As Double, _
+                                  ByVal whereTxt As String) As Boolean
+    Dim a(1 To 1, 1 To 4) As Variant
+    Dim ok As Boolean
+
+    a(1, 1) = nRows
+    a(1, 2) = statusTxt
+    a(1, 3) = Round(secs, 1)
+    a(1, 4) = whereTxt
+    ok = XlWriteBlock(idxSheet, idxRow, 9, a)
+    WriteIndexResult = ok
+    If Not ok Then Exit Function
+
+    If statusTxt = "OK" Then Exit Function
+    Call XlReady
+    On Error Resume Next
+    idxSheet.Range(idxSheet.Cells(idxRow, 1), idxSheet.Cells(idxRow, 12)).Interior.Color = RGB(255, 220, 200)
+    Err.Clear
+End Function
+
+' the Index writes of the run: what Excel could not take is kept and written
+' again at the end (RedoIndexWrites), so no component is missing on the Index
+Private Sub NoteIndexRow(idxSheet As Object, ByVal idxRow As Long, ByVal no As Long, _
+                   ByVal pn As String, ByVal desc As String, ByVal lvl As Long, _
+                   ByVal qty As Long, ByVal firstLevel As String, ByVal pathTxt As String, _
+                   ByVal sheetName As String)
+    If Not WriteIndexRow(idxSheet, idxRow, no, pn, desc, lvl, qty, firstLevel, pathTxt, sheetName, True) Then
+        mIdxRedo.Add Array("ROW", idxRow, no, pn, desc, lvl, qty, firstLevel, pathTxt, sheetName)
+    ElseIf Not mIdxFmtOK Then
+        ' written before the text formats: once more after them
+        mIdxEarly.Add Array(idxRow, no, pn, desc, lvl, qty, firstLevel, pathTxt, sheetName)
+    End If
+End Sub
+
+Private Sub NoteIndexResult(idxSheet As Object, ByVal idxRow As Long, ByVal nRows As Long, _
+                      ByVal statusTxt As String, ByVal secs As Double, ByVal whereTxt As String)
+    If Not WriteIndexResult(idxSheet, idxRow, nRows, statusTxt, secs, whereTxt) Then
+        mIdxRedo.Add Array("RES", idxRow, nRows, statusTxt, secs, whereTxt)
+    End If
+End Sub
+
+Private Sub RedoIndexWrites(idxSheet As Object)
+    Dim it As Variant, ok As Boolean
+    If mIdxRedo Is Nothing Then Exit Sub
+    If mIdxRedo.Count = 0 Then Exit Sub
+    Call LogLine("writing " & mIdxRedo.Count & " Index entries again")
+    mXlSkipAt = -1
+    For Each it In mIdxRedo
+        If it(0) = "ROW" Then
+            ok = WriteIndexRow(idxSheet, CLng(it(1)), CLng(it(2)), CStr(it(3)), CStr(it(4)), _
+                               CLng(it(5)), CLng(it(6)), CStr(it(7)), CStr(it(8)), CStr(it(9)), False)
+        Else
+            ok = WriteIndexResult(idxSheet, CLng(it(1)), CLng(it(2)), CStr(it(3)), CDbl(it(4)), CStr(it(5)))
+        End If
+        If Not ok Then Call LogLine("Index row " & it(1) & " could not be written")
+    Next it
+    Set mIdxRedo = New Collection
+End Sub
+
+Private Sub FinishIndexLayout(idxSheet As Object)
+    Call XlReady
+    On Error Resume Next
+    idxSheet.Columns("A:L").AutoFit
+    idxSheet.Columns("A:A").ColumnWidth = 5
+    idxSheet.Columns("G:G").ColumnWidth = 60
+    idxSheet.Range("A2:L2").AutoFilter
+    Err.Clear
+End Sub
+
+
+' ==============================================================================
+' HELPER: ASK AT WHICH LEVEL THE BOM IS SPLIT
+' Shows how many components (and how many of them are sub-assemblies) every
+' level has. Returns -1 when the user cancels, 0 for "no split".
+' ==============================================================================
+Private Function AskSplitLevel(rootProd As Product) As Long
+    Dim cntAll(1 To 30) As Long, cntAssy(1 To 30) As Long
+    Dim maxDepth As Long, lvl As Long, n As Long
+    Dim msg As String, ans As String
+    Dim t As Double
+
+    AskSplitLevel = 0
+    If Not ASK_SPLIT_LEVEL Then Exit Function
+
+    Call SetStatus("BOM: reading the product structure ...")
+    t = Timer
+    Call ScanLevels(rootProd, 1, cntAll, cntAssy, maxDepth)
+    Call SetStatus("")
+    Call LogLine("structure read in " & Format(Elapsed(t), "0.0") & " s, " & maxDepth & " levels")
+
+    msg = "At which level should the BOM be split?" & vbCrLf & vbCrLf & _
+          "0 = no split: one sheet for the whole product" & vbCrLf & _
+          "n = one sheet per sub-assembly on level n," & vbCrLf & _
+          "     each one worked in its own window" & vbCrLf & vbCrLf & _
+          "Level:  components  (sub-assemblies)" & vbCrLf
+    For lvl = 1 To maxDepth
+        If lvl > 15 Then
+            msg = msg & "  ... deeper levels down to " & maxDepth & vbCrLf
+            Exit For
+        End If
+        msg = msg & "  " & lvl & ":   " & cntAll(lvl) & "  (" & cntAssy(lvl) & ")" & vbCrLf
+    Next lvl
+
+    Do
+        ans = Trim$(InputBox(msg, "BOM - split level", "0"))
+        If Len(ans) = 0 Then
+            AskSplitLevel = -1                       ' Cancel or empty
+            Exit Function
+        End If
+
+        ' plain digits only - "1e10" or "2.5" would pass IsNumeric and then overflow
+        If Len(ans) <= 3 And Not (ans Like "*[!0-9]*") Then
+            n = CLng(ans)
+            If n = 0 Then
+                AskSplitLevel = 0
+                Exit Function
+            ElseIf n >= 1 And n <= maxDepth And n <= 30 Then
+                If cntAssy(n) > 0 Then
+                    AskSplitLevel = n
+                    Exit Function
+                End If
+                MsgBox "Level " & n & " has no sub-assemblies, so there is nothing to split." & vbCrLf & _
+                       "Please choose another level.", vbExclamation
+            Else
+                MsgBox "Please enter a number between 0 and " & maxDepth & ".", vbExclamation
+            End If
+        Else
+            MsgBox "Please enter a number between 0 and " & maxDepth & ".", vbExclamation
+        End If
+    Loop
+End Function
+
+' counts the components per level - structure only, nothing is loaded
+' (unless EXPAND_UNLOADED is set)
+Private Sub ScanLevels(oProd As Product, ByVal lvl As Long, cntAll() As Long, _
+                       cntAssy() As Long, ByRef maxDepth As Long)
+    Dim i As Long, n As Long, nk As Long
+    Dim child As Product
+
+    If lvl > 30 Then Exit Sub
+    On Error Resume Next
+    n = 0
+    n = oProd.Products.Count
+    For i = 1 To n
+        Set child = Nothing
+        Set child = oProd.Products.Item(i)
+        If Not child Is Nothing Then
+            cntAll(lvl) = cntAll(lvl) + 1
+            If lvl > maxDepth Then maxDepth = lvl
+            nk = LoadedChildCount(child)
+            If nk > 0 Then
+                cntAssy(lvl) = cntAssy(lvl) + 1
+                Call ScanLevels(child, lvl + 1, cntAll, cntAssy, maxDepth)
+            End If
+        End If
+        Call Pump
+    Next i
+    Err.Clear
+End Sub
+
+
+' Number of children of a node.
+' A sub-assembly that is NOT LOADED reports 0 and passes for a part. With
+' EXPAND_UNLOADED its structure is loaded (visualization mode) - but that means
+' a call per childless node, which on a big product loads a lot from Teamcenter
+' before the first question appears, so by default the tree is taken as it is.
+Private Function LoadedChildCount(child As Product) As Long
+    Dim nk As Long
+    Dim oDoc As Object
+    Dim tn As String
 
     On Error Resume Next
-    Call RestoreVisibility(sel, colLeaves, colWasShown, colWasHidden)
-    If viewToggled And savedLayout >= 0 Then oWin.Layout = savedLayout
-    If compassToggled And Len(COMPASS_COMMAND) > 0 Then CATIA.StartCommand COMPASS_COMMAND
-    If Not oViewer Is Nothing Then oViewer.Reframe
-    CATIA.HSOSynchronized = True
-    CATIA.RefreshDisplay = True
-    CATIA.DisplayFileAlerts = True
-    CATIA.StatusBar = ""
-    If Not sel Is Nothing Then sel.Clear
-    If Not xlApp Is Nothing Then xlApp.ScreenUpdating = True
+    nk = 0
+    nk = child.Products.Count
+    If nk = 0 And EXPAND_UNLOADED Then
+        Set oDoc = Nothing
+        Set oDoc = child.ReferenceProduct.Parent
+        tn = ""
+        If Not oDoc Is Nothing Then tn = TypeName(oDoc)
+        If tn <> "PartDocument" Then
+            Err.Clear
+            child.ApplyWorkMode 1
+            nk = 0
+            nk = child.Products.Count
+        End If
+    End If
+    Err.Clear
+    LoadedChildCount = nk
+End Function
+
+
+' ==============================================================================
+' HELPER: THE COMPONENTS ON THE SPLIT LEVEL
+'   dUnit*        one entry per part number (first occurrence + count)
+'   colUnitInst   EVERY instance on the split level (to hide them all)
+'   colAbove      every assembly instance above it
+'   colLoose*     parts above (or on) the split level that sit in no component
+' Structure only - nothing is loaded here. The content of every assembly above
+' the split level is noted for the sums of the assembly rows.
+' ==============================================================================
+Private Sub CollectUnits(oProd As Product, ByVal lvl As Long, ByVal target As Long, _
+                         ByVal firstName As String, ByVal pathTxt As String, _
+                         ByVal parentKey As String, _
+                         dUnitQty As Object, dUnitRef As Object, dUnitFirst As Object, _
+                         dUnitDesc As Object, dUnitPath As Object, _
+                         colUnitInst As Collection, colAbove As Collection, _
+                         colLooseInst As Collection, colLooseLevel As Collection, _
+                         colLooseFirst As Collection, colLooseKey As Collection, _
+                         colLooseIsAssy As Collection, colLooseParts As Collection)
+    Dim i As Long, n As Long, nk As Long
+    Dim child As Product
+    Dim pn As String, rawPn As String, childFirst As String, sDesc As String
+    Dim childPath As String, rowKey As String, ownPn As String
+    Dim kids As Collection
+
+    On Error Resume Next
+    n = 0
+    n = oProd.Products.Count
+    ownPn = ""
+    ownPn = oProd.PartNumber
+    Set kids = New Collection
+
+    For i = 1 To n
+        Set child = Nothing
+        Set child = oProd.Products.Item(i)
+        If Not child Is Nothing Then
+            rawPn = ""
+            rawPn = child.PartNumber
+            pn = rawPn
+            If Len(pn) = 0 Then pn = child.Name
+
+            If lvl = 1 Then
+                childFirst = FirstLevelLabel(child, pn)
+            Else
+                childFirst = firstName
+            End If
+            rowKey = MakeRowKey(parentKey, childFirst, pn)
+
+            nk = 0
+            nk = child.Products.Count
+            If Len(rawPn) > 0 Then kids.Add Array(rawPn, (nk > 0))
+
+            If nk > 0 And lvl = target Then
+                ' ---- a component: one sheet per part number ----
+                colUnitInst.Add child
+                If dUnitQty.Exists(pn) Then
+                    ' used again, maybe in another branch: keep every branch and path
+                    dUnitQty(pn) = dUnitQty(pn) + 1
+                    Call AppendUnique(dUnitFirst, pn, childFirst, ", ")
+                    Call AppendUnique(dUnitPath, pn, pathTxt, "; ")
+                Else
+                    dUnitQty.Add pn, 1
+                    dUnitRef.Add pn, child
+                    dUnitFirst.Add pn, childFirst
+                    dUnitPath.Add pn, pathTxt
+                    sDesc = ""
+                    sDesc = child.DescriptionRef
+                    dUnitDesc.Add pn, sDesc
+                End If
+
+            ElseIf nk > 0 Then
+                ' ---- an assembly above the split level ----
+                colAbove.Add child
+                ' in the assembly structure it gets a row on the extra sheet, so
+                ' the tree above the components stays visible
+                If mIncludeSubassemblies Then
+                    colLooseInst.Add child
+                    colLooseLevel.Add lvl
+                    colLooseFirst.Add childFirst
+                    colLooseKey.Add rowKey
+                    colLooseIsAssy.Add True
+                End If
+                If Len(pathTxt) > 0 Then childPath = pathTxt & " > " & pn Else childPath = pn
+                Call CollectUnits(child, lvl + 1, target, childFirst, childPath, rowKey, _
+                                  dUnitQty, dUnitRef, dUnitFirst, dUnitDesc, dUnitPath, _
+                                  colUnitInst, colAbove, colLooseInst, colLooseLevel, _
+                                  colLooseFirst, colLooseKey, colLooseIsAssy, colLooseParts)
+
+            Else
+                ' ---- a part that is not inside any component ----
+                colLooseInst.Add child
+                colLooseLevel.Add lvl
+                colLooseFirst.Add childFirst
+                colLooseKey.Add rowKey
+                colLooseIsAssy.Add False
+                colLooseParts.Add child
+            End If
+        End If
+        Call Pump
+    Next i
+
+    Call NoteAssemblyContent(ownPn, kids)
+    Err.Clear
+End Sub
+
+' appends a value to a dictionary entry unless it is already in the list
+Private Sub AppendUnique(d As Object, ByVal k As String, ByVal v As String, ByVal sep As String)
+    Dim cur As String
+
+    If Len(v) = 0 Then Exit Sub
+    If Not d.Exists(k) Then
+        d.Add k, v
+        Exit Sub
+    End If
+    cur = CStr(d(k))
+    If Len(cur) = 0 Then
+        d(k) = v
+    ElseIf InStr(1, sep & cur & sep, sep & v & sep, vbTextCompare) = 0 Then
+        d(k) = cur & sep & v
+    End If
+End Sub
+
+
+' ==============================================================================
+' HELPER: THE DOCUMENT OF A COMPONENT, IF IT HAS ONE OF ITS OWN
+' A component gets its own window only when it is the ROOT of its own
+' CATProduct. A component that is defined inside another file (for example a
+' "Product1" inserted into an assembly) would open that whole other file, so it
+' returns Nothing and the component is done in the main window instead.
+' ==============================================================================
+Private Function OwnDocumentOf(oInst As Product, ByVal pn As String, rootDoc As Document) As Object
+    Dim oRef As Product
+    Dim oDoc As Object
+    Dim docRootPN As String
+
+    Set OwnDocumentOf = Nothing
+    On Error Resume Next
+
+    Set oRef = oInst.ReferenceProduct
+    If oRef Is Nothing Then Err.Clear: Exit Function
+    Set oDoc = oRef.Parent
+    If oDoc Is Nothing Then Err.Clear: Exit Function
+    If oDoc Is rootDoc Then Err.Clear: Exit Function
+    If StrComp(oDoc.FullName, rootDoc.FullName, vbTextCompare) = 0 Then Err.Clear: Exit Function
+    If InStr(1, oDoc.Name, ".CATProduct", vbTextCompare) = 0 Then Err.Clear: Exit Function
+
+    docRootPN = ""
+    docRootPN = oDoc.Product.PartNumber
+    If StrComp(docRootPN, pn, vbTextCompare) <> 0 Then Err.Clear: Exit Function
+
+    Set OwnDocumentOf = oDoc
+    Err.Clear
+End Function
+
+
+' ==============================================================================
+' HELPER: A WINDOW READY FOR PICTURES - geometry only, fixed iso camera
+' ==============================================================================
+Private Sub PrepareWindow(oWin As Object, ByRef oViewer As Viewer, ByRef savedLayout As Long, _
+                          ByRef layoutSet As Boolean)
+    On Error Resume Next
+    Set oViewer = Nothing
+    layoutSet = False
+    savedLayout = -1
+
+    Set oViewer = oWin.ActiveViewer
+    savedLayout = oWin.Layout
+    oWin.Layout = catWindowGeomOnly            ' no spec tree in the pictures
+    layoutSet = (Err.Number = 0 And savedLayout >= 0)
     Err.Clear
 
-    MsgBox failMsg & vbCrLf & vbCrLf & _
-           "Visibility, spec tree and compass were restored." & vbCrLf & _
-           "The rows written so far are in the Excel sheet.", vbCritical
+    If SET_ISO_VIEW Then Call SetIsoViewpoint(oViewer)
+    Call Settle(100)
+    Err.Clear
+End Sub
 
+
+' ==============================================================================
+' HELPER: THE COMPASS (only a translated command name exists for it)
+' ==============================================================================
+Private Function ToggleCompass() As Boolean
+    ToggleCompass = False
+    If Len(COMPASS_COMMAND) = 0 Then Exit Function
+    On Error Resume Next
+    CATIA.StartCommand COMPASS_COMMAND
+    ToggleCompass = (Err.Number = 0)
+    Err.Clear
+End Function
+
+
+' ==============================================================================
+' HELPER: EXCEL SHEETS
+' ==============================================================================
+Private Sub KeepOneSheet(xlBook As Object)
+    Dim i As Long
+    Call XlReady
+    On Error Resume Next
+    xlBook.Application.DisplayAlerts = False
+    For i = xlBook.Sheets.Count To 2 Step -1
+        xlBook.Sheets(i).Delete
+    Next i
+    xlBook.Application.DisplayAlerts = True
+    Err.Clear
+End Sub
+
+' a new sheet at the end of the workbook, or Nothing when Excel refuses
+Private Function AddSheet(xlBook As Object, ByVal baseName As String) As Object
+    Dim ws As Object, e As Long
+    Dim t0 As Double, told As Boolean
+
+    Set AddSheet = Nothing
+    ' creating a sheet is not one cell that can be skipped: it always waits and
+    ' asks again, whatever was answered for an earlier write
+    mXlSkipAt = -1
+    t0 = Timer
+    Do
+        If Not XlReady() Then
+            Call LogLine("skipped: the sheet " & baseName)
+            Exit Function
+        End If
+        On Error Resume Next
+        Err.Clear
+        Set ws = Nothing
+        Set ws = xlBook.Sheets.Add(, xlBook.Sheets(xlBook.Sheets.Count))
+        e = Err.Number
+        Err.Clear
+        On Error GoTo 0
+        If Not ws Is Nothing Then Exit Do
+        Call NoteXlError(e)
+        If Not IsExcelBusy(e) Then
+            Call LogLine("Excel could not add the sheet " & baseName & ": error " & e)
+            Exit Function
+        End If
+        If Not XlKeepTrying(t0, told) Then
+            Call LogLine("skipped: the sheet " & baseName)
+            Exit Function
+        End If
+    Loop
+
+    Call NameSheet(ws, baseName)
+    Set AddSheet = ws
+End Function
+
+' gives a sheet a valid, unused name - a name Excel refuses never ends the run
+Private Sub NameSheet(ws As Object, ByVal baseName As String)
+    Dim nm As String
+
+    nm = SafeSheetName(baseName)
+    Call XlReady
+    On Error Resume Next
+    Err.Clear
+    ws.Name = nm
+    If Err.Number <> 0 Then
+        Err.Clear
+        nm = SafeSheetName("Sheet")
+        ws.Name = nm
+    End If
+    Err.Clear
+    nm = ws.Name                         ' whatever Excel really has
+    Err.Clear
+    On Error GoTo 0
+    If Not mSheetNames.Exists(nm) Then mSheetNames.Add nm, True
+    mSheetName = nm
+End Sub
+
+' Excel sheet names: max 31 characters, none of  : \ / ? * [ ] '  and unique
+Private Function SafeSheetName(ByVal baseName As String) As String
+    Dim s As String, cand As String, bad As Variant
+    Dim k As Long, n As Long
+
+    s = baseName
+    For Each bad In Array(":", "\", "/", "?", "*", "[", "]", "'")
+        s = Replace(s, CStr(bad), "_")
+    Next bad
+    s = Trim$(s)
+    If Len(s) = 0 Then s = "Sheet"
+    If StrComp(s, "History", vbTextCompare) = 0 Then s = "History_"
+    If Len(s) > 31 Then s = Left$(s, 31)
+
+    cand = s
+    n = 1
+    Do While mSheetNames.Exists(cand)
+        n = n + 1
+        k = Len(CStr(n)) + 1
+        cand = Left$(s, 31 - k) & "~" & n
+    Loop
+    SafeSheetName = cand
+End Function
+
+Private Function SheetNameOf(ws As Object) As String
+    SheetNameOf = mSheetName
+    Call XlReady
+    On Error Resume Next
+    SheetNameOf = ws.Name
+    Err.Clear
+End Function
+
+Private Sub ShowSheet(ws As Object)
+    If ws Is Nothing Then Exit Sub
+    Call XlReady
+    On Error Resume Next
+    ws.Activate
+    Err.Clear
+End Sub
+
+
+' ==============================================================================
+' HELPER: TALKING TO A BUSY EXCEL
+' Excel refuses calls from another program while it is busy - a cell in edit
+' mode, an open dialog or menu, a drag in progress. VBA then gets error 50290
+' (or "call was rejected"). Every write therefore keeps trying for
+' EXCEL_WAIT_SECONDS, then asks the user (Retry / Cancel). A write that cannot
+' be done is logged and skipped - it never ends the run.
+' ==============================================================================
+Private Function IsExcelBusy(ByVal e As Long) As Boolean
+    Select Case e
+        Case 50290, -2146777998            ' 0x800AC472: Excel is busy
+            IsExcelBusy = True
+        Case -2147418111                   ' 0x80010001: call was rejected by callee
+            IsExcelBusy = True
+        Case -2147417846                   ' 0x8001010A: server busy, retry later
+            IsExcelBusy = True
+        Case Else
+            IsExcelBusy = False
+    End Select
+End Function
+
+' Excel was closed or has crashed: the COM server is gone for good
+Private Function IsExcelGone(ByVal e As Long) As Boolean
+    Select Case e
+        Case 462                           ' remote server machine does not exist or is unavailable
+            IsExcelGone = True
+        Case -2147023174, -2147023170      ' 0x800706BA / 0x800706BE: RPC server unavailable / call failed
+            IsExcelGone = True
+        Case -2147417848                   ' 0x80010108: object disconnected from its clients
+            IsExcelGone = True
+        Case Else
+            IsExcelGone = False
+    End Select
+End Function
+
+' ends the current component (or the run, outside a component) when Excel is gone
+Private Sub CheckExcel()
+    Dim e As Long, nm As String
+
+    ' the workbook itself can be closed while Excel stays open
+    If Not mXlLost And Not mXlBook Is Nothing Then
+        On Error Resume Next
+        Err.Clear
+        nm = mXlBook.Name
+        e = Err.Number
+        Err.Clear
+        On Error GoTo 0
+        If e <> 0 And Not IsExcelBusy(e) Then
+            mXlLost = True
+            Call LogLine("the BOM workbook is gone (error " & e & ") - nothing can be written any more")
+        End If
+    End If
+    If mXlLost Then Err.Raise vbObjectError + 515, , _
+        "Excel or the BOM workbook was closed - the run is stopped"
+End Sub
+
+' notes the outcome of an Excel call
+Private Sub NoteXlError(ByVal e As Long)
+    If IsExcelGone(e) And Not mXlLost Then
+        mXlLost = True
+        Call LogLine("Excel is gone (error " & e & ") - nothing can be written any more")
+    End If
+End Sub
+
+' After a "busy" answer from Excel: wait a little and say whether to try again.
+' Excel is given EXCEL_WAIT_SECONDS, then the user is asked - no data is ever
+' dropped silently. After a "skip", writes are skipped without asking again for
+' 30 seconds, so one stuck cell edit does not bring up a question per row.
+Private Function XlKeepTrying(ByRef t0 As Double, ByRef told As Boolean) As Boolean
+    Dim ans As Long
+
+    XlKeepTrying = False
+    If mXlLost Then Exit Function
+    If mXlSkipAt >= 0 Then
+        If Elapsed(mXlSkipAt) < 30 Then Exit Function
+        mXlSkipAt = -1
+    End If
+
+    If Not told Then
+        told = True
+        Call LogLine("Excel is busy - waiting (a cell in edit mode or a dialog open in the BOM Excel?)")
+        Call SetStatus("BOM: Excel is busy - finish the cell you are editing or close the dialog in Excel ...")
+    End If
+    If Elapsed(t0) > EXCEL_WAIT_SECONDS Then
+        Call LogLine("Excel still busy after " & EXCEL_WAIT_SECONDS & " s - asking the user")
+        ans = MsgBox("The Excel window of the BOM does not accept data right now." & vbCrLf & _
+                     "Most likely a cell is being edited there, or a dialog is open." & vbCrLf & vbCrLf & _
+                     "Finish it in Excel (Enter or Esc), then click Retry." & vbCrLf & _
+                     "Cancel = skip what Excel cannot take now and go on.", _
+                     vbRetryCancel + vbExclamation, "BOM - Excel is busy")
+        If ans = vbCancel Then
+            Call LogLine("the user chose to skip writes while Excel is busy")
+            mXlSkipAt = Timer
+            Exit Function
+        End If
+        t0 = Timer
+    End If
+    Call Settle(500)
+    XlKeepTrying = True
+End Function
+
+' waits (CATIA stays alive) until Excel takes calls again. Application.Ready is
+' only a hint - it can say True while a cell is being edited - so every write
+' still retries on a "busy" error itself.
+' False = Excel is gone, or the user chose to skip.
+Private Function XlReady() As Boolean
+    Dim t0 As Double, ok As Boolean, e As Long, told As Boolean
+
+    XlReady = False
+    If mXlApp Is Nothing Or mXlLost Then Exit Function
+    t0 = Timer
+    Do
+        ok = False
+        On Error Resume Next
+        Err.Clear
+        ok = mXlApp.Ready
+        e = Err.Number
+        Err.Clear
+        On Error GoTo 0
+        If e <> 0 Then
+            Call NoteXlError(e)
+            If mXlLost Then Exit Function
+            ' an error that does not mean "busy": cannot tell, just try the call
+            If Not IsExcelBusy(e) Then ok = True
+        End If
+        If ok Then
+            XlReady = True
+            Exit Function
+        End If
+        If Not XlKeepTrying(t0, told) Then Exit Function
+    Loop
+End Function
+
+' writes a 2-D array (1-based) to the sheet with its top left corner at (r, c)
+Private Function XlWriteBlock(ws As Object, ByVal r As Long, ByVal c As Long, arr As Variant) As Boolean
+    Dim e As Long, nr As Long, nc As Long
+    Dim t0 As Double, told As Boolean
+
+    XlWriteBlock = False
+    mXlLastErr = 0
+    If ws Is Nothing Then Exit Function
+    nr = UBound(arr, 1) - LBound(arr, 1) + 1
+    nc = UBound(arr, 2) - LBound(arr, 2) + 1
+    t0 = Timer
+    Do
+        If Not XlReady() Then
+            Call LogLine("skipped: Excel write at row " & r & ", column " & c)
+            Exit Function
+        End If
+        On Error Resume Next
+        Err.Clear
+        ws.Range(ws.Cells(r, c), ws.Cells(r + nr - 1, c + nc - 1)).Value = arr
+        e = Err.Number
+        Err.Clear
+        On Error GoTo 0
+        If e = 0 Then
+            XlWriteBlock = True
+            Exit Function
+        End If
+        Call NoteXlError(e)
+        If Not IsExcelBusy(e) Then
+            mXlLastErr = e
+            Call LogLine("Excel write failed at row " & r & ", column " & c & ": error " & e)
+            Exit Function
+        End If
+        ' "busy" is answered before Excel does anything, so trying again is safe
+        If Not XlKeepTrying(t0, told) Then
+            Call LogLine("skipped: Excel write at row " & r & ", column " & c)
+            Exit Function
+        End If
+    Loop
+End Function
+
+' one cell
+Private Function XlPutCell(ws As Object, ByVal r As Long, ByVal c As Long, ByVal v As Variant) As Boolean
+    Dim a(1 To 1, 1 To 1) As Variant
+    a(1, 1) = v
+    XlPutCell = XlWriteBlock(ws, r, c, a)
+End Function
+
+' one picture into column A of a row, sized to the row
+Private Function XlInsertPicture(ws As Object, ByVal rowNo As Long, ByVal picPath As String) As Boolean
+    Dim shp As Object, e As Long
+    Dim x As Double, y As Double
+    Dim t0 As Double, told As Boolean
+
+    XlInsertPicture = False
+    t0 = Timer
+    Do
+        If Not XlReady() Then Exit Function
+        On Error Resume Next
+        Err.Clear
+        Set shp = Nothing
+        x = ws.Cells(rowNo, 1).Left + 2
+        y = ws.Cells(rowNo, 1).Top + 2
+        If Err.Number = 0 Then Set shp = ws.Shapes.AddPicture(picPath, False, True, x, y, -1, -1)
+        e = Err.Number
+        Err.Clear
+        On Error GoTo 0
+        If Not shp Is Nothing Then Exit Do
+        Call NoteXlError(e)
+        If Not IsExcelBusy(e) Then
+            Call LogLine("Excel could not insert the picture of row " & rowNo & ": error " & e)
+            Exit Function
+        End If
+        If Not XlKeepTrying(t0, told) Then Exit Function
+    Loop
+
+    On Error Resume Next
+    shp.Height = 50
+    If shp.Width > 90 Then shp.Width = 90
+    ws.Rows(rowNo).RowHeight = 60
+    Err.Clear
+    On Error GoTo 0
+    XlInsertPicture = True
+End Function
+
+' starts the Excel of the run (or attaches to the open one when
+' OWN_EXCEL_INSTANCE is False), makes it visible and adds the workbook
+Private Function StartExcel(ByRef firstSheet As Object) As Boolean
+    Dim e As Long, t0 As Double, told As Boolean
+
+    StartExcel = False
+    Set firstSheet = Nothing
+    On Error Resume Next
+    If Not OWN_EXCEL_INSTANCE Then Set mXlApp = GetObject(, "Excel.Application")
+    Err.Clear
+    If mXlApp Is Nothing Then
+        Set mXlApp = CreateObject("Excel.Application")
+        mOwnXl = Not (mXlApp Is Nothing)
+    End If
+    Err.Clear
+    On Error GoTo 0
+    If mXlApp Is Nothing Then
+        Call LogLine("Excel could not be started")
+        Exit Function
+    End If
+
+    ' a fresh Excel can still be loading its add-ins and refuse calls for a while
+    t0 = Timer
+    Do
+        On Error Resume Next
+        Err.Clear
+        mXlApp.Visible = True
+        If Err.Number = 0 And mXlBook Is Nothing Then Set mXlBook = mXlApp.Workbooks.Add
+        If Err.Number = 0 And Not mXlBook Is Nothing Then Set firstSheet = mXlBook.Sheets(1)
+        e = Err.Number
+        Err.Clear
+        On Error GoTo 0
+        If e = 0 And Not firstSheet Is Nothing Then Exit Do
+        Call NoteXlError(e)
+        If Not IsExcelBusy(e) Then
+            Call LogLine("Excel could not be prepared: error " & e)
+            Exit Function
+        End If
+        If Not XlKeepTrying(t0, told) Then Exit Function
+    Loop
+
+    ' an Excel started by the macro stays open when the macro ends
+    On Error Resume Next
+    If mOwnXl Then mXlApp.UserControl = True
+    Err.Clear
+    On Error GoTo 0
+    StartExcel = True
+End Function
+
+' Excel back to normal at the end of the run (also after an error). An own
+' Excel that never got its workbook is closed again instead of being left
+' running invisible.
+Private Sub XlRestore()
+    If mXlApp Is Nothing Then Exit Sub
+    On Error Resume Next
+    If mOwnXl And mXlBook Is Nothing Then
+        mXlApp.Quit
+        Set mXlApp = Nothing
+        Err.Clear
+        Exit Sub
+    End If
+    mXlApp.ScreenUpdating = True
+    mXlApp.DisplayAlerts = True
+    If mOwnXl Then mXlApp.UserControl = True
+    Err.Clear
+End Sub
+
+
+' ==============================================================================
+' HELPER: SAVING, LOG, STATUS
+' ==============================================================================
+' log file and save path of this run:  <folder>\BOM_<product>_<date>_<time>.txt/.xlsx
+Private Sub StartRunFiles(ByVal rootPN As String)
+    Dim folder As String, baseName As String, bad As Variant
+    Dim k As Long, f As Integer, e As Long, ch As String
+
+    mLogPath = ""
+    mSavePath = ""
+    mSavedOnce = False
+    mSaveTried = False
+    mLastSaveOK = False
+    mLastSave = Timer
+    Set mSlow = New Collection
+
+    ' file name: no character Windows or Excel refuses
+    baseName = rootPN
+    For Each bad In Array("\", "/", ":", "*", "?", Chr(34), "<", ">", "|", "[", "]")
+        baseName = Replace(baseName, CStr(bad), "_")
+    Next bad
+    For k = 0 To 31
+        baseName = Replace(baseName, Chr(k), "_")
+    Next k
+    ' VBA's Open (the log) only takes characters of the Windows code page
+    For k = 1 To Len(baseName)
+        ch = Mid$(baseName, k, 1)
+        If StrConv(StrConv(ch, vbFromUnicode), vbUnicode) <> ch Then Mid$(baseName, k, 1) = "_"
+    Next k
+    baseName = Trim$(baseName)
+    If Len(baseName) = 0 Then baseName = "product"
+    If Len(baseName) > 60 Then baseName = Left$(baseName, 60)
+    baseName = "BOM_" & baseName & "_" & Format(Now, "yyyymmdd_hhnnss")
+
+    ' the folder must be WRITABLE, not only exist - otherwise the user's TEMP
+    folder = SAVE_FOLDER
+    If Len(folder) = 0 Then folder = "C:\Temp"
+    Call EnsureFolder(folder)
+    ' the probe is the log file itself (the run appends to it anyway); Excel's
+    ' Save As also refuses a full path of more than 218 characters
+    On Error Resume Next
+    Err.Clear
+    f = FreeFile
+    Open folder & "\" & baseName & ".txt" For Append As #f
+    e = Err.Number
+    Close #f
+    Err.Clear
+    If e = 0 And Len(folder & "\" & baseName & ".xlsx") > 218 Then e = 1
+    If e <> 0 Then folder = CStr(Environ$("TEMP"))
+    Err.Clear
+    On Error GoTo 0
+
+    mLogPath = folder & "\" & baseName & ".txt"
+    If Len(SAVE_FOLDER) > 0 Then mSavePath = folder & "\" & baseName & ".xlsx"
+End Sub
+
+' saves the workbook (first time: Save As). force = False saves at most every
+' SAVE_EVERY_SECONDS. A failed save is logged and the run goes on.
+Private Sub SaveWorkbook(ByVal force As Boolean)
+    Dim e As Long, d As String
+
+    If Len(mSavePath) = 0 Or mXlBook Is Nothing Then Exit Sub
+    If mXlLost Then
+        mLastSaveOK = False
+        Exit Sub
+    End If
+    ' throttled after any attempt - a save that keeps failing is not retried
+    ' after every picture
+    If Not force And mSaveTried And Elapsed(mLastSave) < SAVE_EVERY_SECONDS Then Exit Sub
+
+    Call SetStatus("BOM: saving the workbook ...")
+    Call XlReady
+    On Error Resume Next
+    ' no question from Excel may ever wait for a click in the middle of a call
+    mXlApp.DisplayAlerts = False
+    Err.Clear
+    If mSavedOnce Then
+        mXlBook.Save
+    Else
+        mXlBook.SaveAs mSavePath, 51           ' 51 = .xlsx
+    End If
+    e = Err.Number
+    d = Err.Description
+    Err.Clear
+    mXlApp.DisplayAlerts = True
+    Err.Clear
+    On Error GoTo 0
+    mLastSave = Timer
+    mSaveTried = True
+    mLastSaveOK = (e = 0)
+
+    If e = 0 Then
+        mSavedOnce = True
+        mLastSaveAt = Now
+        Call LogLine("saved " & mSavePath)
+    Else
+        Call NoteXlError(e)
+        Call LogLine("saving failed: error " & e & " - " & d)
+    End If
+End Sub
+
+Private Function SavedText() As String
+    Dim s As String
+    If mSavedOnce And mLastSaveOK Then
+        s = "Saved as:" & vbCrLf & mSavePath
+    ElseIf mSavedOnce Then
+        s = "The LAST save did not work - only the copy of " & Format(mLastSaveAt, "hh:nn") & _
+            " is saved as:" & vbCrLf & mSavePath & vbCrLf & _
+            "Save the workbook in Excel yourself if it is still open."
+    ElseIf Len(mSavePath) > 0 Then
+        s = "The workbook could NOT be saved automatically - please save it yourself."
+    Else
+        s = "The workbook is not saved yet."
+    End If
+    If Len(mLogPath) > 0 Then s = s & vbCrLf & vbCrLf & "Log of the run:" & vbCrLf & mLogPath
+    SavedText = s
+End Function
+
+' the sub-assemblies CATIA had not loaded - their content is missing in the BOM
+Private Function NotLoadedText() As String
+    Dim k As Variant, s As String, n As Long
+    NotLoadedText = ""
+    If mNotLoaded Is Nothing Then Exit Function
+    If mNotLoaded.Count = 0 Then Exit Function
+    s = mNotLoaded.Count & " sub-assembly(ies) were NOT LOADED in CATIA - their content is" & vbCrLf & _
+        "missing in the BOM (marked ""NOT LOADED"" in column L):" & vbCrLf
+    For Each k In mNotLoaded.Keys
+        n = n + 1
+        If n > 8 Then
+            s = s & "  ..." & vbCrLf
+            Exit For
+        End If
+        s = s & "  " & CStr(k) & vbCrLf
+    Next k
+    NotLoadedText = s & vbCrLf
+End Function
+
+' one line into the log file - opened and closed every time, so the file is
+' complete even if CATIA has to be killed
+Private Sub LogLine(ByVal txt As String)
+    Dim f As Integer
+    If Len(mLogPath) = 0 Then Exit Sub
+    On Error Resume Next
+    f = FreeFile
+    Err.Clear
+    Open mLogPath For Append As #f
+    If Err.Number <> 0 Then
+        mLogPath = ""                      ' no log possible - stop trying
+    Else
+        Print #f, Format(Now, "hh:nn:ss") & "  " & txt
+        Close #f
+    End If
+    Err.Clear
+End Sub
+
+' a step that took long: into the log and onto the "Log" sheet
+Private Sub NoteSlow(ByVal secs As Double, ByVal txt As String)
+    Call LogLine("  SLOW " & Format(secs, "0.0") & " s: " & txt)
+    If mSlow Is Nothing Then Exit Sub
+    If mSlow.Count < 2000 Then mSlow.Add Array(secs, txt)
+End Sub
+
+' the "Log" sheet: run summary and every slow step
+Private Sub WriteLogSheet(ByVal summary As String)
+    Dim ws As Object, a() As Variant, it As Variant
+    Dim n As Long, i As Long
+
+    If mXlBook Is Nothing Then Exit Sub
+    Set ws = AddSheet(mXlBook, "Log")
+    If ws Is Nothing Then Exit Sub
+
+    n = 0
+    If Not mSlow Is Nothing Then n = mSlow.Count
+    ReDim a(1 To n + 5, 1 To 2)
+    a(1, 1) = "Run"
+    a(1, 2) = summary
+    a(2, 1) = "Log file"
+    a(2, 2) = mLogPath
+    a(4, 1) = "Seconds"
+    a(4, 2) = "Slow steps (" & SLOW_STEP_SECONDS & " s or more)"
+    If n = 0 Then a(5, 2) = "none"
+    For i = 1 To n
+        it = mSlow(i)
+        a(i + 4, 1) = Round(CDbl(it(0)), 1)
+        a(i + 4, 2) = CStr(it(1))
+    Next i
+    Call XlWriteBlock(ws, 1, 1, a)
+
+    Call XlReady
+    On Error Resume Next
+    ws.Columns("A:A").ColumnWidth = 10
+    ws.Columns("B:B").ColumnWidth = 110
+    ws.Range("A4:B4").Font.Bold = True
+    Err.Clear
+End Sub
+
+Private Sub SetStatus(ByVal txt As String)
+    On Error Resume Next
+    CATIA.StatusBar = txt
+    Err.Clear
+End Sub
+
+' seconds since t0 - also across midnight, where Timer starts again at 0
+Private Function Elapsed(ByVal t0 As Double) As Double
+    Dim d As Double
+    d = Timer - t0
+    If d < 0 Then d = d + 86400#
+    Elapsed = d
+End Function
+
+' the tree walks call this for every node: CATIA keeps its window alive
+Private Sub Pump()
+    mPump = mPump + 1
+    If mPump Mod 50 = 0 Then DoEvents
+    If mPump Mod 1000 = 0 Then Call SetStatus("BOM: walking the product tree ... " & mPump & " nodes")
+End Sub
+
+Private Sub EnsureFolder(ByVal p As String)
+    Dim parentPath As String
+    If Len(p) = 0 Or mFso Is Nothing Then Exit Sub
+    On Error Resume Next
+    If mFso.FolderExists(p) Then Exit Sub
+    parentPath = mFso.GetParentFolderName(p)
+    If Len(parentPath) > 0 And parentPath <> p Then Call EnsureFolder(parentPath)
+    mFso.CreateFolder p
+    Err.Clear
 End Sub
 
 ' ==============================================================================
@@ -784,24 +3351,48 @@ End Sub
 
 ' ==============================================================================
 ' HELPER: BATCHED SHOW / HIDE FOR A COLLECTION OF PRODUCTS
-' One Selection.Add per item but only ONE SetShow call (= one visual update)
+' One Selection.Add per item but only ONE SetShow call (= one visual update).
+' CATIA refuses the whole SetShow when ONE element cannot be shown or hidden
+' (e.g. a component that is not loaded) - then a refused range is halved again
+' and again, so the refused element costs a few calls, not the whole list.
 ' In CATIA: SetShow(0) = SHOW, SetShow(1) = HIDE
 ' ==============================================================================
 Sub SetShowCollection(sel As Selection, colItems As Collection, ByVal showMode As Integer)
-    On Error Resume Next
-    Dim i As Long
-
     If colItems Is Nothing Then Exit Sub
     If colItems.Count = 0 Then Exit Sub
+    Call SetShowSplit(sel, colItems, 1, colItems.Count, showMode)
+End Sub
 
+Private Sub SetShowSplit(sel As Selection, colItems As Collection, ByVal i1 As Long, _
+                         ByVal i2 As Long, ByVal showMode As Integer)
+    Dim m As Long
+    If SetShowRange(sel, colItems, i1, i2, showMode) Then Exit Sub
+    If i1 >= i2 Then Exit Sub                ' one element CATIA refuses - left as it is
+    m = (i1 + i2) \ 2
+    DoEvents
+    Call SetShowSplit(sel, colItems, i1, m, showMode)
+    Call SetShowSplit(sel, colItems, m + 1, i2, showMode)
+End Sub
+
+' items i1..i2 of the list in one selection and one SetShow; False = refused
+Private Function SetShowRange(sel As Selection, colItems As Collection, ByVal i1 As Long, _
+                              ByVal i2 As Long, ByVal showMode As Integer) As Boolean
+    Dim i As Long, ok As Boolean
+
+    On Error Resume Next
     sel.Clear
-    For i = 1 To colItems.Count
+    For i = i1 To i2
         sel.Add colItems.Item(i)
+        If i Mod 200 = 0 Then DoEvents     ' a long list must not freeze CATIA
     Next i
+    Err.Clear
     sel.VisProperties.SetShow showMode
+    ok = (Err.Number = 0)
+    Err.Clear
     sel.Clear
     Err.Clear
-End Sub
+    SetShowRange = ok
+End Function
 
 ' ==============================================================================
 ' HELPER: PUT THE VISIBILITY BACK
@@ -886,45 +3477,13 @@ Sub SetShowBodyList(oPart As Part, partSel As Selection, bodyNames As Variant, B
 End Sub
 
 ' ==============================================================================
-' HELPER: REFRAME + CAPTURE CURRENT VIEW INTO EXCEL CELL A(row)
-' ==============================================================================
-Sub CaptureViewToExcel(oViewer As Viewer, xlSheet As Object, ByVal row As Long, _
-                       tempPicPath As String, fso As Object)
-    On Error Resume Next
-    Dim shp As Object
-
-    If oViewer Is Nothing Then
-        xlSheet.Cells(row, 1).Value = "No Viewer"
-        Exit Sub
-    End If
-
-    oViewer.Reframe
-    oViewer.Update
-    Call Settle(PART_SETTLE_MS)
-
-    If fso.FileExists(tempPicPath) Then fso.DeleteFile tempPicPath
-    oViewer.CaptureToFile 4, tempPicPath
-
-    If fso.FileExists(tempPicPath) Then
-        Set shp = xlSheet.Shapes.AddPicture(tempPicPath, False, True, _
-            xlSheet.Cells(row, 1).Left + 2, xlSheet.Cells(row, 1).Top + 2, -1, -1)
-        If Not shp Is Nothing Then
-            shp.Height = 50
-            If shp.Width > 90 Then shp.Width = 90
-        End If
-        xlSheet.Rows(row).RowHeight = 60
-    Else
-        xlSheet.Cells(row, 1).Value = "No Preview"
-    End If
-    Err.Clear
-End Sub
-
-' ==============================================================================
-' HELPER: TRAVERSE TREE (CALCULATES MASS + TRACKS LEVEL + DETECTS MULTI-BODY)
+' HELPER: TRAVERSE TREE (ROWS + LEVELS + FIRST LEVEL, structure only)
 ' Level 1 = direct children of root, Level 2 = grandchildren, etc.
 ' Also fills:
 '   - colLeaves: EVERY leaf instance (used to hide them all in one call)
-'   - dBodies: partNum -> array of solid body names (only when more than one)
+'   - mAssyKids: the content of every assembly part number, for the sums of
+'     the assembly rows
+' Nothing is loaded or measured here.
 ' ==============================================================================
 Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As Object, _
                       dProps As Object, dLevel As Object, dBodies As Object, _
@@ -933,10 +3492,11 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
                       ByVal currentLevel As Integer, ByVal firstLevelName As String, _
                       ByVal parentKey As String) As Collection
 
-    Dim childProd As Product, i As Integer, partNum As String
+    Dim childProd As Product, i As Long, partNum As String
     Dim myLeaves As Collection, childLeaves As Collection
-    Dim k As Long
-    Dim sKey As String, childFirst As String
+    Dim k As Long, nk As Long
+    Dim sKey As String, childFirst As String, ownPn As String
+    Dim kids As Collection
 
     Set myLeaves = New Collection
     Set TraverseTree = myLeaves          ' set early: an error still returns a list
@@ -944,19 +3504,29 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
     If oProd Is Nothing Then Exit Function
     If oProd.Products.Count = 0 Then Exit Function
 
+    ownPn = ""
+    On Error Resume Next
+    ownPn = oProd.PartNumber
+    Err.Clear
+    On Error GoTo 0
+    Set kids = New Collection
+
     For i = 1 To oProd.Products.Count
         Set childProd = oProd.Products.Item(i)
 
-        ' NOTE: no ApplyWorkMode here any more. Doing it per node forced every
-        ' CATPart of the tree into design mode during the traversal, which is
-        ' what made CATIA go "not responding" on deep trees. Each row promotes
-        ' its own node in RunBOM instead.
+        ' NOTE: no ApplyWorkMode here. It is recursive: on an assembly it loads
+        ' every CATPart below in one blocking call. Each PART row promotes its
+        ' own part in WriteDataRows instead.
         mAllNodes.Add childProd          ' assemblies and leaves, for the show/hide baseline
 
         partNum = ""
         On Error Resume Next
         partNum = childProd.PartNumber
+        Err.Clear
         On Error GoTo 0
+
+        nk = childProd.Products.Count
+        If partNum <> "" Then kids.Add Array(partNum, (nk > 0))
 
         ' The direct children of the root product ARE the first level; deeper
         ' nodes inherit the name of the first level branch they sit in.
@@ -966,9 +3536,10 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
             childFirst = firstLevelName
         End If
 
-        If childProd.Products.Count > 0 Then
+        If nk > 0 Then
 
             ' ---------- SUB-ASSEMBLY ----------
+            mAssyNodes.Add childProd
             ' the key is needed in any case: it is the parent key of everything
             ' below this node
             sKey = MakeRowKey(parentKey, childFirst, partNum)
@@ -989,11 +3560,11 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
 
             ' the leaves below this node are only needed for an assembly
             ' screenshot - building them always is an O(leaves x depth) copy
-            If mIncludeSubassemblies And CAPTURE_ASSEMBLY_SHOTS And partNum <> "" Then
+            If mIncludeSubassemblies And mShotAssy And partNum <> "" Then
                 If Not dNodeLeaves.Exists(sKey) Then dNodeLeaves.Add sKey, childLeaves
             End If
 
-            If mIncludeSubassemblies And CAPTURE_ASSEMBLY_SHOTS Then
+            If mIncludeSubassemblies And mShotAssy Then
                 If Not childLeaves Is Nothing Then
                     For k = 1 To childLeaves.Count
                         myLeaves.Add childLeaves.Item(k)
@@ -1006,7 +3577,7 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
             ' ---------- LEAF PART ----------
             ' Remember every leaf instance so all can be hidden in one call
             colLeaves.Add childProd
-            If mIncludeSubassemblies And CAPTURE_ASSEMBLY_SHOTS Then myLeaves.Add childProd
+            If mIncludeSubassemblies And mShotAssy Then myLeaves.Add childProd
 
             If partNum <> "" Then
                 sKey = MakeRowKey(parentKey, childFirst, partNum)
@@ -1026,7 +3597,10 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
         End If
 
         Set childProd = Nothing
+        Call Pump
     Next i
+
+    Call NoteAssemblyContent(ownPn, kids)
 End Function
 
 ' ==============================================================================
@@ -1129,11 +3703,12 @@ Sub AddFirstLevel(dFirst As Object, ByVal sKey As String, ByVal firstLevel As St
 End Sub
 
 ' ==============================================================================
-' HELPER: MASS / VOLUME / AREA OF A PRODUCT (works for parts and assemblies)
-' Volume in m3, area in m2 - same units as before
+' HELPER: MASS / VOLUME / AREA OF A PART
+' Volume in m3, area in m2 - same units as before. (Assembly rows are added up
+' from their parts instead - see RollUp.)
 ' ==============================================================================
 Sub ReadProductProps(oProd As Product, ByRef dMass As Double, ByRef dVol As Double, _
-                     ByRef dArea As Double, ByVal isAssembly As Boolean)
+                     ByRef dArea As Double)
     Dim oAnalyze As Object
     Dim oInertia As Object
 
@@ -1144,12 +3719,8 @@ Sub ReadProductProps(oProd As Product, ByRef dMass As Double, ByRef dVol As Doub
     Set oAnalyze = oProd.Analyze
     If Not oAnalyze Is Nothing Then
         dMass = oAnalyze.Mass
-        ' Volume and WetArea integrate over the whole subtree - on an assembly
-        ' row that is the expensive part, so it can be switched off
-        If (Not isAssembly) Or ASSEMBLY_VOLUME_AREA Then
-            dVol = oAnalyze.Volume / (1000# ^ 3)
-            dArea = oAnalyze.WetArea / (1000# ^ 2)
-        End If
+        dVol = oAnalyze.Volume / (1000# ^ 3)
+        dArea = oAnalyze.WetArea / (1000# ^ 2)
     End If
 
     If dMass <= 0.0000001 Then
@@ -1316,6 +3887,58 @@ Private Function TryGetLoadedPart(oProd As Product, ByRef oPart As Part, ByRef o
         If Not oPart Is Nothing Then TryGetLoadedPart = True
     End If
     On Error GoTo 0
+End Function
+
+' ==============================================================================
+' HELPER: THE CATPART OF A PART ROW, ALSO WHEN ApplyWorkMode DID NOT BRING IT
+' 1. the reference is a loaded CATPart (the usual case after design mode)
+' 2. the node's shape representation - for a CATProduct whose geometry is a
+'    CATPart, or when design mode did not load it; this loads that ONE file
+' ==============================================================================
+Private Function LoadPartDocument(oProd As Product, ByRef oPart As Part, _
+                                  ByRef oPartDoc As PartDocument) As Boolean
+    Dim d As Object, ok As Boolean
+
+    ok = TryGetLoadedPart(oProd, oPart, oPartDoc)
+    If Not ok Then
+        On Error Resume Next
+        Set d = Nothing
+        Set d = oProd.ReferenceProduct.GetMasterShapeRepresentation(True)
+        If d Is Nothing Then
+            Err.Clear
+            Set d = oProd.GetMasterShapeRepresentation(True)
+        End If
+        Err.Clear
+        If Not d Is Nothing Then
+            If TypeName(d) = "PartDocument" Then
+                Set oPartDoc = d
+                Set oPart = oPartDoc.Part
+                ok = Not (oPart Is Nothing)
+            End If
+        End If
+        Err.Clear
+        On Error GoTo 0
+    End If
+    LoadPartDocument = ok
+End Function
+
+' what CATIA has of a part that gave no values - for the log
+Private Function PartStateText(oProd As Product, ByVal hasPart As Boolean) As String
+    Dim tn As String, pth As String, hasShape As String
+
+    On Error Resume Next
+    tn = "?"
+    tn = TypeName(oProd.ReferenceProduct.Parent)
+    Err.Clear
+    hasShape = "?"
+    hasShape = CStr(oProd.HasAMasterShapeRepresentation)
+    Err.Clear
+    pth = "?"
+    pth = CStr(oProd.GetMasterShapeRepresentationPathName)
+    Err.Clear
+    On Error GoTo 0
+    PartStateText = "reference document = " & tn & ", shape = " & hasShape & _
+                    ", shape file = " & pth & ", CATPart loaded = " & CStr(hasPart)
 End Function
 
 ' ==============================================================================

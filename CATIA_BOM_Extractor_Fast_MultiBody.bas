@@ -157,8 +157,10 @@ Private Const MAX_ASSY_LEAVES_FOR_SHOT As Long = 400
 ' True = every part (and every sub-assembly that is a CATProduct of its own)
 ' is pictured in a WINDOW OF ITS OWN, where it is alone: nothing has to be
 ' hidden, so this also works on read-only Teamcenter data, and every part
-' number is pictured only once for the whole run. False = only the old way:
-' hide every part, show one, capture.
+' number is pictured only once for the whole run. False = parts and
+' sub-assemblies only the old way: hide every part, show one, capture.
+' (The pictures of the single bodies of a multi-body part are always taken in
+' the part's own window.)
 Private Const PICTURES_IN_OWN_WINDOW As Boolean = True
 ' True = after the split level the macro asks whether pictures are wanted at
 ' all. A run without pictures is the quickest way to all numbers of a big product.
@@ -283,6 +285,8 @@ Private mBodyValCache As Object  ' part number|body -> Array(mass, vol, area, L,
 Private mShotFiles As Object     ' "P|pn" / "A|pn" / "B|pn|body" -> picture file, reused by every row
 Private mShotSigs As Object      ' same keys -> fingerprint of that picture file
 Private mShotNo As Long          ' running number of the picture files
+Private mPartDocs As Object      ' part number -> the CATPart document pass 1 found for it
+Private mCompassToggled As Boolean ' the compass was switched off for the pictures
 Private mTempDir As String
 Private mSheetNo As Long
 Private mSheetNames As Object    ' every sheet name used in the workbook
@@ -444,7 +448,9 @@ Private Sub RunBOM()
     Set mBodyValCache = CreateObject("Scripting.Dictionary")
     Set mShotFiles = CreateObject("Scripting.Dictionary")
     Set mShotSigs = CreateObject("Scripting.Dictionary")
+    Set mPartDocs = CreateObject("Scripting.Dictionary")
     mShotNo = 0
+    mCompassToggled = False
     Set mSheetNames = CreateObject("Scripting.Dictionary")
     mSheetNames.CompareMode = vbTextCompare
     mBBoxDisabled = False
@@ -507,6 +513,7 @@ Private Sub RunBOM()
     ' --- 6. MAIN WINDOW: geometry only, fixed camera ----------------------------
     Call PrepareWindow(rootWin, rootViewer, rootLayout, rootLayoutSet)
     compassToggled = ToggleCompass()
+    mCompassToggled = compassToggled
 
     If splitLevel = 0 Then
 
@@ -979,6 +986,9 @@ Private Function ProcessLoose(colInst As Collection, colLevel As Collection, _
     Call FinishSheetLayout(xlSheet)
     Call SaveWorkbook(False)
     Call CheckExcel
+    ' RunBOM has hidden these parts for the main-window scene - visible again,
+    ' so the first picture (and the reference of the show / hide check) has them
+    Call SetShowCollection(sel, mLeaves, 0)
     Call TakePictures(sel, oViewer, xlSheet)
 
     If Not hdrOK Or nLost > 0 Then
@@ -1123,6 +1133,11 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
             Set oPart = Nothing
             Set oPartDoc = Nothing
             hasPart = LoadPartDocument(oPartProd, oPart, oPartDoc)
+            ' the picture pass needs the same CATPart - also when it was only
+            ' found through the shape representation
+            If hasPart Then
+                If Not mPartDocs.Exists(strPartNum) Then mPartDocs.Add strPartNum, oPartDoc
+            End If
 
             ' multi-body parts: the body names are cached per part number, so a
             ' part that appears on several sheets gets its body rows on every one
@@ -1518,7 +1533,7 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
     Dim bodyNames As Variant
     Dim colWasShown As Collection, colWasHidden As Collection
     Dim colFb As Collection
-    Dim t As Double, sceneOK As Boolean
+    Dim t As Double, sceneOK As Boolean, isAll As Boolean
 
     If mJobRow.Count = 0 Then Exit Sub
 
@@ -1572,7 +1587,7 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                 picPath = CachedShot(shotKey)
                 If Len(picPath) = 0 And PICTURES_IN_OWN_WINDOW Then
                     Set oProd = mRef(key)
-                    If TryGetLoadedPart(oProd, oPart, oPartDoc) Then
+                    If PartDocOf(oProd, pn, oPart, oPartDoc) Then
                         picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, Nothing, Empty, "", "")
                     End If
                 End If
@@ -1582,7 +1597,7 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                 picPath = CachedShot(shotKey)
                 If Len(picPath) = 0 And mBodies.Exists(pn) Then
                     Set oProd = mRef(key)
-                    If TryGetLoadedPart(oProd, oPart, oPartDoc) Then
+                    If PartDocOf(oProd, pn, oPart, oPartDoc) Then
                         bodyNames = mBodies(pn)
                         picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, oPart, bodyNames, _
                                                   bodyName, "P|" & pn)
@@ -1659,10 +1674,12 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                 Call LogLine(mSheetName & "  picture (show / hide) " & i & "/" & colFb.Count & "  " & kind & " " & pn)
                 mShotNo = mShotNo + 1
                 picPath = mTempDir & "\shot" & mShotNo & ".jpg"
+                isAll = False                 ' does this row show the whole component?
                 If kind = "ASSY" Then
                     Set colNode = Nothing
                     If mNodeLeaves.Exists(key) Then Set colNode = mNodeLeaves(key)
                     If Not colNode Is Nothing Then
+                        isAll = (colNode.Count >= mLeaves.Count)
                         If colNode.Count > 0 And colNode.Count <= MAX_ASSY_LEAVES_FOR_SHOT Then
                             Call SetShowCollection(sel, colNode, 0)
                             Call Settle(ASSY_SETTLE_MS)
@@ -1671,6 +1688,7 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                         End If
                     End If
                 Else
+                    isAll = (mLeaves.Count <= 1)
                     Set oProd = mRef(key)
                     Call SetShowSingle(sel, oProd, 0)
                     Call Settle(PART_SETTLE_MS)
@@ -1679,9 +1697,10 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                 End If
 
                 If mFso.FileExists(picPath) Then
-                    ' nothing or everything visible: no picture of THIS row
+                    ' nothing visible, or the whole component for a row that is
+                    ' only a piece of it: no picture of THIS row
                     sig = FileSignature(picPath)
-                    If sig = baseSig Or sig = fullSig Then
+                    If sig = baseSig Or (sig = fullSig And Not isAll) Then
                         On Error Resume Next
                         mFso.DeleteFile picPath, True
                         Err.Clear
@@ -1755,6 +1774,9 @@ Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKe
     Set v = Nothing
     Set v = w.ActiveViewer
     w.Layout = catWindowGeomOnly             ' no specification tree in the picture
+    ' every new window starts with its own compass (the window is closed
+    ' again, so nothing has to be put back)
+    If mCompassToggled Then Call ToggleCompass
     Err.Clear
 
     If Len(bodyName) > 0 And Not oPart Is Nothing Then
@@ -1811,6 +1833,28 @@ Private Function CachedShot(ByVal shotKey As String) As String
     If mShotFiles Is Nothing Then Exit Function
     If Not mShotFiles.Exists(shotKey) Then Exit Function
     If mFso.FileExists(CStr(mShotFiles(shotKey))) Then CachedShot = CStr(mShotFiles(shotKey))
+End Function
+
+' the CATPart of a picture row: the one pass 1 found, else found again
+Private Function PartDocOf(oProd As Product, ByVal pn As String, ByRef oPart As Part, _
+                           ByRef oPartDoc As PartDocument) As Boolean
+    Dim ok As Boolean
+
+    ok = False
+    Set oPart = Nothing
+    Set oPartDoc = Nothing
+    If Not mPartDocs Is Nothing Then
+        If mPartDocs.Exists(pn) Then
+            On Error Resume Next
+            Set oPartDoc = mPartDocs(pn)
+            Set oPart = oPartDoc.Part
+            ok = (Err.Number = 0) And Not (oPart Is Nothing)
+            Err.Clear
+            On Error GoTo 0
+        End If
+    End If
+    If Not ok Then ok = LoadPartDocument(oProd, oPart, oPartDoc)
+    PartDocOf = ok
 End Function
 
 ' a fingerprint of a picture file: two captures of an unchanged view are the
@@ -3309,28 +3353,25 @@ End Sub
 ' HELPER: BATCHED SHOW / HIDE FOR A COLLECTION OF PRODUCTS
 ' One Selection.Add per item but only ONE SetShow call (= one visual update).
 ' CATIA refuses the whole SetShow when ONE element cannot be shown or hidden
-' (e.g. a component that is not loaded) - then the list is done again in
-' blocks of 50, and a refused block one by one.
+' (e.g. a component that is not loaded) - then a refused range is halved again
+' and again, so the refused element costs a few calls, not the whole list.
 ' In CATIA: SetShow(0) = SHOW, SetShow(1) = HIDE
 ' ==============================================================================
 Sub SetShowCollection(sel As Selection, colItems As Collection, ByVal showMode As Integer)
-    Dim n As Long, i As Long, i2 As Long, k As Long
-
     If colItems Is Nothing Then Exit Sub
-    n = colItems.Count
-    If n = 0 Then Exit Sub
-    If SetShowRange(sel, colItems, 1, n, showMode) Then Exit Sub
+    If colItems.Count = 0 Then Exit Sub
+    Call SetShowSplit(sel, colItems, 1, colItems.Count, showMode)
+End Sub
 
-    For i = 1 To n Step 50
-        i2 = i + 49
-        If i2 > n Then i2 = n
-        If Not SetShowRange(sel, colItems, i, i2, showMode) Then
-            For k = i To i2
-                Call SetShowRange(sel, colItems, k, k, showMode)
-            Next k
-        End If
-        DoEvents
-    Next i
+Private Sub SetShowSplit(sel As Selection, colItems As Collection, ByVal i1 As Long, _
+                         ByVal i2 As Long, ByVal showMode As Integer)
+    Dim m As Long
+    If SetShowRange(sel, colItems, i1, i2, showMode) Then Exit Sub
+    If i1 >= i2 Then Exit Sub                ' one element CATIA refuses - left as it is
+    m = (i1 + i2) \ 2
+    DoEvents
+    Call SetShowSplit(sel, colItems, i1, m, showMode)
+    Call SetShowSplit(sel, colItems, m + 1, i2, showMode)
 End Sub
 
 ' items i1..i2 of the list in one selection and one SetShow; False = refused

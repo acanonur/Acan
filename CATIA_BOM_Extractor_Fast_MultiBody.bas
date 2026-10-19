@@ -96,7 +96,8 @@ Option Explicit
 ' BOTH versions write:
 '   - Column N "First Level": the first level node (direct child of the root)
 '     the row belongs to, so the BOM can be filtered per first level
-'   - Column O "Type": Assembly / Part / Body
+'   - Column O "Type": Assembly / Part / Body, or "Not loaded" for a component
+'     CATIA has not loaded (no part number readable - no values, no picture)
 '   - Columns A..M unchanged, so both sheets import into the ACE cost model
 '
 ' MULTI-BODY CATPart:
@@ -291,7 +292,6 @@ Private mShotFiles As Object     ' "P|pn" / "A|pn" / "B|pn|body" -> picture file
 Private mShotSigs As Object      ' same keys -> fingerprint of that picture file
 Private mShotNo As Long          ' running number of the picture files
 Private mPartDocs As Object      ' part number -> the CATPart document pass 1 found for it
-Private mCompassToggled As Boolean ' the compass was switched off for the pictures
 Private mTempDir As String
 Private mSheetNo As Long
 Private mSheetNames As Object    ' every sheet name used in the workbook
@@ -307,6 +307,7 @@ Private mIdxRedo As Collection   ' Index writes Excel could not take - repeated 
 Private mIdxFmtOK As Boolean     ' the text formats of the Index are applied
 Private mIdxEarly As Collection  ' Index rows written BEFORE those formats - written again after them
 Private mNotLoaded As Object     ' part numbers of sub-assemblies that are not loaded in CATIA
+Private mNoPartNumber As Object  ' row names of components whose part number cannot be read
 Private mSlow As Collection      ' Array(seconds, step) of every slow step
 Private mPump As Long            ' node counter of the tree walks
 
@@ -450,12 +451,12 @@ Private Sub RunBOM()
     Set mRollCache = CreateObject("Scripting.Dictionary")
     Set mPromoted = CreateObject("Scripting.Dictionary")
     Set mNotLoaded = CreateObject("Scripting.Dictionary")
+    Set mNoPartNumber = CreateObject("Scripting.Dictionary")
     Set mBodyValCache = CreateObject("Scripting.Dictionary")
     Set mShotFiles = CreateObject("Scripting.Dictionary")
     Set mShotSigs = CreateObject("Scripting.Dictionary")
     Set mPartDocs = CreateObject("Scripting.Dictionary")
     mShotNo = 0
-    mCompassToggled = False
     Set mSheetNames = CreateObject("Scripting.Dictionary")
     mSheetNames.CompareMode = vbTextCompare
     mBBoxDisabled = False
@@ -518,7 +519,6 @@ Private Sub RunBOM()
     ' --- 6. MAIN WINDOW: geometry only, fixed camera ----------------------------
     Call PrepareWindow(rootWin, rootViewer, rootLayout, rootLayoutSet)
     compassToggled = ToggleCompass()
-    mCompassToggled = compassToggled
 
     If splitLevel = 0 Then
 
@@ -1107,7 +1107,19 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
             End If
         End If
 
-        If notLoaded And Not isAssy Then
+        If notLoaded And Not isAssy And mNoPartNumber.Exists(strPartNum) Then
+            ' a component CATIA cannot even give a part number for: not loaded,
+            ' and whether it is a part or an assembly is unknown
+            nParts = nParts + 1
+            Call BufSet(r, 15, "Not loaded")
+            Call BufSet(r, 1, "-")
+            For bi = 6 To 11
+                Call BufSet(r, bi, "N/A")
+            Next bi
+            Call BufSet(r, 12, "NOT LOADED - part number cannot be read")
+            Call BufSet(r, 13, "N/A")
+
+        ElseIf notLoaded And Not isAssy Then
             nAssy = nAssy + 1
             Call BufSet(r, 15, "Assembly")
             mBoldRows.Add r
@@ -1454,18 +1466,27 @@ End Function
 
 ' the row name of a component whose part number cannot be read - noted as
 ' NOT LOADED, so it is neither loaded nor measured (that could be a whole
-' sub-assembly in one blocking call)
+' sub-assembly in one blocking call). The instance number is left out
+' ("Bracket.3" -> "Bracket"), so the instances of one part stay one row.
 Private Function NoPartNumberName(oProd As Product) As String
-    Dim nm As String
+    Dim nm As String, k As Long, tail As String
     nm = ""
     On Error Resume Next
     nm = oProd.Name
     Err.Clear
     On Error GoTo 0
+    k = InStrRev(nm, ".")
+    If k > 1 Then
+        tail = Mid$(nm, k + 1)
+        If Len(tail) > 0 And Not (tail Like "*[!0-9]*") Then nm = Left$(nm, k - 1)
+    End If
     If Len(nm) = 0 Then nm = "?"
     nm = "(no part number) " & nm
     If Not mNotLoaded Is Nothing Then
         If Not mNotLoaded.Exists(nm) Then mNotLoaded.Add nm, True
+    End If
+    If Not mNoPartNumber Is Nothing Then
+        If Not mNoPartNumber.Exists(nm) Then mNoPartNumber.Add nm, True
     End If
     NoPartNumberName = nm
 End Function
@@ -1558,7 +1579,7 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
     Dim bodyNames As Variant
     Dim colWasShown As Collection, colWasHidden As Collection
     Dim colFb As Collection
-    Dim t As Double, sceneOK As Boolean, isAll As Boolean
+    Dim t As Double, sceneOK As Boolean
     Dim partSel As Selection, oBody As Body
 
     If mJobRow.Count = 0 Then Exit Sub
@@ -1708,12 +1729,10 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                 Call LogLine(mSheetName & "  picture (show / hide) " & i & "/" & colFb.Count & "  " & kind & " " & pn)
                 mShotNo = mShotNo + 1
                 picPath = mTempDir & "\shot" & mShotNo & ".jpg"
-                isAll = False                 ' does this row show the whole component?
                 If kind = "ASSY" Then
                     Set colNode = Nothing
                     If mNodeLeaves.Exists(key) Then Set colNode = mNodeLeaves(key)
                     If Not colNode Is Nothing Then
-                        isAll = (colNode.Count >= mLeaves.Count)
                         If colNode.Count > 0 And colNode.Count <= MAX_ASSY_LEAVES_FOR_SHOT Then
                             Call SetShowCollection(sel, colNode, 0)
                             Call Settle(ASSY_SETTLE_MS)
@@ -1745,7 +1764,6 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                         End If
                     End If
                 Else
-                    isAll = (mLeaves.Count <= 1)
                     Set oProd = mRef(key)
                     Call SetShowSingle(sel, oProd, 0)
                     Call Settle(PART_SETTLE_MS)
@@ -1754,15 +1772,16 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                 End If
 
                 If mFso.FileExists(picPath) Then
-                    ' nothing visible, or the whole component for a row that is
-                    ' only a piece of it: no picture of THIS row
+                    ' nothing visible: no picture of THIS row. (Equal to the whole
+                    ' component is fine here - hiding works, so the rest of the
+                    ' component simply draws nothing, e.g. parts not loaded.)
                     sig = FileSignature(picPath)
                     ' a body equal to its whole part: hiding the other bodies
                     ' had no effect
                     If kind = "BODY" And mShotSigs.Exists("P|" & pn) Then
                         If mShotSigs("P|" & pn) = sig Then sig = baseSig
                     End If
-                    If sig = baseSig Or (sig = fullSig And Not isAll) Then
+                    If sig = baseSig Then
                         On Error Resume Next
                         mFso.DeleteFile picPath, True
                         Err.Clear
@@ -1835,9 +1854,8 @@ Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKe
     Set v = Nothing
     Set v = w.ActiveViewer
     w.Layout = catWindowGeomOnly             ' no specification tree in the picture
-    ' every new window starts with its own compass (the window is closed
-    ' again, so nothing has to be put back)
-    If mCompassToggled Then Call ToggleCompass
+    ' (no compass command here: when the window is not really displayed, the
+    '  command lands in the main window and changes every later picture)
     Err.Clear
 
     If Len(bodyName) > 0 And Not oPart Is Nothing Then
@@ -3265,21 +3283,31 @@ End Function
 
 ' the sub-assemblies CATIA had not loaded - their content is missing in the BOM
 Private Function NotLoadedText() As String
-    Dim k As Variant, s As String, n As Long
+    Dim k As Variant, s As String, nA As Long, nP As Long, listA As String, listP As String
+
     NotLoadedText = ""
     If mNotLoaded Is Nothing Then Exit Function
     If mNotLoaded.Count = 0 Then Exit Function
-    s = mNotLoaded.Count & " sub-assembly(ies) were NOT LOADED in CATIA - their content is" & vbCrLf & _
-        "missing in the BOM (marked ""NOT LOADED"" in column L):" & vbCrLf
     For Each k In mNotLoaded.Keys
-        n = n + 1
-        If n > 8 Then
-            s = s & "  ..." & vbCrLf
-            Exit For
+        If mNoPartNumber.Exists(CStr(k)) Then
+            nP = nP + 1
+            If nP <= 6 Then listP = listP & "  " & CStr(k) & vbCrLf
+        Else
+            nA = nA + 1
+            If nA <= 6 Then listA = listA & "  " & CStr(k) & vbCrLf
         End If
-        s = s & "  " & CStr(k) & vbCrLf
     Next k
-    NotLoadedText = s & vbCrLf
+    If nA > 6 Then listA = listA & "  ..." & vbCrLf
+    If nP > 6 Then listP = listP & "  ..." & vbCrLf
+    If nA > 0 Then
+        s = s & nA & " sub-assembly(ies) NOT LOADED (or empty) in CATIA - their content is" & vbCrLf & _
+                "missing in the BOM (column L):" & vbCrLf & listA & vbCrLf
+    End If
+    If nP > 0 Then
+        s = s & nP & " component(s) NOT LOADED in CATIA (no part number readable) -" & vbCrLf & _
+                "rows of Type ""Not loaded"" without values:" & vbCrLf & listP & vbCrLf
+    End If
+    NotLoadedText = s
 End Function
 
 ' one line into the log file - opened and closed every time, so the file is

@@ -154,14 +154,15 @@ Private Const CAPTURE_PART_SHOTS As Boolean = True
 ' stalling the run. Set CAPTURE_ASSEMBLY_SHOTS = False for the fastest run.
 Private Const CAPTURE_ASSEMBLY_SHOTS As Boolean = True
 Private Const MAX_ASSY_LEAVES_FOR_SHOT As Long = 400
+' False (default) = every picture is taken in the MAIN window: every part is
+' hidden, the one of the row is shown, captured and hidden again. A part
+' number is pictured only once for the whole run.
 ' True = every part (and every sub-assembly that is a CATProduct of its own)
-' is pictured in a WINDOW OF ITS OWN, where it is alone: nothing has to be
-' hidden, so this also works on read-only Teamcenter data, and every part
-' number is pictured only once for the whole run. False = parts and
-' sub-assemblies only the old way: hide every part, show one, capture.
-' (The pictures of the single bodies of a multi-body part are always taken in
-' the part's own window.)
-Private Const PICTURES_IN_OWN_WINDOW As Boolean = True
+' is first tried in a window of its own. On some installations (seen with
+' Teamcenter) such a window is never displayed and CATIA captures the main
+' window instead - every picture the same. Those pictures are recognised and
+' taken in the main window after all.
+Private Const PICTURES_IN_OWN_WINDOW As Boolean = False
 ' True = after the split level the macro asks whether pictures are wanted at
 ' all. A run without pictures is the quickest way to all numbers of a big product.
 Private Const ASK_PICTURES As Boolean = True
@@ -224,10 +225,14 @@ Private Const ASSY_DIMS_MAX_PARTS As Long = 200
 ' A sub-assembly on level n that is used several times gets ONE sheet; its
 ' quantities are per piece and the Index says how many pieces there are.
 Private Const ASK_SPLIT_LEVEL As Boolean = True
-' False = every component is done in the main window (no extra windows).
+' False (default) = every component is done in the main window: the other
+' components are hidden meanwhile, so CATIA still only draws the one that is
+' worked on. True = each component in a window of its own - but on some
+' installations (seen with Teamcenter) the pictures of such a window come out
+' as pictures of the main window, so it is off.
 ' A component that is not the root of its own CATProduct file (e.g. a
-' "Product1" inserted inside another assembly) is always done there.
-Private Const OPEN_UNITS_IN_NEW_WINDOW As Boolean = True
+' "Product1" inserted inside another assembly) is always done in the main window.
+Private Const OPEN_UNITS_IN_NEW_WINDOW As Boolean = False
 
 ' --- EXCEL, SAVING AND LOG ---------------------------------------------------
 ' True = the BOM goes into an Excel of its OWN (a separate Excel window). Your
@@ -960,6 +965,7 @@ Private Function ProcessLoose(colInst As Collection, colLevel As Collection, _
         pn = oProd.PartNumber
         Err.Clear
         On Error GoTo LooseFail
+        If Len(pn) = 0 And Not isAssembly Then pn = NoPartNumberName(oProd)
         If Len(pn) = 0 Then pn = oProd.Name
 
         If Not isAssembly Then
@@ -1109,7 +1115,7 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
             For bi = 6 To 11
                 Call BufSet(r, bi, "N/A")
             Next bi
-            Call BufSet(r, 12, "NOT LOADED or empty - content missing")
+            Call BufSet(r, 12, "NOT LOADED (or empty) - content missing")
             Call BufSet(r, 13, "N/A")
 
         ElseIf Not isAssy Then
@@ -1446,6 +1452,25 @@ Private Function RollUp(ByVal pn As String, ByVal depth As Long) As Variant
     RollUp = res
 End Function
 
+' the row name of a component whose part number cannot be read - noted as
+' NOT LOADED, so it is neither loaded nor measured (that could be a whole
+' sub-assembly in one blocking call)
+Private Function NoPartNumberName(oProd As Product) As String
+    Dim nm As String
+    nm = ""
+    On Error Resume Next
+    nm = oProd.Name
+    Err.Clear
+    On Error GoTo 0
+    If Len(nm) = 0 Then nm = "?"
+    nm = "(no part number) " & nm
+    If Not mNotLoaded Is Nothing Then
+        If Not mNotLoaded.Exists(nm) Then mNotLoaded.Add nm, True
+    End If
+    NoPartNumberName = nm
+End Function
+
+
 ' ==============================================================================
 ' HELPER: IS A CHILDLESS NODE A SUB-ASSEMBLY THAT IS NOT LOADED (OR EMPTY)?
 ' Decided WITHOUT loading anything - every ApplyWorkMode on such a node would
@@ -1534,6 +1559,7 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
     Dim colWasShown As Collection, colWasHidden As Collection
     Dim colFb As Collection
     Dim t As Double, sceneOK As Boolean, isAll As Boolean
+    Dim partSel As Selection, oBody As Body
 
     If mJobRow.Count = 0 Then Exit Sub
 
@@ -1588,19 +1614,19 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                 If Len(picPath) = 0 And PICTURES_IN_OWN_WINDOW Then
                     Set oProd = mRef(key)
                     If PartDocOf(oProd, pn, oPart, oPartDoc) Then
-                        picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, Nothing, Empty, "", "")
+                        picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, Nothing, Empty, "", "", fullSig)
                     End If
                 End If
 
             Case "BODY"
                 shotKey = "B|" & pn & "|" & bodyName
                 picPath = CachedShot(shotKey)
-                If Len(picPath) = 0 And mBodies.Exists(pn) Then
+                If Len(picPath) = 0 And mBodies.Exists(pn) And PICTURES_IN_OWN_WINDOW Then
                     Set oProd = mRef(key)
                     If PartDocOf(oProd, pn, oPart, oPartDoc) Then
                         bodyNames = mBodies(pn)
                         picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, oPart, bodyNames, _
-                                                  bodyName, "P|" & pn)
+                                                  bodyName, "P|" & pn, fullSig)
                     End If
                 End If
 
@@ -1611,15 +1637,15 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                     Set oProd = mRef(key)
                     Set oDoc = OwnDocumentOf(oProd, pn, homeDoc)
                     If Not oDoc Is Nothing Then
-                        picPath = ShotInOwnWindow(oDoc, homeWin, shotKey, Nothing, Empty, "", "")
+                        picPath = ShotInOwnWindow(oDoc, homeWin, shotKey, Nothing, Empty, "", "", fullSig)
                     End If
                 End If
         End Select
 
         If Len(picPath) > 0 Then
             If Not XlInsertPicture(xlSheet, rowNo, picPath) Then Call XlPutCell(xlSheet, rowNo, 1, "No Preview")
-        ElseIf kind = "PART" Or kind = "ASSY" Then
-            colFb.Add j                       ' tried below, by show / hide
+        ElseIf kind = "PART" Or kind = "ASSY" Or kind = "BODY" Then
+            colFb.Add j                       ' below, by show / hide in this window
         Else
             Call XlPutCell(xlSheet, rowNo, 1, "No Preview")
         End If
@@ -1664,12 +1690,20 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
             rowNo = mJobRow(j)
             kind = mJobKind(j)
             key = mJobKey(j)
+            bodyName = mJobBody(j)
             pn = ""
             If mPartNum.Exists(key) Then pn = mPartNum(key)
-            picPath = ""
+            If kind = "ASSY" Then
+                shotKey = "A|" & pn
+            ElseIf kind = "BODY" Then
+                shotKey = "B|" & pn & "|" & bodyName
+            Else
+                shotKey = "P|" & pn
+            End If
+            picPath = CachedShot(shotKey)       ' an earlier row may have it by now
             t = Timer
 
-            If sceneOK Then
+            If sceneOK And Len(picPath) = 0 Then
                 Call SetStatus("BOM " & mSheetName & ": picture (show / hide) " & i & " of " & colFb.Count)
                 Call LogLine(mSheetName & "  picture (show / hide) " & i & "/" & colFb.Count & "  " & kind & " " & pn)
                 mShotNo = mShotNo + 1
@@ -1687,6 +1721,29 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                             Call SetShowCollection(sel, colNode, 1)
                         End If
                     End If
+                ElseIf kind = "BODY" Then
+                    ' the part shown, all its bodies hidden, then this one body
+                    Set oProd = mRef(key)
+                    If mBodies.Exists(pn) Then
+                        If PartDocOf(oProd, pn, oPart, oPartDoc) Then
+                            bodyNames = mBodies(pn)
+                            Set partSel = oPartDoc.Selection
+                            Call SetShowSingle(sel, oProd, 0)
+                            Call SetShowBodyList(oPart, partSel, bodyNames, 1)
+                            Set oBody = GetBodyByName(oPart, bodyName)
+                            On Error Resume Next
+                            partSel.Clear
+                            partSel.Add oBody
+                            partSel.VisProperties.SetShow 0
+                            partSel.Clear
+                            Err.Clear
+                            On Error GoTo 0
+                            Call Settle(PART_SETTLE_MS)
+                            Call CaptureViewToFile(oViewer, picPath)
+                            Call SetShowBodyList(oPart, partSel, bodyNames, 0)
+                            Call SetShowSingle(sel, oProd, 1)
+                        End If
+                    End If
                 Else
                     isAll = (mLeaves.Count <= 1)
                     Set oProd = mRef(key)
@@ -1700,6 +1757,11 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                     ' nothing visible, or the whole component for a row that is
                     ' only a piece of it: no picture of THIS row
                     sig = FileSignature(picPath)
+                    ' a body equal to its whole part: hiding the other bodies
+                    ' had no effect
+                    If kind = "BODY" And mShotSigs.Exists("P|" & pn) Then
+                        If mShotSigs("P|" & pn) = sig Then sig = baseSig
+                    End If
                     If sig = baseSig Or (sig = fullSig And Not isAll) Then
                         On Error Resume Next
                         mFso.DeleteFile picPath, True
@@ -1707,7 +1769,6 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                         On Error GoTo 0
                         picPath = ""
                     Else
-                        If kind = "ASSY" Then shotKey = "A|" & pn Else shotKey = "P|" & pn
                         If Not mShotFiles.Exists(shotKey) Then
                             mShotFiles.Add shotKey, picPath
                             mShotSigs.Add shotKey, sig
@@ -1755,7 +1816,7 @@ End Sub
 ' ==============================================================================
 Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKey As String, _
                                  oPart As Part, bodyNames As Variant, ByVal bodyName As String, _
-                                 ByVal refKey As String) As String
+                                 ByVal refKey As String, ByVal homeSig As String) As String
     Dim w As Object, v As Viewer, partSel As Selection, oBody As Body
     Dim picPath As String, sig As String, ok As Boolean, isolated As Boolean
 
@@ -1806,6 +1867,16 @@ Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKe
     If Not ok Then Exit Function
 
     sig = FileSignature(picPath)
+    ' the same as the main window: the new window was not displayed and CATIA
+    ' captured the main window - this row is pictured there instead
+    If Len(homeSig) > 0 And sig = homeSig Then
+        Call LogLine(mSheetName & "  the window of " & shotKey & " was not displayed - main window instead")
+        On Error Resume Next
+        mFso.DeleteFile picPath, True
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
     ' a body picture equal to the picture of the whole part: hiding the other
     ' bodies had no effect - no picture rather than a wrong one
     If Len(refKey) > 0 Then
@@ -2517,8 +2588,12 @@ Private Sub CollectUnits(oProd As Product, ByVal lvl As Long, ByVal target As Lo
         Set child = Nothing
         Set child = oProd.Products.Item(i)
         If Not child Is Nothing Then
+            nk = 0
+            nk = child.Products.Count
             rawPn = ""
             rawPn = child.PartNumber
+            ' (a part whose part number cannot be read is not loaded - see TraverseTree)
+            If Len(rawPn) = 0 And nk = 0 Then rawPn = NoPartNumberName(child)
             pn = rawPn
             If Len(pn) = 0 Then pn = child.Name
 
@@ -2529,8 +2604,6 @@ Private Sub CollectUnits(oProd As Product, ByVal lvl As Long, ByVal target As Lo
             End If
             rowKey = MakeRowKey(parentKey, childFirst, pn)
 
-            nk = 0
-            nk = child.Products.Count
             If Len(rawPn) > 0 Then kids.Add Array(rawPn, (nk > 0))
 
             If nk > 0 And lvl = target Then
@@ -3526,6 +3599,10 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
         On Error GoTo 0
 
         nk = childProd.Products.Count
+        ' a component whose part number cannot be read is not loaded (its
+        ' document is not in the session): it gets a row of its own, marked
+        ' NOT LOADED, instead of disappearing from the BOM
+        If Len(partNum) = 0 And nk = 0 Then partNum = NoPartNumberName(childProd)
         If partNum <> "" Then kids.Add Array(partNum, (nk > 0))
 
         ' The direct children of the root product ARE the first level; deeper

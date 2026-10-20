@@ -1216,7 +1216,8 @@ Private Function FindBOMSheet(wb As Workbook, ByRef cancelled As Boolean) As Wor
     shown = 0
     For i = 1 To cands.Count
         nm = cands(i).Name
-        If Len(nm) > 24 Then nm = Left$(nm, 23) & "~"
+        ' (sheet names are at most 31 characters - shown in full, the prompt
+        '  budget below keeps the list short enough)
         hdr = FindHeaderRow(cands(i))
         lineTxt = i & " = " & nm & " (" & (LastDataRow(cands(i), hdr) - hdr) & " rows"
         ' a sheet the extractor could not finish carries a note in Q1

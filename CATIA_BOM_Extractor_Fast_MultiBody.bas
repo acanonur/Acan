@@ -8,11 +8,14 @@ Option Explicit
 '   1. You are asked at which level the BOM is split. The question shows how
 '      many components and sub-assemblies every level of the product has.
 '        0 = no split: one sheet for the whole product
-'        n = one worksheet per sub-assembly on level n. Each one is opened in a
-'            window of its own, so CATIA only has to draw that sub-assembly while
-'            it is measured and pictured. Parts that are not inside any of them
-'            get one extra sheet, and the "Index" sheet links to every sheet and
-'            shows its level, quantity, path, number of rows, status and time.
+'        1 = one worksheet per first level node, named as in the CATIA tree
+'            (e.g. "_AAA_LASER IGNITER GENV TCA"); the parts directly below the
+'            product get one more sheet
+'        n = one worksheet per sub-assembly on level n. While one is measured
+'            and pictured, the others are hidden, so CATIA only draws that one.
+'            Parts that are not inside any of them get one extra sheet.
+'      The "Index" sheet links to every sheet and shows its level, quantity,
+'      path, number of rows, status and time.
 '   2. You are asked whether pictures are wanted. "No" is the fastest run.
 '   3. Every sheet is filled in TWO PASSES:
 '        pass 1 - all numbers: the display is frozen and nothing is shown or
@@ -95,8 +98,10 @@ Option Explicit
 '
 ' BOTH versions write:
 '   - Column N "First Level": the first level node (direct child of the root)
-'     the row belongs to, so the BOM can be filtered per first level
-'   - Column O "Type": Assembly / Part / Body
+'     the row belongs to, named as in the CATIA tree ("<name>-<part number>"),
+'     so the BOM can be filtered per first level
+'   - Column O "Type": Assembly / Part / Body, or "Not loaded" for a component
+'     CATIA has not loaded (no part number readable - no values, no picture)
 '   - Columns A..M unchanged, so both sheets import into the ACE cost model
 '
 ' MULTI-BODY CATPart:
@@ -126,9 +131,18 @@ Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
 Private mIncludeSubassemblies As Boolean
 Private mGroupBy As String
 
-' False = column N shows the part number of the first level node,
-' True  = column N shows its description
-Private Const FIRST_LEVEL_USE_DESCRIPTION As Boolean = False
+' --- NAMES AS IN THE CATIA TREE ----------------------------------------------
+' A Teamcenter tree shows a component as "<name>-<part number> (<instance>)",
+' e.g. "_AAA_LASER IGNITER GENV TCA-1DP000429955 (1DP000429955.1)". The macro
+' uses the same "<name>-<part number>" for the sheet names, the Index, the
+' column "First Level" and the paths. TREE_NAME says where <name> comes from:
+'   "AUTO"         - the Nomenclature; if empty the Definition; if empty the
+'                    description (default)
+'   "NOMENCLATURE" / "DEFINITION" / "DESCRIPTION" - only that property
+'   "PARTNUMBER"   - no name, the part number alone
+' The log of the run lists all these properties of every first level node, so
+' the right one can be picked if AUTO does not match the tree.
+Private Const TREE_NAME As String = "AUTO"
 
 ' --- HOW LENGTH / WIDTH / HEIGHT ARE MEASURED -------------------------------
 '   "SAFE" (default) - the equivalent box from the inertia. NOTHING is created
@@ -154,14 +168,15 @@ Private Const CAPTURE_PART_SHOTS As Boolean = True
 ' stalling the run. Set CAPTURE_ASSEMBLY_SHOTS = False for the fastest run.
 Private Const CAPTURE_ASSEMBLY_SHOTS As Boolean = True
 Private Const MAX_ASSY_LEAVES_FOR_SHOT As Long = 400
+' False (default) = every picture is taken in the MAIN window: every part is
+' hidden, the one of the row is shown, captured and hidden again. A part
+' number is pictured only once for the whole run.
 ' True = every part (and every sub-assembly that is a CATProduct of its own)
-' is pictured in a WINDOW OF ITS OWN, where it is alone: nothing has to be
-' hidden, so this also works on read-only Teamcenter data, and every part
-' number is pictured only once for the whole run. False = parts and
-' sub-assemblies only the old way: hide every part, show one, capture.
-' (The pictures of the single bodies of a multi-body part are always taken in
-' the part's own window.)
-Private Const PICTURES_IN_OWN_WINDOW As Boolean = True
+' is first tried in a window of its own. On some installations (seen with
+' Teamcenter) such a window is never displayed and CATIA captures the main
+' window instead - every picture the same. Those pictures are recognised and
+' taken in the main window after all.
+Private Const PICTURES_IN_OWN_WINDOW As Boolean = False
 ' True = after the split level the macro asks whether pictures are wanted at
 ' all. A run without pictures is the quickest way to all numbers of a big product.
 Private Const ASK_PICTURES As Boolean = True
@@ -224,10 +239,14 @@ Private Const ASSY_DIMS_MAX_PARTS As Long = 200
 ' A sub-assembly on level n that is used several times gets ONE sheet; its
 ' quantities are per piece and the Index says how many pieces there are.
 Private Const ASK_SPLIT_LEVEL As Boolean = True
-' False = every component is done in the main window (no extra windows).
+' False (default) = every component is done in the main window: the other
+' components are hidden meanwhile, so CATIA still only draws the one that is
+' worked on. True = each component in a window of its own - but on some
+' installations (seen with Teamcenter) the pictures of such a window come out
+' as pictures of the main window, so it is off.
 ' A component that is not the root of its own CATProduct file (e.g. a
-' "Product1" inserted inside another assembly) is always done there.
-Private Const OPEN_UNITS_IN_NEW_WINDOW As Boolean = True
+' "Product1" inserted inside another assembly) is always done in the main window.
+Private Const OPEN_UNITS_IN_NEW_WINDOW As Boolean = False
 
 ' --- EXCEL, SAVING AND LOG ---------------------------------------------------
 ' True = the BOM goes into an Excel of its OWN (a separate Excel window). Your
@@ -286,7 +305,6 @@ Private mShotFiles As Object     ' "P|pn" / "A|pn" / "B|pn|body" -> picture file
 Private mShotSigs As Object      ' same keys -> fingerprint of that picture file
 Private mShotNo As Long          ' running number of the picture files
 Private mPartDocs As Object      ' part number -> the CATPart document pass 1 found for it
-Private mCompassToggled As Boolean ' the compass was switched off for the pictures
 Private mTempDir As String
 Private mSheetNo As Long
 Private mSheetNames As Object    ' every sheet name used in the workbook
@@ -302,6 +320,7 @@ Private mIdxRedo As Collection   ' Index writes Excel could not take - repeated 
 Private mIdxFmtOK As Boolean     ' the text formats of the Index are applied
 Private mIdxEarly As Collection  ' Index rows written BEFORE those formats - written again after them
 Private mNotLoaded As Object     ' part numbers of sub-assemblies that are not loaded in CATIA
+Private mNoPartNumber As Object  ' row names of components whose part number cannot be read
 Private mSlow As Collection      ' Array(seconds, step) of every slow step
 Private mPump As Long            ' node counter of the tree walks
 
@@ -381,6 +400,8 @@ Private Sub RunBOM()
     Dim ownWindow As Boolean
     Dim rootSceneSet As Boolean
     Dim idxHdrOK As Boolean
+    Dim unitName As String, looseName As String, looseText As String
+    Dim dLabelCount As Object, lbl As String
 
     startTime = Timer
 
@@ -445,12 +466,12 @@ Private Sub RunBOM()
     Set mRollCache = CreateObject("Scripting.Dictionary")
     Set mPromoted = CreateObject("Scripting.Dictionary")
     Set mNotLoaded = CreateObject("Scripting.Dictionary")
+    Set mNoPartNumber = CreateObject("Scripting.Dictionary")
     Set mBodyValCache = CreateObject("Scripting.Dictionary")
     Set mShotFiles = CreateObject("Scripting.Dictionary")
     Set mShotSigs = CreateObject("Scripting.Dictionary")
     Set mPartDocs = CreateObject("Scripting.Dictionary")
     mShotNo = 0
-    mCompassToggled = False
     Set mSheetNames = CreateObject("Scripting.Dictionary")
     mSheetNames.CompareMode = vbTextCompare
     mBBoxDisabled = False
@@ -488,6 +509,7 @@ Private Sub RunBOM()
         End If
     End If
     Call LogLine("split level " & splitLevel & ", pictures: " & IIf(mShotParts Or mShotAssy, "yes", "no"))
+    Call LogTreeNames(rootProd)
 
     ' --- 4. SESSION --------------------------------------------------------------
     On Error Resume Next
@@ -513,7 +535,6 @@ Private Sub RunBOM()
     ' --- 6. MAIN WINDOW: geometry only, fixed camera ----------------------------
     Call PrepareWindow(rootWin, rootViewer, rootLayout, rootLayoutSet)
     compassToggled = ToggleCompass()
-    mCompassToggled = compassToggled
 
     If splitLevel = 0 Then
 
@@ -562,12 +583,26 @@ Private Sub RunBOM()
         Call WriteIndexHeader(idxSheet, splitLevel, idxHdrOK)
         idxRow = 3
 
+        ' how many components would get the same (shortened) sheet name - those
+        ' keep their part number in it, so they can be told apart
+        Set dLabelCount = CreateObject("Scripting.Dictionary")
+        dLabelCount.CompareMode = vbTextCompare
+        For Each unitKey In dUnitQty.Keys
+            lbl = SheetLabel(TreeName(dUnitRef(unitKey), CStr(unitKey)), CStr(unitKey))
+            If dLabelCount.Exists(lbl) Then
+                dLabelCount(lbl) = dLabelCount(lbl) + 1
+            Else
+                dLabelCount.Add lbl, 1
+            End If
+        Next unitKey
+
         ' --- the components that are CATProducts of their own: own window ------
         For Each unitKey In dUnitQty.Keys
             nUnits = nUnits + 1
             unitStart = Timer
             nRows = 0: nAssy = 0: nParts = 0
             statusTxt = "not started"
+            unitName = CStr(unitKey)
             Set xlSheet = Nothing
             mXlSkipAt = -1                   ' a "skip" given for an earlier component ends here
             Call CheckExcel                  ' Excel gone: stop the whole run here
@@ -577,11 +612,19 @@ Private Sub RunBOM()
             On Error GoTo UnitFail
 
             Set unitInst = dUnitRef(unitKey)
-            Call LogLine("=== component " & nUnits & " of " & dUnitQty.Count & ": " & CStr(unitKey))
-            Set xlSheet = AddSheet(mXlBook, Format(nUnits, "00") & " " & CStr(unitKey))
+            ' the name of the component as the CATIA tree shows it
+            unitName = TreeName(unitInst, CStr(unitKey))
+            Call LogLine("=== component " & nUnits & " of " & dUnitQty.Count & ": " & unitName)
+            lbl = SheetLabel(unitName, CStr(unitKey))
+            If dLabelCount.Exists(lbl) Then
+                If dLabelCount(lbl) > 1 And lbl <> unitName And Len(CStr(unitKey)) < 25 Then
+                    lbl = Left$(lbl, 31 - Len(CStr(unitKey)) - 1) & "-" & CStr(unitKey)
+                End If
+            End If
+            Set xlSheet = AddSheet(mXlBook, lbl)
             If xlSheet Is Nothing Then Err.Raise vbObjectError + 514, , "Excel could not add a sheet"
 
-            Call NoteIndexRow(idxSheet, idxRow, nUnits, CStr(unitKey), CStr(dUnitDesc(unitKey)), _
+            Call NoteIndexRow(idxSheet, idxRow, nUnits, unitName, CStr(dUnitDesc(unitKey)), _
                                splitLevel, CLng(dUnitQty(unitKey)), CStr(dUnitFirst(unitKey)), _
                                CStr(dUnitPath(unitKey)), mSheetName)
 
@@ -648,7 +691,7 @@ UnitCleanup:
             Set unitWin = Nothing
             rootWin.Activate
             If xlSheet Is Nothing Then
-                Call NoteIndexRow(idxSheet, idxRow, nUnits, CStr(unitKey), CStr(dUnitDesc(unitKey)), _
+                Call NoteIndexRow(idxSheet, idxRow, nUnits, unitName, CStr(dUnitDesc(unitKey)), _
                                    splitLevel, CLng(dUnitQty(unitKey)), CStr(dUnitFirst(unitKey)), _
                                    CStr(dUnitPath(unitKey)), "")
             End If
@@ -700,24 +743,29 @@ UnitNext:
                 mXlSkipAt = -1
                 Call CheckExcel
                 unitStart = Timer
-                Call LogLine("=== above level " & splitLevel)
-                Set xlSheet = AddSheet(mXlBook, "Above level " & splitLevel)
+                If splitLevel = 1 Then
+                    looseName = "Parts on level 1"
+                    looseText = "the parts directly below the product (first level parts)"
+                Else
+                    looseName = "Above level " & splitLevel
+                    looseText = "parts that are not inside any component of level " & splitLevel & _
+                                IIf(mIncludeSubassemblies, ", and the assemblies above it", "")
+                End If
+                Call LogLine("=== " & looseName)
+                Set xlSheet = AddSheet(mXlBook, looseName)
                 If Not xlSheet Is Nothing Then
-                    Call NoteIndexRow(idxSheet, idxRow, 0, "(above level " & splitLevel & ")", _
-                                       "parts that are not inside any component of level " & splitLevel & _
-                                       IIf(mIncludeSubassemblies, ", and the assemblies above it", ""), _
+                    Call NoteIndexRow(idxSheet, idxRow, 0, "(" & looseName & ")", looseText, _
                                        0, colLooseParts.Count, "", "", mSheetName)
                     unitOK = ProcessLoose(colLooseInst, colLooseLevel, colLooseFirst, colLooseKey, _
                                           colLooseIsAssy, rootSel, rootViewer, xlSheet, _
                                           nRows, nAssy, nParts, statusTxt)
                     Call NoteIndexResult(idxSheet, idxRow, nRows, statusTxt, Elapsed(unitStart), "main window")
-                    Call LogLine("above level " & splitLevel & ": " & statusTxt & ", " & nRows & " rows, " & _
+                    Call LogLine(looseName & ": " & statusTxt & ", " & nRows & " rows, " & _
                                  Format(Elapsed(unitStart), "0") & " s")
                     totRows = totRows + nRows: totAssy = totAssy + nAssy: totParts = totParts + nParts
                 Else
-                    Call LogLine("above level " & splitLevel & ": no sheet - Excel could not add one")
-                    Call NoteIndexRow(idxSheet, idxRow, 0, "(above level " & splitLevel & ")", _
-                                "parts that are not inside any component of level " & splitLevel, _
+                    Call LogLine(looseName & ": no sheet - Excel could not add one")
+                    Call NoteIndexRow(idxSheet, idxRow, 0, "(" & looseName & ")", looseText, _
                                 0, colLooseParts.Count, "", "", "")
                     Call NoteIndexResult(idxSheet, idxRow, 0, "stopped: Excel could not add the sheet", _
                                    Elapsed(unitStart), "-")
@@ -960,6 +1008,7 @@ Private Function ProcessLoose(colInst As Collection, colLevel As Collection, _
         pn = oProd.PartNumber
         Err.Clear
         On Error GoTo LooseFail
+        If Len(pn) = 0 And Not isAssembly Then pn = NoPartNumberName(oProd)
         If Len(pn) = 0 Then pn = oProd.Name
 
         If Not isAssembly Then
@@ -1101,7 +1150,19 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
             End If
         End If
 
-        If notLoaded And Not isAssy Then
+        If notLoaded And Not isAssy And mNoPartNumber.Exists(strPartNum) Then
+            ' a component CATIA cannot even give a part number for: not loaded,
+            ' and whether it is a part or an assembly is unknown
+            nParts = nParts + 1
+            Call BufSet(r, 15, "Not loaded")
+            Call BufSet(r, 1, "-")
+            For bi = 6 To 11
+                Call BufSet(r, bi, "N/A")
+            Next bi
+            Call BufSet(r, 12, "NOT LOADED - part number cannot be read")
+            Call BufSet(r, 13, "N/A")
+
+        ElseIf notLoaded And Not isAssy Then
             nAssy = nAssy + 1
             Call BufSet(r, 15, "Assembly")
             mBoldRows.Add r
@@ -1109,7 +1170,7 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
             For bi = 6 To 11
                 Call BufSet(r, bi, "N/A")
             Next bi
-            Call BufSet(r, 12, "NOT LOADED or empty - content missing")
+            Call BufSet(r, 12, "NOT LOADED (or empty) - content missing")
             Call BufSet(r, 13, "N/A")
 
         ElseIf Not isAssy Then
@@ -1446,6 +1507,34 @@ Private Function RollUp(ByVal pn As String, ByVal depth As Long) As Variant
     RollUp = res
 End Function
 
+' the row name of a component whose part number cannot be read - noted as
+' NOT LOADED, so it is neither loaded nor measured (that could be a whole
+' sub-assembly in one blocking call). The instance number is left out
+' ("Bracket.3" -> "Bracket"), so the instances of one part stay one row.
+Private Function NoPartNumberName(oProd As Product) As String
+    Dim nm As String, k As Long, tail As String
+    nm = ""
+    On Error Resume Next
+    nm = oProd.Name
+    Err.Clear
+    On Error GoTo 0
+    k = InStrRev(nm, ".")
+    If k > 1 Then
+        tail = Mid$(nm, k + 1)
+        If Len(tail) > 0 And Not (tail Like "*[!0-9]*") Then nm = Left$(nm, k - 1)
+    End If
+    If Len(nm) = 0 Then nm = "?"
+    nm = "(no part number) " & nm
+    If Not mNotLoaded Is Nothing Then
+        If Not mNotLoaded.Exists(nm) Then mNotLoaded.Add nm, True
+    End If
+    If Not mNoPartNumber Is Nothing Then
+        If Not mNoPartNumber.Exists(nm) Then mNoPartNumber.Add nm, True
+    End If
+    NoPartNumberName = nm
+End Function
+
+
 ' ==============================================================================
 ' HELPER: IS A CHILDLESS NODE A SUB-ASSEMBLY THAT IS NOT LOADED (OR EMPTY)?
 ' Decided WITHOUT loading anything - every ApplyWorkMode on such a node would
@@ -1533,7 +1622,8 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
     Dim bodyNames As Variant
     Dim colWasShown As Collection, colWasHidden As Collection
     Dim colFb As Collection
-    Dim t As Double, sceneOK As Boolean, isAll As Boolean
+    Dim t As Double, sceneOK As Boolean
+    Dim partSel As Selection, oBody As Body
 
     If mJobRow.Count = 0 Then Exit Sub
 
@@ -1588,19 +1678,19 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                 If Len(picPath) = 0 And PICTURES_IN_OWN_WINDOW Then
                     Set oProd = mRef(key)
                     If PartDocOf(oProd, pn, oPart, oPartDoc) Then
-                        picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, Nothing, Empty, "", "")
+                        picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, Nothing, Empty, "", "", fullSig)
                     End If
                 End If
 
             Case "BODY"
                 shotKey = "B|" & pn & "|" & bodyName
                 picPath = CachedShot(shotKey)
-                If Len(picPath) = 0 And mBodies.Exists(pn) Then
+                If Len(picPath) = 0 And mBodies.Exists(pn) And PICTURES_IN_OWN_WINDOW Then
                     Set oProd = mRef(key)
                     If PartDocOf(oProd, pn, oPart, oPartDoc) Then
                         bodyNames = mBodies(pn)
                         picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, oPart, bodyNames, _
-                                                  bodyName, "P|" & pn)
+                                                  bodyName, "P|" & pn, fullSig)
                     End If
                 End If
 
@@ -1611,15 +1701,15 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                     Set oProd = mRef(key)
                     Set oDoc = OwnDocumentOf(oProd, pn, homeDoc)
                     If Not oDoc Is Nothing Then
-                        picPath = ShotInOwnWindow(oDoc, homeWin, shotKey, Nothing, Empty, "", "")
+                        picPath = ShotInOwnWindow(oDoc, homeWin, shotKey, Nothing, Empty, "", "", fullSig)
                     End If
                 End If
         End Select
 
         If Len(picPath) > 0 Then
             If Not XlInsertPicture(xlSheet, rowNo, picPath) Then Call XlPutCell(xlSheet, rowNo, 1, "No Preview")
-        ElseIf kind = "PART" Or kind = "ASSY" Then
-            colFb.Add j                       ' tried below, by show / hide
+        ElseIf kind = "PART" Or kind = "ASSY" Or kind = "BODY" Then
+            colFb.Add j                       ' below, by show / hide in this window
         Else
             Call XlPutCell(xlSheet, rowNo, 1, "No Preview")
         End If
@@ -1664,22 +1754,28 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
             rowNo = mJobRow(j)
             kind = mJobKind(j)
             key = mJobKey(j)
+            bodyName = mJobBody(j)
             pn = ""
             If mPartNum.Exists(key) Then pn = mPartNum(key)
-            picPath = ""
+            If kind = "ASSY" Then
+                shotKey = "A|" & pn
+            ElseIf kind = "BODY" Then
+                shotKey = "B|" & pn & "|" & bodyName
+            Else
+                shotKey = "P|" & pn
+            End If
+            picPath = CachedShot(shotKey)       ' an earlier row may have it by now
             t = Timer
 
-            If sceneOK Then
+            If sceneOK And Len(picPath) = 0 Then
                 Call SetStatus("BOM " & mSheetName & ": picture (show / hide) " & i & " of " & colFb.Count)
                 Call LogLine(mSheetName & "  picture (show / hide) " & i & "/" & colFb.Count & "  " & kind & " " & pn)
                 mShotNo = mShotNo + 1
                 picPath = mTempDir & "\shot" & mShotNo & ".jpg"
-                isAll = False                 ' does this row show the whole component?
                 If kind = "ASSY" Then
                     Set colNode = Nothing
                     If mNodeLeaves.Exists(key) Then Set colNode = mNodeLeaves(key)
                     If Not colNode Is Nothing Then
-                        isAll = (colNode.Count >= mLeaves.Count)
                         If colNode.Count > 0 And colNode.Count <= MAX_ASSY_LEAVES_FOR_SHOT Then
                             Call SetShowCollection(sel, colNode, 0)
                             Call Settle(ASSY_SETTLE_MS)
@@ -1687,8 +1783,30 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                             Call SetShowCollection(sel, colNode, 1)
                         End If
                     End If
+                ElseIf kind = "BODY" Then
+                    ' the part shown, all its bodies hidden, then this one body
+                    Set oProd = mRef(key)
+                    If mBodies.Exists(pn) Then
+                        If PartDocOf(oProd, pn, oPart, oPartDoc) Then
+                            bodyNames = mBodies(pn)
+                            Set partSel = oPartDoc.Selection
+                            Call SetShowSingle(sel, oProd, 0)
+                            Call SetShowBodyList(oPart, partSel, bodyNames, 1)
+                            Set oBody = GetBodyByName(oPart, bodyName)
+                            On Error Resume Next
+                            partSel.Clear
+                            partSel.Add oBody
+                            partSel.VisProperties.SetShow 0
+                            partSel.Clear
+                            Err.Clear
+                            On Error GoTo 0
+                            Call Settle(PART_SETTLE_MS)
+                            Call CaptureViewToFile(oViewer, picPath)
+                            Call SetShowBodyList(oPart, partSel, bodyNames, 0)
+                            Call SetShowSingle(sel, oProd, 1)
+                        End If
+                    End If
                 Else
-                    isAll = (mLeaves.Count <= 1)
                     Set oProd = mRef(key)
                     Call SetShowSingle(sel, oProd, 0)
                     Call Settle(PART_SETTLE_MS)
@@ -1697,17 +1815,22 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                 End If
 
                 If mFso.FileExists(picPath) Then
-                    ' nothing visible, or the whole component for a row that is
-                    ' only a piece of it: no picture of THIS row
+                    ' nothing visible: no picture of THIS row. (Equal to the whole
+                    ' component is fine here - hiding works, so the rest of the
+                    ' component simply draws nothing, e.g. parts not loaded.)
                     sig = FileSignature(picPath)
-                    If sig = baseSig Or (sig = fullSig And Not isAll) Then
+                    ' a body equal to its whole part: hiding the other bodies
+                    ' had no effect
+                    If kind = "BODY" And mShotSigs.Exists("P|" & pn) Then
+                        If mShotSigs("P|" & pn) = sig Then sig = baseSig
+                    End If
+                    If sig = baseSig Then
                         On Error Resume Next
                         mFso.DeleteFile picPath, True
                         Err.Clear
                         On Error GoTo 0
                         picPath = ""
                     Else
-                        If kind = "ASSY" Then shotKey = "A|" & pn Else shotKey = "P|" & pn
                         If Not mShotFiles.Exists(shotKey) Then
                             mShotFiles.Add shotKey, picPath
                             mShotSigs.Add shotKey, sig
@@ -1755,7 +1878,7 @@ End Sub
 ' ==============================================================================
 Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKey As String, _
                                  oPart As Part, bodyNames As Variant, ByVal bodyName As String, _
-                                 ByVal refKey As String) As String
+                                 ByVal refKey As String, ByVal homeSig As String) As String
     Dim w As Object, v As Viewer, partSel As Selection, oBody As Body
     Dim picPath As String, sig As String, ok As Boolean, isolated As Boolean
 
@@ -1774,9 +1897,8 @@ Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKe
     Set v = Nothing
     Set v = w.ActiveViewer
     w.Layout = catWindowGeomOnly             ' no specification tree in the picture
-    ' every new window starts with its own compass (the window is closed
-    ' again, so nothing has to be put back)
-    If mCompassToggled Then Call ToggleCompass
+    ' (no compass command here: when the window is not really displayed, the
+    '  command lands in the main window and changes every later picture)
     Err.Clear
 
     If Len(bodyName) > 0 And Not oPart Is Nothing Then
@@ -1806,6 +1928,16 @@ Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKe
     If Not ok Then Exit Function
 
     sig = FileSignature(picPath)
+    ' the same as the main window: the new window was not displayed and CATIA
+    ' captured the main window - this row is pictured there instead
+    If Len(homeSig) > 0 And sig = homeSig Then
+        Call LogLine(mSheetName & "  the window of " & shotKey & " was not displayed - main window instead")
+        On Error Resume Next
+        mFso.DeleteFile picPath, True
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
     ' a body picture equal to the picture of the whole part: hiding the other
     ' bodies had no effect - no picture rather than a wrong one
     If Len(refKey) > 0 Then
@@ -2218,7 +2350,7 @@ Private Sub WriteIndexHeader(idxSheet As Object, ByVal splitLevel As Long, ByRef
                   "  -  quantities on a component sheet are per ONE piece of that component; " & _
                   "column E says how many pieces the product contains"
         a(2, 1) = "#"
-        a(2, 2) = "Component"
+        a(2, 2) = "Component (as in the CATIA tree)"
         a(2, 3) = "Description"
         a(2, 4) = "Level"
         a(2, 5) = "Qty in product"
@@ -2369,7 +2501,7 @@ End Sub
 Private Function AskSplitLevel(rootProd As Product) As Long
     Dim cntAll(1 To 30) As Long, cntAssy(1 To 30) As Long
     Dim maxDepth As Long, lvl As Long, n As Long
-    Dim msg As String, ans As String
+    Dim msg As String, ans As String, deflt As String
     Dim t As Double
 
     AskSplitLevel = 0
@@ -2383,8 +2515,9 @@ Private Function AskSplitLevel(rootProd As Product) As Long
 
     msg = "At which level should the BOM be split?" & vbCrLf & vbCrLf & _
           "0 = no split: one sheet for the whole product" & vbCrLf & _
-          "n = one sheet per sub-assembly on level n," & vbCrLf & _
-          "     each one worked in its own window" & vbCrLf & vbCrLf & _
+          "1 = one sheet per first level node, as in the CATIA tree" & vbCrLf & _
+          "     (the parts directly below the product on one more sheet)" & vbCrLf & _
+          "n = one sheet per sub-assembly on level n" & vbCrLf & vbCrLf & _
           "Level:  components  (sub-assemblies)" & vbCrLf
     For lvl = 1 To maxDepth
         If lvl > 15 Then
@@ -2393,9 +2526,15 @@ Private Function AskSplitLevel(rootProd As Product) As Long
         End If
         msg = msg & "  " & lvl & ":   " & cntAll(lvl) & "  (" & cntAssy(lvl) & ")" & vbCrLf
     Next lvl
+    ' one sheet per first level node is offered first, when there is any
+    If maxDepth >= 1 Then
+        If cntAssy(1) > 0 Then deflt = "1" Else deflt = "0"
+    Else
+        deflt = "0"
+    End If
 
     Do
-        ans = Trim$(InputBox(msg, "BOM - split level", "0"))
+        ans = Trim$(InputBox(msg, "BOM - split level", deflt))
         If Len(ans) = 0 Then
             AskSplitLevel = -1                       ' Cancel or empty
             Exit Function
@@ -2517,8 +2656,12 @@ Private Sub CollectUnits(oProd As Product, ByVal lvl As Long, ByVal target As Lo
         Set child = Nothing
         Set child = oProd.Products.Item(i)
         If Not child Is Nothing Then
+            nk = 0
+            nk = child.Products.Count
             rawPn = ""
             rawPn = child.PartNumber
+            ' (a part whose part number cannot be read is not loaded - see TraverseTree)
+            If Len(rawPn) = 0 And nk = 0 Then rawPn = NoPartNumberName(child)
             pn = rawPn
             If Len(pn) = 0 Then pn = child.Name
 
@@ -2529,8 +2672,6 @@ Private Sub CollectUnits(oProd As Product, ByVal lvl As Long, ByVal target As Lo
             End If
             rowKey = MakeRowKey(parentKey, childFirst, pn)
 
-            nk = 0
-            nk = child.Products.Count
             If Len(rawPn) > 0 Then kids.Add Array(rawPn, (nk > 0))
 
             If nk > 0 And lvl = target Then
@@ -2563,7 +2704,12 @@ Private Sub CollectUnits(oProd As Product, ByVal lvl As Long, ByVal target As Lo
                     colLooseKey.Add rowKey
                     colLooseIsAssy.Add True
                 End If
-                If Len(pathTxt) > 0 Then childPath = pathTxt & " > " & pn Else childPath = pn
+                ' the path in the names of the CATIA tree
+                If Len(pathTxt) > 0 Then
+                    childPath = pathTxt & " > " & TreeName(child, pn)
+                Else
+                    childPath = TreeName(child, pn)
+                End If
                 Call CollectUnits(child, lvl + 1, target, childFirst, childPath, rowKey, _
                                   dUnitQty, dUnitRef, dUnitFirst, dUnitDesc, dUnitPath, _
                                   colUnitInst, colAbove, colLooseInst, colLooseLevel, _
@@ -3192,21 +3338,31 @@ End Function
 
 ' the sub-assemblies CATIA had not loaded - their content is missing in the BOM
 Private Function NotLoadedText() As String
-    Dim k As Variant, s As String, n As Long
+    Dim k As Variant, s As String, nA As Long, nP As Long, listA As String, listP As String
+
     NotLoadedText = ""
     If mNotLoaded Is Nothing Then Exit Function
     If mNotLoaded.Count = 0 Then Exit Function
-    s = mNotLoaded.Count & " sub-assembly(ies) were NOT LOADED in CATIA - their content is" & vbCrLf & _
-        "missing in the BOM (marked ""NOT LOADED"" in column L):" & vbCrLf
     For Each k In mNotLoaded.Keys
-        n = n + 1
-        If n > 8 Then
-            s = s & "  ..." & vbCrLf
-            Exit For
+        If mNoPartNumber.Exists(CStr(k)) Then
+            nP = nP + 1
+            If nP <= 6 Then listP = listP & "  " & CStr(k) & vbCrLf
+        Else
+            nA = nA + 1
+            If nA <= 6 Then listA = listA & "  " & CStr(k) & vbCrLf
         End If
-        s = s & "  " & CStr(k) & vbCrLf
     Next k
-    NotLoadedText = s & vbCrLf
+    If nA > 6 Then listA = listA & "  ..." & vbCrLf
+    If nP > 6 Then listP = listP & "  ..." & vbCrLf
+    If nA > 0 Then
+        s = s & nA & " sub-assembly(ies) NOT LOADED (or empty) in CATIA - their content is" & vbCrLf & _
+                "missing in the BOM (column L):" & vbCrLf & listA & vbCrLf
+    End If
+    If nP > 0 Then
+        s = s & nP & " component(s) NOT LOADED in CATIA (no part number readable) -" & vbCrLf & _
+                "rows of Type ""Not loaded"" without values:" & vbCrLf & listP & vbCrLf
+    End If
+    NotLoadedText = s
 End Function
 
 ' one line into the log file - opened and closed every time, so the file is
@@ -3526,6 +3682,10 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
         On Error GoTo 0
 
         nk = childProd.Products.Count
+        ' a component whose part number cannot be read is not loaded (its
+        ' document is not in the session): it gets a row of its own, marked
+        ' NOT LOADED, instead of disappearing from the BOM
+        If Len(partNum) = 0 And nk = 0 Then partNum = NoPartNumberName(childProd)
         If partNum <> "" Then kids.Add Array(partNum, (nk > 0))
 
         ' The direct children of the root product ARE the first level; deeper
@@ -3624,32 +3784,103 @@ Function MakeRowKey(ByVal parentKey As String, ByVal firstLevel As String, _
 End Function
 
 ' ==============================================================================
-' HELPER: NAME OF A FIRST LEVEL NODE (part number, or description on request)
+' HELPER: NAME OF A FIRST LEVEL NODE - as in the CATIA tree
 ' ==============================================================================
 Function FirstLevelLabel(oProd As Product, ByVal partNum As String) As String
     Dim s As String
-    Dim d As String
 
-    s = partNum
-
-    If FIRST_LEVEL_USE_DESCRIPTION Then
-        d = ""
-        On Error Resume Next
-        d = oProd.DescriptionRef
-        Err.Clear
-        On Error GoTo 0
-        If Len(Trim$(d)) > 0 Then s = d
-    End If
-
+    s = TreeName(oProd, partNum)
     If Len(s) = 0 Then
         On Error Resume Next
         s = oProd.Name
         Err.Clear
         On Error GoTo 0
     End If
-
     FirstLevelLabel = s
 End Function
+
+' ==============================================================================
+' HELPER: "<name>-<part number>" OF A COMPONENT, AS THE CATIA TREE SHOWS IT
+' (see TREE_NAME). Without a name it is the part number alone.
+' ==============================================================================
+Function TreeName(oProd As Product, ByVal pn As String) As String
+    Dim nm As String, src As String
+
+    src = UCase$(TREE_NAME)
+    nm = ""
+    If src <> "PARTNUMBER" Then
+        On Error Resume Next
+        Select Case src
+            Case "NOMENCLATURE"
+                nm = oProd.Nomenclature
+            Case "DEFINITION"
+                nm = oProd.Definition
+            Case "DESCRIPTION"
+                nm = oProd.DescriptionRef
+            Case Else                                  ' AUTO
+                nm = oProd.Nomenclature
+                If Len(Trim$(nm)) = 0 Then nm = oProd.Definition
+                If Len(Trim$(nm)) = 0 Then nm = oProd.DescriptionRef
+        End Select
+        Err.Clear
+        On Error GoTo 0
+    End If
+    nm = Trim$(nm)
+
+    If Len(nm) = 0 Then
+        TreeName = pn
+    ElseIf Len(pn) = 0 Or InStr(1, nm, pn, vbTextCompare) > 0 Then
+        TreeName = nm                                ' the name has the part number already
+    Else
+        TreeName = nm & "-" & pn
+    End If
+End Function
+
+' the sheet name of a component: its tree name; when "<name>-<part number>" is
+' longer than the 31 characters Excel allows, the name alone
+Private Function SheetLabel(ByVal treeNm As String, ByVal pn As String) As String
+    Dim lbl As String, k As Long
+
+    lbl = treeNm
+    If Len(lbl) > 31 And Len(pn) > 0 Then
+        k = InStrRev(lbl, "-" & pn, -1, vbTextCompare)
+        If k > 1 Then lbl = Left$(lbl, k - 1)
+    End If
+    If Len(Trim$(lbl)) = 0 Then lbl = pn
+    SheetLabel = lbl
+End Function
+
+' every first level node with all the properties a tree name can come from -
+' to check which one the CATIA tree shows (see TREE_NAME)
+Private Sub LogTreeNames(rootProd As Product)
+    Dim i As Long, n As Long, child As Product
+    Dim pn As String, nmc As String, dfn As String, dsc As String, inst As String
+
+    On Error Resume Next
+    n = 0
+    n = rootProd.Products.Count
+    Call LogLine("first level nodes (part number | Nomenclature | Definition | DescriptionRef | instance -> name used):")
+    For i = 1 To n
+        If i > 60 Then
+            Call LogLine("  ... " & (n - 60) & " more")
+            Exit For
+        End If
+        Set child = Nothing
+        Set child = rootProd.Products.Item(i)
+        If Not child Is Nothing Then
+            pn = "": nmc = "": dfn = "": dsc = "": inst = ""
+            pn = child.PartNumber
+            nmc = child.Nomenclature
+            dfn = child.Definition
+            dsc = child.DescriptionRef
+            inst = child.Name
+            Err.Clear
+            Call LogLine("  " & pn & " | " & nmc & " | " & dfn & " | " & dsc & " | " & inst & _
+                         "  ->  " & TreeName(child, pn))
+        End If
+    Next i
+    Err.Clear
+End Sub
 
 ' ==============================================================================
 ' HELPER: REGISTER ONE BOM ROW (sub-assembly or part)

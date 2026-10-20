@@ -401,6 +401,7 @@ Private Sub RunBOM()
     Dim rootSceneSet As Boolean
     Dim idxHdrOK As Boolean
     Dim unitName As String, looseName As String, looseText As String
+    Dim dLabelCount As Object, lbl As String
 
     startTime = Timer
 
@@ -582,6 +583,19 @@ Private Sub RunBOM()
         Call WriteIndexHeader(idxSheet, splitLevel, idxHdrOK)
         idxRow = 3
 
+        ' how many components would get the same (shortened) sheet name - those
+        ' keep their part number in it, so they can be told apart
+        Set dLabelCount = CreateObject("Scripting.Dictionary")
+        dLabelCount.CompareMode = vbTextCompare
+        For Each unitKey In dUnitQty.Keys
+            lbl = SheetLabel(TreeName(dUnitRef(unitKey), CStr(unitKey)), CStr(unitKey))
+            If dLabelCount.Exists(lbl) Then
+                dLabelCount(lbl) = dLabelCount(lbl) + 1
+            Else
+                dLabelCount.Add lbl, 1
+            End If
+        Next unitKey
+
         ' --- the components that are CATProducts of their own: own window ------
         For Each unitKey In dUnitQty.Keys
             nUnits = nUnits + 1
@@ -601,7 +615,13 @@ Private Sub RunBOM()
             ' the name of the component as the CATIA tree shows it
             unitName = TreeName(unitInst, CStr(unitKey))
             Call LogLine("=== component " & nUnits & " of " & dUnitQty.Count & ": " & unitName)
-            Set xlSheet = AddSheet(mXlBook, SheetLabel(unitName, CStr(unitKey)))
+            lbl = SheetLabel(unitName, CStr(unitKey))
+            If dLabelCount.Exists(lbl) Then
+                If dLabelCount(lbl) > 1 And lbl <> unitName And Len(CStr(unitKey)) < 25 Then
+                    lbl = Left$(lbl, 31 - Len(CStr(unitKey)) - 1) & "-" & CStr(unitKey)
+                End If
+            End If
+            Set xlSheet = AddSheet(mXlBook, lbl)
             If xlSheet Is Nothing Then Err.Raise vbObjectError + 514, , "Excel could not add a sheet"
 
             Call NoteIndexRow(idxSheet, idxRow, nUnits, unitName, CStr(dUnitDesc(unitKey)), _
@@ -740,11 +760,11 @@ UnitNext:
                                           colLooseIsAssy, rootSel, rootViewer, xlSheet, _
                                           nRows, nAssy, nParts, statusTxt)
                     Call NoteIndexResult(idxSheet, idxRow, nRows, statusTxt, Elapsed(unitStart), "main window")
-                    Call LogLine("above level " & splitLevel & ": " & statusTxt & ", " & nRows & " rows, " & _
+                    Call LogLine(looseName & ": " & statusTxt & ", " & nRows & " rows, " & _
                                  Format(Elapsed(unitStart), "0") & " s")
                     totRows = totRows + nRows: totAssy = totAssy + nAssy: totParts = totParts + nParts
                 Else
-                    Call LogLine("above level " & splitLevel & ": no sheet - Excel could not add one")
+                    Call LogLine(looseName & ": no sheet - Excel could not add one")
                     Call NoteIndexRow(idxSheet, idxRow, 0, "(" & looseName & ")", looseText, _
                                 0, colLooseParts.Count, "", "", "")
                     Call NoteIndexResult(idxSheet, idxRow, 0, "stopped: Excel could not add the sheet", _

@@ -8,11 +8,14 @@ Option Explicit
 '   1. You are asked at which level the BOM is split. The question shows how
 '      many components and sub-assemblies every level of the product has.
 '        0 = no split: one sheet for the whole product
-'        n = one worksheet per sub-assembly on level n. Each one is opened in a
-'            window of its own, so CATIA only has to draw that sub-assembly while
-'            it is measured and pictured. Parts that are not inside any of them
-'            get one extra sheet, and the "Index" sheet links to every sheet and
-'            shows its level, quantity, path, number of rows, status and time.
+'        1 = one worksheet per first level node, named as in the CATIA tree
+'            (e.g. "_AAA_LASER IGNITER GENV TCA"); the parts directly below the
+'            product get one more sheet
+'        n = one worksheet per sub-assembly on level n. While one is measured
+'            and pictured, the others are hidden, so CATIA only draws that one.
+'            Parts that are not inside any of them get one extra sheet.
+'      The "Index" sheet links to every sheet and shows its level, quantity,
+'      path, number of rows, status and time.
 '   2. You are asked whether pictures are wanted. "No" is the fastest run.
 '   3. Every sheet is filled in TWO PASSES:
 '        pass 1 - all numbers: the display is frozen and nothing is shown or
@@ -95,7 +98,8 @@ Option Explicit
 '
 ' BOTH versions write:
 '   - Column N "First Level": the first level node (direct child of the root)
-'     the row belongs to, so the BOM can be filtered per first level
+'     the row belongs to, named as in the CATIA tree ("<name>-<part number>"),
+'     so the BOM can be filtered per first level
 '   - Column O "Type": Assembly / Part / Body, or "Not loaded" for a component
 '     CATIA has not loaded (no part number readable - no values, no picture)
 '   - Columns A..M unchanged, so both sheets import into the ACE cost model
@@ -127,9 +131,18 @@ Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
 Private mIncludeSubassemblies As Boolean
 Private mGroupBy As String
 
-' False = column N shows the part number of the first level node,
-' True  = column N shows its description
-Private Const FIRST_LEVEL_USE_DESCRIPTION As Boolean = False
+' --- NAMES AS IN THE CATIA TREE ----------------------------------------------
+' A Teamcenter tree shows a component as "<name>-<part number> (<instance>)",
+' e.g. "_AAA_LASER IGNITER GENV TCA-1DP000429955 (1DP000429955.1)". The macro
+' uses the same "<name>-<part number>" for the sheet names, the Index, the
+' column "First Level" and the paths. TREE_NAME says where <name> comes from:
+'   "AUTO"         - the Nomenclature; if empty the Definition; if empty the
+'                    description (default)
+'   "NOMENCLATURE" / "DEFINITION" / "DESCRIPTION" - only that property
+'   "PARTNUMBER"   - no name, the part number alone
+' The log of the run lists all these properties of every first level node, so
+' the right one can be picked if AUTO does not match the tree.
+Private Const TREE_NAME As String = "AUTO"
 
 ' --- HOW LENGTH / WIDTH / HEIGHT ARE MEASURED -------------------------------
 '   "SAFE" (default) - the equivalent box from the inertia. NOTHING is created
@@ -387,6 +400,7 @@ Private Sub RunBOM()
     Dim ownWindow As Boolean
     Dim rootSceneSet As Boolean
     Dim idxHdrOK As Boolean
+    Dim unitName As String, looseName As String, looseText As String
 
     startTime = Timer
 
@@ -494,6 +508,7 @@ Private Sub RunBOM()
         End If
     End If
     Call LogLine("split level " & splitLevel & ", pictures: " & IIf(mShotParts Or mShotAssy, "yes", "no"))
+    Call LogTreeNames(rootProd)
 
     ' --- 4. SESSION --------------------------------------------------------------
     On Error Resume Next
@@ -573,6 +588,7 @@ Private Sub RunBOM()
             unitStart = Timer
             nRows = 0: nAssy = 0: nParts = 0
             statusTxt = "not started"
+            unitName = CStr(unitKey)
             Set xlSheet = Nothing
             mXlSkipAt = -1                   ' a "skip" given for an earlier component ends here
             Call CheckExcel                  ' Excel gone: stop the whole run here
@@ -582,11 +598,13 @@ Private Sub RunBOM()
             On Error GoTo UnitFail
 
             Set unitInst = dUnitRef(unitKey)
-            Call LogLine("=== component " & nUnits & " of " & dUnitQty.Count & ": " & CStr(unitKey))
-            Set xlSheet = AddSheet(mXlBook, Format(nUnits, "00") & " " & CStr(unitKey))
+            ' the name of the component as the CATIA tree shows it
+            unitName = TreeName(unitInst, CStr(unitKey))
+            Call LogLine("=== component " & nUnits & " of " & dUnitQty.Count & ": " & unitName)
+            Set xlSheet = AddSheet(mXlBook, SheetLabel(unitName, CStr(unitKey)))
             If xlSheet Is Nothing Then Err.Raise vbObjectError + 514, , "Excel could not add a sheet"
 
-            Call NoteIndexRow(idxSheet, idxRow, nUnits, CStr(unitKey), CStr(dUnitDesc(unitKey)), _
+            Call NoteIndexRow(idxSheet, idxRow, nUnits, unitName, CStr(dUnitDesc(unitKey)), _
                                splitLevel, CLng(dUnitQty(unitKey)), CStr(dUnitFirst(unitKey)), _
                                CStr(dUnitPath(unitKey)), mSheetName)
 
@@ -653,7 +671,7 @@ UnitCleanup:
             Set unitWin = Nothing
             rootWin.Activate
             If xlSheet Is Nothing Then
-                Call NoteIndexRow(idxSheet, idxRow, nUnits, CStr(unitKey), CStr(dUnitDesc(unitKey)), _
+                Call NoteIndexRow(idxSheet, idxRow, nUnits, unitName, CStr(dUnitDesc(unitKey)), _
                                    splitLevel, CLng(dUnitQty(unitKey)), CStr(dUnitFirst(unitKey)), _
                                    CStr(dUnitPath(unitKey)), "")
             End If
@@ -705,12 +723,18 @@ UnitNext:
                 mXlSkipAt = -1
                 Call CheckExcel
                 unitStart = Timer
-                Call LogLine("=== above level " & splitLevel)
-                Set xlSheet = AddSheet(mXlBook, "Above level " & splitLevel)
+                If splitLevel = 1 Then
+                    looseName = "Parts on level 1"
+                    looseText = "the parts directly below the product (first level parts)"
+                Else
+                    looseName = "Above level " & splitLevel
+                    looseText = "parts that are not inside any component of level " & splitLevel & _
+                                IIf(mIncludeSubassemblies, ", and the assemblies above it", "")
+                End If
+                Call LogLine("=== " & looseName)
+                Set xlSheet = AddSheet(mXlBook, looseName)
                 If Not xlSheet Is Nothing Then
-                    Call NoteIndexRow(idxSheet, idxRow, 0, "(above level " & splitLevel & ")", _
-                                       "parts that are not inside any component of level " & splitLevel & _
-                                       IIf(mIncludeSubassemblies, ", and the assemblies above it", ""), _
+                    Call NoteIndexRow(idxSheet, idxRow, 0, "(" & looseName & ")", looseText, _
                                        0, colLooseParts.Count, "", "", mSheetName)
                     unitOK = ProcessLoose(colLooseInst, colLooseLevel, colLooseFirst, colLooseKey, _
                                           colLooseIsAssy, rootSel, rootViewer, xlSheet, _
@@ -721,8 +745,7 @@ UnitNext:
                     totRows = totRows + nRows: totAssy = totAssy + nAssy: totParts = totParts + nParts
                 Else
                     Call LogLine("above level " & splitLevel & ": no sheet - Excel could not add one")
-                    Call NoteIndexRow(idxSheet, idxRow, 0, "(above level " & splitLevel & ")", _
-                                "parts that are not inside any component of level " & splitLevel, _
+                    Call NoteIndexRow(idxSheet, idxRow, 0, "(" & looseName & ")", looseText, _
                                 0, colLooseParts.Count, "", "", "")
                     Call NoteIndexResult(idxSheet, idxRow, 0, "stopped: Excel could not add the sheet", _
                                    Elapsed(unitStart), "-")
@@ -2307,7 +2330,7 @@ Private Sub WriteIndexHeader(idxSheet As Object, ByVal splitLevel As Long, ByRef
                   "  -  quantities on a component sheet are per ONE piece of that component; " & _
                   "column E says how many pieces the product contains"
         a(2, 1) = "#"
-        a(2, 2) = "Component"
+        a(2, 2) = "Component (as in the CATIA tree)"
         a(2, 3) = "Description"
         a(2, 4) = "Level"
         a(2, 5) = "Qty in product"
@@ -2458,7 +2481,7 @@ End Sub
 Private Function AskSplitLevel(rootProd As Product) As Long
     Dim cntAll(1 To 30) As Long, cntAssy(1 To 30) As Long
     Dim maxDepth As Long, lvl As Long, n As Long
-    Dim msg As String, ans As String
+    Dim msg As String, ans As String, deflt As String
     Dim t As Double
 
     AskSplitLevel = 0
@@ -2472,8 +2495,9 @@ Private Function AskSplitLevel(rootProd As Product) As Long
 
     msg = "At which level should the BOM be split?" & vbCrLf & vbCrLf & _
           "0 = no split: one sheet for the whole product" & vbCrLf & _
-          "n = one sheet per sub-assembly on level n," & vbCrLf & _
-          "     each one worked in its own window" & vbCrLf & vbCrLf & _
+          "1 = one sheet per first level node, as in the CATIA tree" & vbCrLf & _
+          "     (the parts directly below the product on one more sheet)" & vbCrLf & _
+          "n = one sheet per sub-assembly on level n" & vbCrLf & vbCrLf & _
           "Level:  components  (sub-assemblies)" & vbCrLf
     For lvl = 1 To maxDepth
         If lvl > 15 Then
@@ -2482,9 +2506,15 @@ Private Function AskSplitLevel(rootProd As Product) As Long
         End If
         msg = msg & "  " & lvl & ":   " & cntAll(lvl) & "  (" & cntAssy(lvl) & ")" & vbCrLf
     Next lvl
+    ' one sheet per first level node is offered first, when there is any
+    If maxDepth >= 1 Then
+        If cntAssy(1) > 0 Then deflt = "1" Else deflt = "0"
+    Else
+        deflt = "0"
+    End If
 
     Do
-        ans = Trim$(InputBox(msg, "BOM - split level", "0"))
+        ans = Trim$(InputBox(msg, "BOM - split level", deflt))
         If Len(ans) = 0 Then
             AskSplitLevel = -1                       ' Cancel or empty
             Exit Function
@@ -2654,7 +2684,12 @@ Private Sub CollectUnits(oProd As Product, ByVal lvl As Long, ByVal target As Lo
                     colLooseKey.Add rowKey
                     colLooseIsAssy.Add True
                 End If
-                If Len(pathTxt) > 0 Then childPath = pathTxt & " > " & pn Else childPath = pn
+                ' the path in the names of the CATIA tree
+                If Len(pathTxt) > 0 Then
+                    childPath = pathTxt & " > " & TreeName(child, pn)
+                Else
+                    childPath = TreeName(child, pn)
+                End If
                 Call CollectUnits(child, lvl + 1, target, childFirst, childPath, rowKey, _
                                   dUnitQty, dUnitRef, dUnitFirst, dUnitDesc, dUnitPath, _
                                   colUnitInst, colAbove, colLooseInst, colLooseLevel, _
@@ -3729,32 +3764,103 @@ Function MakeRowKey(ByVal parentKey As String, ByVal firstLevel As String, _
 End Function
 
 ' ==============================================================================
-' HELPER: NAME OF A FIRST LEVEL NODE (part number, or description on request)
+' HELPER: NAME OF A FIRST LEVEL NODE - as in the CATIA tree
 ' ==============================================================================
 Function FirstLevelLabel(oProd As Product, ByVal partNum As String) As String
     Dim s As String
-    Dim d As String
 
-    s = partNum
-
-    If FIRST_LEVEL_USE_DESCRIPTION Then
-        d = ""
-        On Error Resume Next
-        d = oProd.DescriptionRef
-        Err.Clear
-        On Error GoTo 0
-        If Len(Trim$(d)) > 0 Then s = d
-    End If
-
+    s = TreeName(oProd, partNum)
     If Len(s) = 0 Then
         On Error Resume Next
         s = oProd.Name
         Err.Clear
         On Error GoTo 0
     End If
-
     FirstLevelLabel = s
 End Function
+
+' ==============================================================================
+' HELPER: "<name>-<part number>" OF A COMPONENT, AS THE CATIA TREE SHOWS IT
+' (see TREE_NAME). Without a name it is the part number alone.
+' ==============================================================================
+Function TreeName(oProd As Product, ByVal pn As String) As String
+    Dim nm As String, src As String
+
+    src = UCase$(TREE_NAME)
+    nm = ""
+    If src <> "PARTNUMBER" Then
+        On Error Resume Next
+        Select Case src
+            Case "NOMENCLATURE"
+                nm = oProd.Nomenclature
+            Case "DEFINITION"
+                nm = oProd.Definition
+            Case "DESCRIPTION"
+                nm = oProd.DescriptionRef
+            Case Else                                  ' AUTO
+                nm = oProd.Nomenclature
+                If Len(Trim$(nm)) = 0 Then nm = oProd.Definition
+                If Len(Trim$(nm)) = 0 Then nm = oProd.DescriptionRef
+        End Select
+        Err.Clear
+        On Error GoTo 0
+    End If
+    nm = Trim$(nm)
+
+    If Len(nm) = 0 Then
+        TreeName = pn
+    ElseIf Len(pn) = 0 Or InStr(1, nm, pn, vbTextCompare) > 0 Then
+        TreeName = nm                                ' the name has the part number already
+    Else
+        TreeName = nm & "-" & pn
+    End If
+End Function
+
+' the sheet name of a component: its tree name; when "<name>-<part number>" is
+' longer than the 31 characters Excel allows, the name alone
+Private Function SheetLabel(ByVal treeNm As String, ByVal pn As String) As String
+    Dim lbl As String, k As Long
+
+    lbl = treeNm
+    If Len(lbl) > 31 And Len(pn) > 0 Then
+        k = InStrRev(lbl, "-" & pn, -1, vbTextCompare)
+        If k > 1 Then lbl = Left$(lbl, k - 1)
+    End If
+    If Len(Trim$(lbl)) = 0 Then lbl = pn
+    SheetLabel = lbl
+End Function
+
+' every first level node with all the properties a tree name can come from -
+' to check which one the CATIA tree shows (see TREE_NAME)
+Private Sub LogTreeNames(rootProd As Product)
+    Dim i As Long, n As Long, child As Product
+    Dim pn As String, nmc As String, dfn As String, dsc As String, inst As String
+
+    On Error Resume Next
+    n = 0
+    n = rootProd.Products.Count
+    Call LogLine("first level nodes (part number | Nomenclature | Definition | DescriptionRef | instance -> name used):")
+    For i = 1 To n
+        If i > 60 Then
+            Call LogLine("  ... " & (n - 60) & " more")
+            Exit For
+        End If
+        Set child = Nothing
+        Set child = rootProd.Products.Item(i)
+        If Not child Is Nothing Then
+            pn = "": nmc = "": dfn = "": dsc = "": inst = ""
+            pn = child.PartNumber
+            nmc = child.Nomenclature
+            dfn = child.Definition
+            dsc = child.DescriptionRef
+            inst = child.Name
+            Err.Clear
+            Call LogLine("  " & pn & " | " & nmc & " | " & dfn & " | " & dsc & " | " & inst & _
+                         "  ->  " & TreeName(child, pn))
+        End If
+    Next i
+    Err.Clear
+End Sub
 
 ' ==============================================================================
 ' HELPER: REGISTER ONE BOM ROW (sub-assembly or part)

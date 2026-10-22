@@ -2696,7 +2696,7 @@ End Function
 ' its owner), as Chr(1) & name & Chr(1) & name ... & Chr(1)
 Private Function VisiblePartItems(oPart As Part, partSel As Selection, ByVal pn As String, _
                                   ByRef drawn As String) As Collection
-    Dim col As Collection, it As Variant, k As Variant, top As Object
+    Dim col As Collection, it As Variant, k As Variant, dTop As Object
     Dim names As Variant, tree As Variant, depths As Variant, i As Long
     Dim names2() As String, depths2() As Long, ops2() As String
 
@@ -2705,14 +2705,14 @@ Private Function VisiblePartItems(oPart As Part, partSel As Selection, ByVal pn 
     drawn = Chr(1)
     If oPart Is Nothing Then Exit Function
 
-    Set top = CreateObject("Scripting.Dictionary")
+    Set dTop = CreateObject("Scripting.Dictionary")
     If mBodyCache.Exists(pn) And mBodyTree.Exists(pn) Then
         names = mBodyCache(pn)
         If IsArray(names) Then
             tree = mBodyTree(pn)
             depths = tree(0)
             For i = LBound(names) To UBound(names)
-                If CLng(depths(i)) = 1 Then top(CStr(names(i))) = True
+                If CLng(depths(i)) = 1 Then dTop(CStr(names(i))) = True
             Next i
         End If
     End If
@@ -2722,7 +2722,7 @@ Private Function VisiblePartItems(oPart As Part, partSel As Selection, ByVal pn 
         For Each k In mBodyObj.Keys
             If ShowState(partSel, mBodyObj(k)) <> 0 Then
                 col.Add mBodyObj(k)
-                If top.Exists(CStr(k)) Then drawn = drawn & CStr(k) & Chr(1)
+                If dTop.Exists(CStr(k)) Then drawn = drawn & CStr(k) & Chr(1)
             End If
         Next k
     End If
@@ -2752,6 +2752,7 @@ Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKe
                                  ByVal refKey As String, ByVal homeSig As String) As String
     Dim w As Object, v As Viewer, partSel As Selection, oBody As Body
     Dim picPath As String, sig As String, ok As Boolean, isolated As Boolean
+    Dim emptyPath As String, emptySig As String
 
     ShotInOwnWindow = ""
     mShotNo = mShotNo + 1
@@ -2784,8 +2785,17 @@ Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKe
             Exit Function
         End If
         Call SetShowCollection(partSel, colShown, 1)
-        Call SetShowSingle(partSel, oBody, 0)
         isolated = True
+        ' the window with nothing of the part in it - a body that CATIA does
+        ' not draw on its own (inside Add / Assemble) looks exactly like this
+        If Not v Is Nothing Then
+            If SET_ISO_VIEW Then Call SetIsoViewpoint(v)
+            Call Settle(ASSY_SETTLE_MS)
+            emptyPath = mTempDir & "\shot" & mShotNo & "_empty.jpg"
+            If CaptureViewToFile(v, emptyPath) Then emptySig = FileSignature(emptyPath)
+            If mFso.FileExists(emptyPath) Then mFso.DeleteFile emptyPath, True
+        End If
+        Call SetShowSingle(partSel, oBody, 0)
         Err.Clear
     End If
 
@@ -2811,6 +2821,15 @@ Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKe
     ' captured the main window - this row is pictured there instead
     If Len(homeSig) > 0 And sig = homeSig Then
         Call LogLine(mSheetName & "  the window of " & shotKey & " was not displayed - main window instead")
+        On Error Resume Next
+        mFso.DeleteFile picPath, True
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+    ' nothing of the body drawn
+    If Len(emptySig) > 0 And sig = emptySig Then
+        Call LogLine(mSheetName & "  " & shotKey & " is not drawn on its own - No Preview")
         On Error Resume Next
         mFso.DeleteFile picPath, True
         Err.Clear
@@ -5372,7 +5391,9 @@ Private Sub ScanBody(ByVal oBody As Object, dObj As Object, dKids As Object, dGe
     nShapes = oBody.Shapes.Count
     Err.Clear
     dGeo.Add nm, (nShapes > 0)
-    If Not LIST_INNER_BODIES Or depth >= 30 Then Exit Sub
+    ' (always: which bodies sit inside an operation, and which are only tools -
+    '  LIST_INNER_BODIES only decides whether they get rows, in EmitBody)
+    If depth >= 30 Then Exit Sub
 
     For j = 1 To nShapes
         Set shp = Nothing
@@ -5423,8 +5444,10 @@ Private Sub EmitBody(ByVal nm As String, ByVal depth As Long, ByVal opName As St
     If depth >= 30 Then Exit Sub
     If Not dKids.Exists(nm) Then Exit Sub
     For Each it In dKids(nm)
-        If it(2) Then
-            Call SkipBody(CStr(it(0)), dKids, dDone, 0)     ' a tool body: not a piece of the part
+        If it(2) Or Not LIST_INNER_BODIES Then
+            ' a tool body is not a piece of the part; without LIST_INNER_BODIES
+            ' no body inside an operation gets a row
+            Call SkipBody(CStr(it(0)), dKids, dDone, 0)
         Else
             Call EmitBody(CStr(it(0)), depth + 1, CStr(it(1)), dKids, dGeo, dDone, names, depths, ops, n)
         End If

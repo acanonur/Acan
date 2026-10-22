@@ -1148,6 +1148,17 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
             ' blocking call - so it is neither loaded nor measured: it gets an
             ' "Assembly" row marked NOT LOADED, and the final message lists it.
             notLoaded = mNotLoaded.Exists(strPartNum)
+            ' a row named before its part number could be read is loaded as a part
+            ' only when something says it IS a part - a sub-assembly would be
+            ' loaded completely in design mode, in one blocking call
+            If Not notLoaded And mProvisional.Exists(strPartNum) Then
+                If Not HasPartEvidence(oPartProd) Then
+                    notLoaded = True
+                    If Not mNotLoaded.Exists(strPartNum) Then mNotLoaded.Add strPartNum, True
+                    If Not mNoPartNumber.Exists(strPartNum) Then mNoPartNumber.Add strPartNum, True
+                    Call LogLine(mSheetName & "  NOT LOADED (nothing says it is a part): " & strPartNum)
+                End If
+            End If
             If Not notLoaded And Not mPromoted.Exists(strPartNum) Then
                 notLoaded = IsUnloadedAssembly(oPartProd)
                 If notLoaded Then
@@ -1159,15 +1170,14 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
         End If
 
         If notLoaded And Not isAssy And mNoPartNumber.Exists(strPartNum) Then
-            ' a component CATIA cannot even give a part number for: not loaded,
-            ' and whether it is a part or an assembly is unknown
-            nParts = nParts + 1
+            ' a component that could not be loaded: whether it is a part or an
+            ' assembly is unknown (not counted as either)
             Call BufSet(r, 15, "Not loaded")
             Call BufSet(r, 1, "-")
             For bi = 6 To 11
                 Call BufSet(r, bi, "N/A")
             Next bi
-            Call BufSet(r, 12, "NOT LOADED - part number cannot be read")
+            Call BufSet(r, 12, "NOT LOADED - could not be loaded")
             Call BufSet(r, 13, "N/A")
 
         ElseIf notLoaded And Not isAssy Then
@@ -1189,12 +1199,12 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
             ' inertia box are all 0 on a component in visualization mode. The
             ' CATPart document is shared by all instances of the part, so once
             ' per part number is enough.
-            If Not mPromoted.Exists(strPartNum) Then
+            If Not mPromoted.Exists(strPartNum) Or mProvisional.Exists(strPartNum) Then
                 On Error Resume Next
                 oPartProd.ApplyWorkMode 2
                 Err.Clear
                 On Error GoTo 0
-                mPromoted.Add strPartNum, True
+                If Not mPromoted.Exists(strPartNum) Then mPromoted.Add strPartNum, True
             End If
             tLoad = Elapsed(tRow)
 
@@ -1223,6 +1233,11 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
                 If Len(realPn) > 0 Then
                     dispPn = realPn
                     Call BufSet(r, 3, realPn)
+                    ' a first level node: its "First Level" name with the real part number
+                    If mLevel(uniqueKey) = 1 Then
+                        mFirst(uniqueKey) = FirstLevelLabel(oPartProd, realPn)
+                        Call BufSet(r, 14, mFirst(uniqueKey))
+                    End If
                 End If
                 If Len(realDesc) > 0 Then Call BufSet(r, 4, realDesc)
             End If
@@ -1303,7 +1318,7 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
             If propsArray(0) <= 0 And propsArray(1) <= 0 And propsArray(2) <= 0 And dims(0) <= 0 Then
                 Call LogLine(mSheetName & "  NO VALUES " & strPartNum & ": " & PartStateText(oPartProd, hasPart))
                 ' a component that could not even be loaded: NOT LOADED, no picture
-                If Not hasPart And mProvisional.Exists(strPartNum) Then
+                If Not hasPart And mProvisional.Exists(strPartNum) And Len(realPn) = 0 Then
                     nParts = nParts - 1
                     Call BufSet(r, 15, "Not loaded")
                     Call BufSet(r, 12, "NOT LOADED - could not be loaded")
@@ -1330,7 +1345,7 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
 
                         Call BufSet(r, 2, mLevel(uniqueKey) + 1)
                         Call BufSet(r, 3, "    " & CStr(bodyNames(bi)))
-                        Call BufSet(r, 4, "Body of " & strPartNum)
+                        Call BufSet(r, 4, "Body of " & dispPn)
                         Call BufSet(r, 5, mQty(uniqueKey))
                         Call BufSet(r, 14, mFirst(uniqueKey))
                         Call BufSet(r, 15, "Body")
@@ -1551,10 +1566,11 @@ End Function
 
 ' the row name of a component whose part number CATIA cannot give yet (not
 ' loaded): the name of its file ("1DP000524104.CATPart" -> "1DP000524104"),
-' else the instance name without its number ("Bracket.3" -> "Bracket"). Pass 1
-' loads the part and writes the real part number and description.
+' else its instance name ("Product1.4") - generic instance names repeat, so
+' the number stays, and different components are never merged. Pass 1 loads
+' the part and writes the real part number and description.
 Private Function ProvisionalName(oProd As Product) As String
-    Dim nm As String, pth As String, k As Long, tail As String
+    Dim nm As String, pth As String, k As Long
 
     nm = ""
     On Error Resume Next
@@ -1569,11 +1585,6 @@ Private Function ProvisionalName(oProd As Product) As String
     If Len(nm) = 0 Then
         nm = oProd.Name
         Err.Clear
-        k = InStrRev(nm, ".")
-        If k > 1 Then
-            tail = Mid$(nm, k + 1)
-            If Len(tail) > 0 And Not (tail Like "*[!0-9]*") Then nm = Left$(nm, k - 1)
-        End If
     End If
     Err.Clear
     On Error GoTo 0
@@ -1582,6 +1593,35 @@ Private Function ProvisionalName(oProd As Product) As String
         If Not mProvisional.Exists(nm) Then mProvisional.Add nm, True
     End If
     ProvisionalName = nm
+End Function
+
+' something says this component IS a part (and not a sub-assembly): its CATPart
+' is in the session, it has a shape, or its file is a CATPart / cgr. Nothing
+' is loaded to find out.
+Private Function HasPartEvidence(oProd As Product) As Boolean
+    Dim tn As String, pth As String, hasShape As Boolean
+
+    HasPartEvidence = False
+    On Error Resume Next
+    tn = ""
+    tn = TypeName(oProd.ReferenceProduct.Parent)
+    Err.Clear
+    If tn = "PartDocument" Then
+        HasPartEvidence = True
+        Exit Function
+    End If
+    hasShape = False
+    hasShape = oProd.HasAMasterShapeRepresentation
+    If Err.Number = 0 And hasShape Then
+        HasPartEvidence = True
+        Exit Function
+    End If
+    Err.Clear
+    pth = ""
+    pth = LCase$(CStr(oProd.GetMasterShapeRepresentationPathName))
+    Err.Clear
+    If Right$(pth, 8) = ".catpart" Or Right$(pth, 4) = ".cgr" Then HasPartEvidence = True
+    Err.Clear
 End Function
 
 ' loads the STRUCTURE of a component CATIA has not loaded yet (Teamcenter loads
@@ -1597,7 +1637,9 @@ Private Sub LoadStructure(oProd As Product, ByRef pn As String, ByRef nk As Long
     Call SetStatus("BOM: loading " & nm & " ...")
     Call LogLine("loading the structure of " & nm)
     t = Timer
+    Err.Clear
     oProd.ApplyWorkMode 1
+    If Err.Number <> 0 Then Call LogLine("  CATIA refused to load it: error " & Err.Number & " - " & Err.Description)
     Err.Clear
     nk = 0
     nk = oProd.Products.Count
@@ -2227,8 +2269,9 @@ Private Function FlushSheet(xlSheet As Object, ByVal onlyLost As Boolean) As Lon
             ' try - text again, so nothing is read as a formula
             Call XlReady
             On Error Resume Next
-            xlSheet.Range(xlSheet.Cells(i0 + 1, 4), xlSheet.Cells(i0 + n, 4)).NumberFormat = "@"
-            xlSheet.Range(xlSheet.Cells(i0 + 1, 14), xlSheet.Cells(i0 + n, 14)).NumberFormat = "@"
+            For Each c In Array(4, 14, 16)
+                xlSheet.Range(xlSheet.Cells(i0 + 1, c), xlSheet.Cells(i0 + n, c)).NumberFormat = "@"
+            Next c
             Err.Clear
             On Error GoTo 0
         End If
@@ -2263,7 +2306,7 @@ NextBlock:
         On Error Resume Next
         ' assembly rows in bold - only looks, so a failure here is ignored
         For Each rr In mBoldRows
-            xlSheet.Range(xlSheet.Cells(rr, 2), xlSheet.Cells(rr, 15)).Font.Bold = True
+            xlSheet.Range(xlSheet.Cells(rr, 2), xlSheet.Cells(rr, 16)).Font.Bold = True
         Next rr
         ' a text cell shows more than 255 characters only as #####: back to
         ' General (the value stays the text it is)
@@ -2283,13 +2326,32 @@ End Function
 
 ' the sheet as a tree: every row grouped below its parent row with Excel's
 ' outline (the +/- at the left, like the CATIA tree; Excel has up to 8 group
-' levels) and the column "CATIA tree" indented by depth. Only looks - a
-' failure here is ignored.
+' levels) and the column "CATIA tree" indented by depth - in the assembly
+' structure, where the parent rows exist. Only looks - a failure here is
+' ignored.
 Private Sub ShowAsTree(xlSheet As Object)
     Dim i As Long, j As Long, lv As Long, lv2 As Long, minLv As Long
     Dim ol As Long, ind As Long
 
     If mBufRows = 0 Then Exit Sub
+
+    ' the part list has no assembly rows - no tree to show; only the bodies
+    ' fold below their part
+    If Not (mIncludeSubassemblies And UCase$(mGroupBy) = "PARENT") Then
+        Call XlReady
+        On Error Resume Next
+        xlSheet.Outline.SummaryRow = 0
+        For i = 1 To mBufRows
+            If CStr(mBuf(15, i)) = "Body" Then
+                xlSheet.Rows(i + 1).OutlineLevel = 2
+                xlSheet.Cells(i + 1, 16).IndentLevel = 1
+            End If
+        Next i
+        Err.Clear
+        On Error GoTo 0
+        Exit Sub
+    End If
+
     minLv = 0
     For i = 1 To mBufRows
         If IsNumeric(mBuf(2, i)) And Not IsEmpty(mBuf(2, i)) Then
@@ -3282,6 +3344,7 @@ Private Function XlInsertPicture(ws As Object, ByVal rowNo As Long, ByVal picPat
     On Error Resume Next
     shp.Height = 50
     If shp.Width > 90 Then shp.Width = 90
+    shp.Placement = 1                        ' move and size with cells: a folded row hides its picture
     ws.Rows(rowNo).RowHeight = 60
     Err.Clear
     On Error GoTo 0
@@ -3935,7 +3998,8 @@ End Function
 Function FirstLevelLabel(oProd As Product, ByVal partNum As String) As String
     Dim s As String
 
-    s = TreeName(oProd, partNum)
+    s = ""
+    If Len(partNum) > 0 Then s = TreeName(oProd, partNum)
     If Len(s) = 0 Then
         On Error Resume Next
         s = oProd.Name

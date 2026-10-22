@@ -325,6 +325,7 @@ Private mIdxEarly As Collection  ' Index rows written BEFORE those formats - wri
 Private mNotLoaded As Object     ' part numbers of sub-assemblies that are not loaded in CATIA
 Private mNoPartNumber As Object  ' row names of components whose part number cannot be read
 Private mProvisional As Object   ' row names given before the part number could be read
+Private mProvOwner As Object     ' provisional instance name -> the parent key it belongs to
 Private mSlow As Collection      ' Array(seconds, step) of every slow step
 Private mPump As Long            ' node counter of the tree walks
 
@@ -472,6 +473,7 @@ Private Sub RunBOM()
     Set mNotLoaded = CreateObject("Scripting.Dictionary")
     Set mNoPartNumber = CreateObject("Scripting.Dictionary")
     Set mProvisional = CreateObject("Scripting.Dictionary")
+    Set mProvOwner = CreateObject("Scripting.Dictionary")
     Set mBodyValCache = CreateObject("Scripting.Dictionary")
     Set mShotFiles = CreateObject("Scripting.Dictionary")
     Set mShotSigs = CreateObject("Scripting.Dictionary")
@@ -1013,7 +1015,8 @@ Private Function ProcessLoose(colInst As Collection, colLevel As Collection, _
         pn = oProd.PartNumber
         Err.Clear
         On Error GoTo LooseFail
-        If Len(pn) = 0 And Not isAssembly Then pn = ProvisionalName(oProd)
+        ' the same provisional name CollectUnits gave it: the last part of its key
+        If Len(pn) = 0 And Not isAssembly Then pn = KeyTail(CStr(colKey(i)))
         If Len(pn) = 0 Then pn = oProd.Name
 
         If Not isAssembly Then
@@ -1097,6 +1100,7 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
     Dim tRow As Double, tLoad As Double, tRowAll As Double
     Dim notLoaded As Boolean, bodyKey As String, bv As Variant
     Dim rowStart As Long, dispPn As String, realPn As String, realDesc As String, shotOK As Boolean
+    Dim realDesc2 As String, k2 As Long, newFirst As String
 
     On Error Resume Next
     CATIA.RefreshDisplay = False
@@ -1233,9 +1237,15 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
                 If Len(realPn) > 0 Then
                     dispPn = realPn
                     Call BufSet(r, 3, realPn)
-                    ' a first level node: its "First Level" name with the real part number
+                    ' a first level node: its "First Level" name with the real part
+                    ' number. Its own label is the FIRST entry; the part list may
+                    ' have appended the other branches after ", " - they stay.
                     If mLevel(uniqueKey) = 1 Then
-                        mFirst(uniqueKey) = FirstLevelLabel(oPartProd, realPn)
+                        realDesc2 = CStr(mFirst(uniqueKey))
+                        k2 = InStr(1, realDesc2, ", ")
+                        newFirst = FirstLevelLabel(oPartProd, realPn)
+                        If UCase$(mGroupBy) = "GLOBAL" And k2 > 0 Then newFirst = newFirst & Mid$(realDesc2, k2)
+                        mFirst(uniqueKey) = newFirst
                         Call BufSet(r, 14, mFirst(uniqueKey))
                     End If
                 End If
@@ -1569,8 +1579,8 @@ End Function
 ' else its instance name ("Product1.4") - generic instance names repeat, so
 ' the number stays, and different components are never merged. Pass 1 loads
 ' the part and writes the real part number and description.
-Private Function ProvisionalName(oProd As Product) As String
-    Dim nm As String, pth As String, k As Long
+Private Function ProvisionalName(oProd As Product, ByVal ownerKey As String) As String
+    Dim nm As String, pth As String, k As Long, base As String
 
     nm = ""
     On Error Resume Next
@@ -1585,6 +1595,19 @@ Private Function ProvisionalName(oProd As Product) As String
     If Len(nm) = 0 Then
         nm = oProd.Name
         Err.Clear
+        If Len(nm) = 0 Then nm = "?"
+        ' an instance name is unique only below its own parent: the same name
+        ' below another parent is another component and gets its own name
+        If Not mProvOwner Is Nothing Then
+            base = nm
+            k = 1
+            Do While mProvOwner.Exists(nm)
+                If CStr(mProvOwner(nm)) = ownerKey Then Exit Do
+                k = k + 1
+                nm = base & " ~" & k
+            Loop
+            If Not mProvOwner.Exists(nm) Then mProvOwner.Add nm, ownerKey
+        End If
     End If
     Err.Clear
     On Error GoTo 0
@@ -1593,6 +1616,15 @@ Private Function ProvisionalName(oProd As Product) As String
         If Not mProvisional.Exists(nm) Then mProvisional.Add nm, True
     End If
     ProvisionalName = nm
+End Function
+
+' the part number at the end of a row key ("a>b>pn", "first|pn" or "pn")
+Private Function KeyTail(ByVal k As String) As String
+    Dim p As Long, p2 As Long
+    p = InStrRev(k, ">")
+    p2 = InStrRev(k, "|")
+    If p2 > p Then p = p2
+    KeyTail = Mid$(k, p + 1)
 End Function
 
 ' something says this component IS a part (and not a sub-assembly): its CATPart
@@ -2861,7 +2893,9 @@ Private Sub CollectUnits(oProd As Product, ByVal lvl As Long, ByVal target As Lo
             rawPn = ""
             rawPn = child.PartNumber
             ' (a part whose part number cannot be read is not loaded - see TraverseTree)
-            If Len(rawPn) = 0 And nk = 0 Then rawPn = ProvisionalName(child)
+            ' (not loaded yet: its structure first, like TraverseTree does)
+            If Len(rawPn) = 0 And nk = 0 Then Call LoadStructure(child, rawPn, nk)
+            If Len(rawPn) = 0 And nk = 0 Then rawPn = ProvisionalName(child, parentKey)
             pn = rawPn
             If Len(pn) = 0 Then pn = child.Name
 
@@ -3320,6 +3354,12 @@ Private Function XlInsertPicture(ws As Object, ByVal rowNo As Long, ByVal picPat
     Dim t0 As Double, told As Boolean
 
     XlInsertPicture = False
+    ' the row first gets its height, so the 2 + 50 pt picture lies inside it
+    Call XlReady
+    On Error Resume Next
+    ws.Rows(rowNo).RowHeight = 60
+    Err.Clear
+    On Error GoTo 0
     t0 = Timer
     Do
         If Not XlReady() Then Exit Function
@@ -3344,8 +3384,10 @@ Private Function XlInsertPicture(ws As Object, ByVal rowNo As Long, ByVal picPat
     On Error Resume Next
     shp.Height = 50
     If shp.Width > 90 Then shp.Width = 90
-    shp.Placement = 1                        ' move and size with cells: a folded row hides its picture
-    ws.Rows(rowNo).RowHeight = 60
+    If ws.Rows(rowNo).RowHeight < 60 Then ws.Rows(rowNo).RowHeight = 60
+    ' move and size with cells - set last, when the picture lies inside its own
+    ' row: folding that row hides the picture, other rows do not stretch it
+    shp.Placement = 1
     Err.Clear
     On Error GoTo 0
     XlInsertPicture = True
@@ -3894,7 +3936,7 @@ Function TraverseTree(oProd As Product, dQty As Object, dRef As Object, dDesc As
                 Call LoadStructure(childProd, partNum, nk)
             End If
         End If
-        If Len(partNum) = 0 And nk = 0 Then partNum = ProvisionalName(childProd)
+        If Len(partNum) = 0 And nk = 0 Then partNum = ProvisionalName(childProd, parentKey)
         If partNum <> "" Then kids.Add Array(partNum, (nk > 0))
 
         ' The direct children of the root product ARE the first level; deeper

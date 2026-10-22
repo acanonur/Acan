@@ -53,7 +53,7 @@ The assembly extractor offers three versions and the import handles all of them:
 `GeneratePartBodyBOM` (or answer `2` at the start question, or run either
 macro on an open CATPart) lists the bodies of one part: one row per body,
 also the bodies inside another body (`PartBody > Assemble.1 > Body.2`, one
-level deeper). The part number of a row is the body name — or, for a body
+level deeper; tool bodies of Remove / Intersect / Union Trim get no row). The part number of a row is the body name — or, for a body
 pasted with link from a product (`2DP…1\…\2DP000034948.1\PartBody`), the part
 number in that path. A body that takes in other bodies already contains their
 mass, so do not add it and the bodies below it up.

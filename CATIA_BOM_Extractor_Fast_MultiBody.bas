@@ -90,8 +90,10 @@ Option Explicit
 '   GeneratePartBodyBOM    BODIES OF ONE PART (no question, straight to 2)
 '                          - one row per body with geometry, in the order of
 '                            the body tree: PartBody, the other bodies, and
-'                            the bodies INSIDE a body (Add, Assemble, Remove,
-'                            Intersect, Union Trim) one level deeper
+'                            the bodies INSIDE a body (taken in by Add or
+'                            Assemble) one level deeper. A body that is only
+'                            a tool of Remove / Intersect / Union Trim is no
+'                            piece of the part and gets no row
 '                          - every body measured on its own: mass, volume,
 '                            area, length / width / height, material, density
 '                          - every body pictured alone: the other bodies, the
@@ -244,13 +246,16 @@ Private Const ASSY_SETTLE_MS As Long = 120
 ' Multi-body detection has to load every leaf CATPart. Switch it off when you do
 ' not need one row per body.
 Private Const DETECT_MULTIBODY As Boolean = True
-' Bodies that are exactly alike (same place in the body tree, same name apart
-' from its number, same mass and volume - e.g. "Passstift.1" and "Passstift.2")
-' get ONE row and Qty counts them. False = one row per body, like the tree.
+' On the sheet of the bodies of one part: bodies that are exactly alike (same
+' place in the body tree, same name apart from its number, same mass and
+' volume - e.g. "Passstift.1" and "Passstift.2") get ONE row and Qty counts
+' them. False = one row per body, like the tree. (The whole-product BOM always
+' lists every body of a multi-body part, as before.)
 Private Const GROUP_IDENTICAL_BODIES As Boolean = True
-' True = also the bodies that sit INSIDE another body (taken in by Add,
-' Assemble, Remove, Intersect or Union Trim - in the tree below e.g.
-' PartBody > Assemble.1) get a row, one level deeper than that body.
+' True = also the bodies that sit INSIDE another body (taken in by Add or
+' Assemble - in the tree below e.g. PartBody > Assemble.1) get a row, one
+' level deeper than that body. Tool bodies of Remove, Intersect and Union
+' Trim never get a row: they are cut away, not pieces of the part.
 Private Const LIST_INNER_BODIES As Boolean = True
 
 ' --- "KEINE RUECKMELDUNG" / "NOT RESPONDING" ----------------------------------
@@ -362,6 +367,7 @@ Private mFlushed As Boolean      ' mBuf is already in Excel
 Private mLostBlocks As Object    ' first buffer row of every block Excel did not take
 Private mBoldRows As Collection  ' sheet rows written in bold (assemblies)
 Private mAssyRows As Collection  ' Array(sheet row, part number, product) of every assembly row
+Private mTreeDepth As Object     ' buffer row -> depth in the tree, where it is not the Level (bodies of one part)
 Private mSheetName As String     ' name of the sheet being written
 
 ' --- the whole run -------------------------------------------------------------
@@ -423,7 +429,7 @@ End Sub
 ' ==============================================================================
 ' ENTRY POINT 3: THE BODIES OF ONE PART
 ' One row per body, like the body tree of the CATPart - also the bodies that sit
-' inside another body (Add, Assemble, Remove, ...). Works on an open CATPart, or
+' inside another body (Add, Assemble). Works on an open CATPart, or
 ' on one part of the open product (the part selected in the tree, or picked).
 ' ==============================================================================
 Sub GeneratePartBodyBOM()
@@ -495,7 +501,7 @@ Private Sub RunBOM()
     Dim isPartDoc As Boolean
     Dim bodyInst As Product, bodyPartDoc As PartDocument, bodyPart As Part
     Dim bodySel As Selection, bodyPn As String
-    Dim colIsoHidden As Collection, isoSet As Boolean
+    Dim colIsoHidden As Collection, colIsoShown As Collection, isoSet As Boolean
 
     startTime = Timer
 
@@ -555,15 +561,6 @@ Private Sub RunBOM()
     Set rootSel = catDoc.Selection
     Set rootWin = CATIA.ActiveWindow
 
-    ' the part whose bodies are listed: the open CATPart, or a part of the product
-    If mBodyMode Then
-        If isPartDoc Then
-            Set bodyInst = rootProd
-        ElseIf Not PickPartInstance(catDoc, bodyInst) Then
-            Exit Sub
-        End If
-    End If
-
     ' Windows must not offer to close CATIA while it loads a big part
     If NO_NOT_RESPONDING_GHOST Then
         On Error Resume Next
@@ -581,6 +578,20 @@ Private Sub RunBOM()
     Err.Clear
     On Error GoTo Fail
     If Len(rootPN) = 0 Then rootPN = "product"
+
+    ' the part whose bodies are listed: the open CATPart, or a part of the product
+    If mBodyMode Then
+        If isPartDoc Then
+            Set bodyInst = rootProd
+        ElseIf Not PickPartInstance(catDoc, bodyInst) Then
+            On Error Resume Next
+            CATIA.DisplayFileAlerts = True
+            CATIA.StatusBar = ""
+            Err.Clear
+            On Error GoTo 0
+            Exit Sub
+        End If
+    End If
 
     If mBodyMode Then
         ' the CATPart of that part - in a product only this ONE part is loaded
@@ -705,12 +716,13 @@ Private Sub RunBOM()
         ' a part inside a product: everything else is hidden meanwhile, so the
         ' pictures show only its bodies (shown again right after)
         If Not isPartDoc And mShotParts Then
-            Call IsolateInstance(rootSel, bodyInst, colIsoHidden)
-            isoSet = True
+            isoSet = True                    ' (before: a stop inside still restores)
+            Call IsolateInstance(rootSel, rootProd, bodyInst, bodyPn, colIsoHidden, colIsoShown)
         End If
         unitOK = ProcessBodies(bodyInst, bodyPartDoc, bodySel, rootViewer, xlSheet, _
                                nRows, nParts, statusTxt)
         If isoSet Then
+            Call SetShowCollection(rootSel, colIsoShown, 1)
             Call SetShowCollection(rootSel, colIsoHidden, 0)
             isoSet = False
         End If
@@ -1063,7 +1075,10 @@ FailCleanup:
         Call SetShowCollection(rootSel, colLooseParts, 0)
     End If
     Call RestoreScene
-    If isoSet Then Call SetShowCollection(rootSel, colIsoHidden, 0)
+    If isoSet Then
+        Call SetShowCollection(rootSel, colIsoShown, 1)
+        Call SetShowCollection(rootSel, colIsoHidden, 0)
+    End If
     If rootLayoutSet Then rootWin.Layout = rootLayout
     If compassToggled Then CATIA.StartCommand COMPASS_COMMAND
     If Not rootViewer Is Nothing Then rootViewer.Reframe
@@ -1307,7 +1322,7 @@ Private Function ProcessBodies(oInst As Product, oPartDoc As PartDocument, partS
     firstName = FirstLevelLabel(oInst, pn)
     If Not mPartDocs.Exists(pn) Then mPartDocs.Add pn, oPartDoc
 
-    ' every body with geometry - also those inside Add, Assemble, Remove ...
+    ' every body with geometry - also those inside Add and Assemble
     Call SetStatus("BOM: reading the bodies of " & pn & " ...")
     Call NoteBodies(pn, oPart, 1)
     names = mBodyCache(pn)
@@ -1554,7 +1569,7 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
 
             ' multi-body parts: the body names are cached per part number, so a
             ' part that appears on several sheets gets its body rows on every one.
-            ' Bodies inside another body (Add, Assemble, Remove ...) count too.
+            ' Bodies inside another body (Add, Assemble) count too.
             If hasPart And DETECT_MULTIBODY Then
                 If Not mBodyCache.Exists(strPartNum) Then Call NoteBodies(strPartNum, oPart, 2)
                 If IsArray(mBodyCache(strPartNum)) Then
@@ -1690,8 +1705,9 @@ Private Sub WriteBodyRows(ByRef r As Long, ByVal pn As String, ByVal dispPn As S
     Dim names As Variant, tree As Variant, depths As Variant, ops As Variant
     Dim bi As Long, n As Long, d As Long, no As Long, bv As Variant, nm As String
     Dim owner(1 To 32) As String, parentNm As String, hasKids As Boolean, isHidden As Boolean
+    Dim lvlAt(0 To 32) As Long
     Dim rowPn As String, rowDesc As String, pathKey As String, pathLv As Long, lastSeg As String
-    Dim lvl As Long, treeTxt As String, gk As String, g As Variant, cnt As Long
+    Dim lvl As Long, treeTxt As String, gk As String, g As Variant, cnt As Long, grpPn As String
     Dim grp As Object
 
     If Not mBodyCache.Exists(pn) Or Not mBodyTree.Exists(pn) Then Exit Sub
@@ -1721,24 +1737,30 @@ Private Sub WriteBodyRows(ByRef r As Long, ByVal pn As String, ByVal dispPn As S
         Call LogLine(mSheetName & "  body " & no & "/" & n & "  " & dispPn & " / " & nm)
         bv = BodyValues(pn, nm, oPart, oPartDoc)
 
-        ' part number, description and level of the row
+        ' part number, description and level of the row (grpPn: the part
+        ' number once equal bodies share the row - without the ".1")
         lastSeg = nm
         pathKey = ""
         pathLv = 0
+        lvlAt(0) = baseLevel
         If ownSheet Then
             If SplitBodyPath(nm, rowPn, lastSeg, pathKey, pathLv) Then
                 rowDesc = lastSeg
-                lvl = baseLevel + pathLv + d - 1
+                lvl = baseLevel + pathLv             ' the level of its source in the product
+                grpPn = rowPn
             Else
                 rowPn = nm
                 rowDesc = "Body of " & dispPn
-                lvl = baseLevel + d
+                lvl = lvlAt(d - 1) + 1
+                grpPn = BodyBaseName(nm)
             End If
         Else
             rowPn = "    " & nm
             rowDesc = "Body of " & dispPn
             lvl = baseLevel + d
+            grpPn = "    " & BodyBaseName(nm)
         End If
+        lvlAt(d) = lvl
 
         ' the column "CATIA tree": the body, the operation it sits in
         treeTxt = nm
@@ -1747,7 +1769,7 @@ Private Sub WriteBodyRows(ByRef r As Long, ByVal pn As String, ByVal dispPn As S
 
         ' bodies that are exactly alike: one row, Qty counts them
         gk = ""
-        If GROUP_IDENTICAL_BODIES And Not hasKids Then
+        If GROUP_IDENTICAL_BODIES And ownSheet And Not hasKids Then
             If CDbl(bv(1)) > 0 Then
                 gk = parentNm & "|" & pathKey & "|" & UCase$(BodyBaseName(lastSeg)) & "|" & _
                      CStr(ops(bi) <> "") & "|" & CStr(isHidden) & "|" & _
@@ -1758,7 +1780,8 @@ Private Sub WriteBodyRows(ByRef r As Long, ByVal pn As String, ByVal dispPn As S
         If Len(gk) > 0 And grp.Exists(gk) Then
             g = grp(gk)
             cnt = CLng(g(1)) + 1
-            grp(gk) = Array(g(0), cnt, g(2))
+            grp(gk) = Array(g(0), cnt, g(2), g(3))
+            Call BufSet(CLng(g(0)), 3, CStr(g(3)))      ' "Passstift.1" -> "Passstift"
             Call BufSet(CLng(g(0)), 5, partQty * cnt)
             Call BufSet(CLng(g(0)), 16, CStr(g(2)) & "  (+ " & (cnt - 1) & " more)")
         Else
@@ -1783,7 +1806,10 @@ Private Sub WriteBodyRows(ByRef r As Long, ByVal pn As String, ByVal dispPn As S
             Else
                 Call BufSet(r, 1, "-")
             End If
-            If Len(gk) > 0 Then grp.Add gk, Array(r, 1, treeTxt)
+            If Len(gk) > 0 Then grp.Add gk, Array(r, 1, treeTxt, grpPn)
+            ' the +/- groups of the sheet follow the body tree (the level of
+            ' a linked body is that of its source in the product)
+            If ownSheet Then mTreeDepth(r - 1) = d
         End If
         DoEvents                                 ' a part with many bodies takes a while
     Next bi
@@ -1842,14 +1868,21 @@ End Function
 Private Function SplitBodyPath(ByVal fullName As String, ByRef partNum As String, _
                                ByRef bodyNm As String, ByRef pathKey As String, _
                                ByRef pathLv As Long) As Boolean
-    Dim s As String, segs As Variant, i As Long, n As Long
+    Dim s As String, segs As Variant, i As Long, n As Long, seg As String
 
     SplitBodyPath = False
-    s = Replace(Trim$(fullName), "/", "\")
+    s = Trim$(fullName)
     If InStr(s, "\") = 0 Then Exit Function
     segs = Split(s, "\")
     n = UBound(segs)                             ' the last part is the body name
-    If Len(Trim$(CStr(segs(n)))) = 0 Or Len(Trim$(CStr(segs(n - 1)))) = 0 Then Exit Function
+    If Len(Trim$(CStr(segs(n)))) = 0 Then Exit Function
+    ' an instance path: every part before the body name is an instance
+    ' ("2DP000034948.1") - anything else is an ordinary name with a "\" in it
+    For i = 0 To n - 1
+        seg = Trim$(CStr(segs(i)))
+        If Len(seg) = 0 Then Exit Function
+        If BodyBaseName(seg) = seg Then Exit Function
+    Next i
 
     bodyNm = Trim$(CStr(segs(n)))
     partNum = BodyBaseName(Trim$(CStr(segs(n - 1))))
@@ -2220,15 +2253,15 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
     Dim oProd As Product, colNode As Collection
     Dim oPart As Part, oPartDoc As PartDocument
     Dim oDoc As Object, homeWin As Object, homeDoc As Document
-    Dim bodyNames As Variant
     Dim colWasShown As Collection, colWasHidden As Collection
     Dim colFb As Collection
     Dim t As Double, sceneOK As Boolean
     Dim partSel As Selection, oBody As Body
-    Dim dShownBodies As Object, colShown As Collection
+    Dim dShownBodies As Object, dShownCount As Object, colShown As Collection, nVis As Long
 
     If mJobRow.Count = 0 Then Exit Sub
-    Set dShownBodies = CreateObject("Scripting.Dictionary")   ' part number -> its visible bodies
+    Set dShownBodies = CreateObject("Scripting.Dictionary")   ' part number -> what of it is visible
+    Set dShownCount = CreateObject("Scripting.Dictionary")    ' part number -> visible bodies among that
 
     If oViewer Is Nothing Then
         For j = 1 To mJobRow.Count
@@ -2281,7 +2314,7 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                 If Len(picPath) = 0 And PICTURES_IN_OWN_WINDOW Then
                     Set oProd = mRef(key)
                     If PartDocOf(oProd, pn, oPart, oPartDoc) Then
-                        picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, Nothing, Empty, "", "", fullSig)
+                        picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, Nothing, Nothing, "", "", fullSig)
                     End If
                 End If
 
@@ -2291,9 +2324,16 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                 If Len(picPath) = 0 And mBodies.Exists(pn) And PICTURES_IN_OWN_WINDOW Then
                     Set oProd = mRef(key)
                     If PartDocOf(oProd, pn, oPart, oPartDoc) Then
-                        bodyNames = mBodies(pn)
-                        picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, oPart, bodyNames, _
-                                                  bodyName, "P|" & pn, fullSig)
+                        ' what is visible now - only that is hidden and shown again
+                        If Not dShownBodies.Exists(pn) Then
+                            Set partSel = oPartDoc.Selection
+                            dShownBodies.Add pn, VisiblePartItems(oPart, partSel, nVis)
+                            dShownCount.Add pn, nVis
+                        End If
+                        Set colShown = dShownBodies(pn)
+                        ' (one visible body: its picture IS the picture of the part)
+                        picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, oPart, colShown, bodyName, _
+                                                  IIf(dShownCount(pn) > 1, "P|" & pn, ""), fullSig)
                     End If
                 End If
 
@@ -2304,7 +2344,7 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                     Set oProd = mRef(key)
                     Set oDoc = OwnDocumentOf(oProd, pn, homeDoc)
                     If Not oDoc Is Nothing Then
-                        picPath = ShotInOwnWindow(oDoc, homeWin, shotKey, Nothing, Empty, "", "", fullSig)
+                        picPath = ShotInOwnWindow(oDoc, homeWin, shotKey, Nothing, Nothing, "", "", fullSig)
                     End If
                 End If
         End Select
@@ -2393,8 +2433,10 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                     If mBodies.Exists(pn) Then
                         If PartDocOf(oProd, pn, oPart, oPartDoc) Then
                             Set partSel = oPartDoc.Selection
-                            If Not dShownBodies.Exists(pn) Then _
-                                dShownBodies.Add pn, ShownBodies(oPart, partSel, mBodies(pn))
+                            If Not dShownBodies.Exists(pn) Then
+                                dShownBodies.Add pn, VisiblePartItems(oPart, partSel, nVis)
+                                dShownCount.Add pn, nVis
+                            End If
                             Set colShown = dShownBodies(pn)
                             Set oBody = GetBodyByName(oPart, bodyName)
                             If Not oBody Is Nothing Then
@@ -2422,10 +2464,14 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                     ' component is fine here - hiding works, so the rest of the
                     ' component simply draws nothing, e.g. parts not loaded.)
                     sig = FileSignature(picPath)
-                    ' a body equal to its whole part: hiding the other bodies
-                    ' had no effect
+                    ' a body equal to its whole part while other bodies were
+                    ' visible: hiding them had no effect
                     If kind = "BODY" And mShotSigs.Exists("P|" & pn) Then
-                        If mShotSigs("P|" & pn) = sig Then sig = baseSig
+                        If mShotSigs("P|" & pn) = sig Then
+                            nVis = 2
+                            If dShownCount.Exists(pn) Then nVis = dShownCount(pn)
+                            If nVis > 1 Then sig = baseSig
+                        End If
                     End If
                     If sig = baseSig Then
                         On Error Resume Next
@@ -2482,10 +2528,10 @@ End Sub
 ' ==============================================================================
 Private Sub TakeBodyPictures(oPart As Part, partSel As Selection, oViewer As Viewer, _
                              xlSheet As Object, ByVal pn As String)
-    Dim j As Long, i As Long, rowNo As Long, t As Double
+    Dim j As Long, rowNo As Long, t As Double
     Dim bodyName As String, shotKey As String
     Dim picPath As String, basePath As String, baseSig As String, sig As String
-    Dim oBody As Body, colAll As Collection, it As Variant, names As Variant
+    Dim oBody As Body, nVis As Long
 
     If mJobRow.Count = 0 Then Exit Sub
     If oViewer Is Nothing Then
@@ -2496,21 +2542,10 @@ Private Sub TakeBodyPictures(oPart As Part, partSel As Selection, oViewer As Vie
     End If
     Call LogLine(mSheetName & ": " & mJobRow.Count & " pictures")
 
-    ' --- the scene: nothing of the part visible ---
-    Set colAll = PartClutter(oPart)
-    names = Empty
-    If mBodyCache.Exists(pn) Then names = mBodyCache(pn)
-    If IsArray(names) Then
-        For i = LBound(names) To UBound(names)
-            Set oBody = GetBodyByName(oPart, CStr(names(i)))
-            If Not oBody Is Nothing Then colAll.Add oBody
-        Next i
-    End If
+    ' --- the scene: nothing of the part visible (every body - also one with
+    '     only wireframe in it - and the construction elements) ---
     Set mSceneSel = partSel
-    Set mSceneShow = New Collection
-    For Each it In colAll
-        If ShowState(partSel, it) <> 0 Then mSceneShow.Add it
-    Next it
+    Set mSceneShow = VisiblePartItems(oPart, partSel, nVis)
     Call SetShowCollection(partSel, mSceneShow, 1)
     Call Settle(100)
 
@@ -2575,6 +2610,21 @@ Private Sub TakeBodyPictures(oPart As Part, partSel As Selection, oViewer As Vie
     Err.Clear
     On Error GoTo 0
 End Sub
+
+' every body of a part, with or without geometry, also those inside operations
+Private Function AllBodiesOf(oPart As Part) As Collection
+    Dim col As Collection, k As Variant
+    Dim names() As String, depths() As Long, ops() As String
+
+    Set col = New Collection
+    Set AllBodiesOf = col
+    If oPart Is Nothing Then Exit Function
+    If Not (mBodyObjPart Is oPart) Then Call CollectBodies(oPart, names, depths, ops)
+    If mBodyObj Is Nothing Then Exit Function
+    For Each k In mBodyObj.Keys
+        col.Add mBodyObj(k)
+    Next k
+End Function
 
 ' what the body pictures hid is shown again
 Private Sub RestoreScene()
@@ -2651,21 +2701,25 @@ Private Function ShowState(sel As Selection, ByVal oObj As Object) As Long
     Err.Clear
 End Function
 
-' the bodies of a part (by name) that are visible now - one CATIA does not
-' tell about counts as visible
-Private Function ShownBodies(oPart As Part, partSel As Selection, bodyNames As Variant) As Collection
-    Dim col As Collection, i As Long, oBody As Body
+' what of a part is visible now: its bodies (every one, also those inside
+' operations or with only wireframe) and its construction elements - what a
+' body picture hides and shows again. nBodies = how many of them are bodies.
+' Something CATIA does not tell about counts as visible.
+Private Function VisiblePartItems(oPart As Part, partSel As Selection, ByRef nBodies As Long) As Collection
+    Dim col As Collection, it As Variant
 
     Set col = New Collection
-    If IsArray(bodyNames) Then
-        For i = LBound(bodyNames) To UBound(bodyNames)
-            Set oBody = GetBodyByName(oPart, CStr(bodyNames(i)))
-            If Not oBody Is Nothing Then
-                If ShowState(partSel, oBody) <> 0 Then col.Add oBody
-            End If
-        Next i
-    End If
-    Set ShownBodies = col
+    nBodies = 0
+    For Each it In AllBodiesOf(oPart)
+        If ShowState(partSel, it) <> 0 Then
+            col.Add it
+            nBodies = nBodies + 1
+        End If
+    Next it
+    For Each it In PartClutter(oPart)
+        If ShowState(partSel, it) <> 0 Then col.Add it
+    Next it
+    Set VisiblePartItems = col
 End Function
 
 
@@ -2673,12 +2727,13 @@ End Function
 ' HELPER: ONE PICTURE IN A WINDOW OF ITS OWN
 ' The document (a CATPart, or a sub-assembly's CATProduct) is opened in a new
 ' window - it is alone there, so nothing in the product has to be hidden.
-' For a body picture the other bodies of the part are hidden in that window.
+' For a body picture the visible bodies of the part (colShown) are hidden,
+' the body is shown alone, and afterwards exactly colShown is visible again.
 ' refKey: the picture a body picture must differ from (the whole part).
 ' Returns the picture file, or "" when there is none.
 ' ==============================================================================
 Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKey As String, _
-                                 oPart As Part, bodyNames As Variant, ByVal bodyName As String, _
+                                 oPart As Part, colShown As Collection, ByVal bodyName As String, _
                                  ByVal refKey As String, ByVal homeSig As String) As String
     Dim w As Object, v As Viewer, partSel As Selection, oBody As Body
     Dim picPath As String, sig As String, ok As Boolean, isolated As Boolean
@@ -2704,12 +2759,17 @@ Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKe
 
     If Len(bodyName) > 0 And Not oPart Is Nothing Then
         Set partSel = oDoc.Selection
-        Call SetShowBodyList(oPart, partSel, bodyNames, 1)
         Set oBody = GetBodyByName(oPart, bodyName)
-        partSel.Clear
-        partSel.Add oBody
-        partSel.VisProperties.SetShow 0
-        partSel.Clear
+        If oBody Is Nothing Or partSel Is Nothing Then
+            ' no body to show alone - no picture rather than the whole part
+            w.Close
+            If Not homeWin Is Nothing Then homeWin.Activate
+            Err.Clear
+            On Error GoTo 0
+            Exit Function
+        End If
+        Call SetShowCollection(partSel, colShown, 1)
+        Call SetShowSingle(partSel, oBody, 0)
         isolated = True
         Err.Clear
     End If
@@ -2720,7 +2780,10 @@ Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKe
         ok = CaptureViewToFile(v, picPath)
     End If
 
-    If isolated Then Call SetShowBodyList(oPart, partSel, bodyNames, 0)
+    If isolated Then
+        Call SetShowSingle(partSel, oBody, 1)
+        Call SetShowCollection(partSel, colShown, 0)
+    End If
     w.Close
     Err.Clear
     If Not homeWin Is Nothing Then homeWin.Activate
@@ -2882,6 +2945,7 @@ Private Sub ResetSheetData()
     Set mJobBody = New Collection
     Set mBoldRows = New Collection
     Set mAssyRows = New Collection
+    Set mTreeDepth = CreateObject("Scripting.Dictionary")
     ReDim mBuf(1 To 16, 1 To 256)
     mBufRows = 0
     mFlushed = False
@@ -3080,6 +3144,12 @@ End Sub
 Private Function RowDepth(ByVal i As Long, ByVal minLv As Long) As Long
     Dim d As Long
     d = 1
+    If Not mTreeDepth Is Nothing Then
+        If mTreeDepth.Exists(i) Then
+            RowDepth = CLng(mTreeDepth(i))
+            Exit Function
+        End If
+    End If
     If IsNumeric(mBuf(2, i)) And Not IsEmpty(mBuf(2, i)) Then d = CLng(mBuf(2, i)) - minLv + 1
     If d < 1 Then d = 1
     RowDepth = d
@@ -3790,9 +3860,16 @@ Private Function IsPartInstance(oInst As Product) As Boolean
     pn = oInst.PartNumber
     Err.Clear
     On Error GoTo 0
-    If nk = 0 And Not HasPartEvidence(oInst) Then Call LoadStructure(oInst, pn, nk)
     If nk <> 0 Then Exit Function
-    IsPartInstance = Not IsUnloadedAssembly(oInst)
+    ' known to be a sub-assembly without loading anything
+    If IsUnloadedAssembly(oInst) Then Exit Function
+    If Not HasPartEvidence(oInst) Then
+        Call LoadStructure(oInst, pn, nk)
+        Call SetStatus("")
+        If nk <> 0 Then Exit Function
+        If IsUnloadedAssembly(oInst) Then Exit Function
+    End If
+    IsPartInstance = True
 End Function
 
 ' the CATPart whose bodies are listed: the open CATPart itself, or the part of
@@ -3859,49 +3936,128 @@ End Function
 
 ' ==============================================================================
 ' HELPER: ONE PART OF A PRODUCT ALONE IN THE MAIN WINDOW
-' On every level above the part, every other component that is visible is
-' hidden - colHidden gets them, so exactly those are shown again afterwards.
+' The way from the root down to an instance of the part is searched from the
+' top (Product.Parent of an instance inside a sub-assembly leads to that
+' sub-assembly's own document, not up the product). On every level of that
+' way every other visible component is hidden (colHidden - shown again
+' afterwards) and a hidden node on the way is shown (colShown - hidden again
+' afterwards). Any instance of the part will do: its bodies are the same.
 ' ==============================================================================
-Private Sub IsolateInstance(sel As Selection, oInst As Product, colHidden As Collection)
-    Dim cur As Product, par As Product, coll As Object, sib As Product
-    Dim i As Long, n As Long, guard As Long, nm As String
+Private Sub IsolateInstance(sel As Selection, rootProd As Product, oInst As Product, _
+                            ByVal pn As String, colHidden As Collection, colShown As Collection)
+    Dim path As Collection, nm As String, sibNm As String
+    Dim par As Product, node As Product, sib As Product
+    Dim i As Long, j As Long, n As Long
 
     Set colHidden = New Collection
-    If oInst Is Nothing Then Exit Sub
+    Set colShown = New Collection
+    If oInst Is Nothing Or rootProd Is Nothing Then Exit Sub
+    If Len(pn) = 0 Then Exit Sub
     Call SetStatus("BOM: hiding the rest of the product ...")
+    nm = ""
     On Error Resume Next
-    Set cur = oInst
-    Do While guard < 60
-        guard = guard + 1
-        Set coll = Nothing
-        Set coll = cur.Parent
-        If coll Is Nothing Then Exit Do
-        If TypeName(coll) <> "Products" Then Exit Do      ' the root reached
-        Set par = Nothing
-        Set par = coll.Parent
-        If par Is Nothing Then Exit Do
-        nm = ""
-        nm = cur.Name
-        n = 0
-        n = par.Products.Count
-        For i = 1 To n
-            Set sib = Nothing
-            Set sib = par.Products.Item(i)
-            If Not sib Is Nothing Then
-                If sib.Name <> nm Then
-                    If ShowState(sel, sib) <> 0 Then colHidden.Add sib
-                End If
-            End If
-            If i Mod 50 = 0 Then DoEvents
-        Next i
-        Err.Clear
-        Set cur = par
-    Loop
+    nm = oInst.Name
     Err.Clear
     On Error GoTo 0
-    Call LogLine("hiding " & colHidden.Count & " other components for the pictures")
+
+    ' the picked instance (same instance name), else any instance of the part
+    Set path = New Collection
+    If Not FindInstancePath(rootProd, pn, nm, path, 0) Then
+        Set path = New Collection
+        If Not FindInstancePath(rootProd, pn, "", path, 0) Then
+            Call LogLine("the part " & pn & " was not found below the product - " & _
+                         "the rest of the product stays visible in the pictures")
+            Exit Sub
+        End If
+    End If
+
+    ' path(1) is the part, path(path.Count) its first level node
+    Set par = rootProd
+    For i = path.Count To 1 Step -1
+        Set node = path(i)
+        nm = ""
+        n = 0
+        On Error Resume Next
+        nm = node.Name
+        n = par.Products.Count
+        Err.Clear
+        For j = 1 To n
+            Set sib = Nothing
+            Set sib = par.Products.Item(j)
+            sibNm = ""
+            If Not sib Is Nothing Then sibNm = sib.Name
+            Err.Clear
+            If Len(sibNm) > 0 And sibNm <> nm Then
+                If ShowState(sel, sib) <> 0 Then colHidden.Add sib
+            End If
+            If j Mod 50 = 0 Then DoEvents
+        Next j
+        On Error GoTo 0
+        If ShowState(sel, node) = 0 Then colShown.Add node
+        Set par = node
+    Next i
+
+    Call LogLine("pictures: " & colHidden.Count & " other components hidden, " & _
+                 colShown.Count & " hidden nodes on the way to the part shown")
     Call SetShowCollection(sel, colHidden, 1)
+    Call SetShowCollection(sel, colShown, 0)
 End Sub
+
+' searches the product from the top for an instance of the part number pn
+' (with the instance name nm; "" = any). path gets that instance, then its
+' parents - in the order of the way back up. Nothing is loaded.
+Private Function FindInstancePath(oProd As Product, ByVal pn As String, ByVal nm As String, _
+                                  path As Collection, ByVal depth As Long) As Boolean
+    Dim i As Long, n As Long, nk As Long
+    Dim child As Product, cPn As String, cNm As String
+
+    FindInstancePath = False
+    If depth > 60 Then Exit Function
+    n = 0
+    On Error Resume Next
+    n = oProd.Products.Count
+    Err.Clear
+    On Error GoTo 0
+
+    ' this level first ...
+    For i = 1 To n
+        Set child = Nothing
+        cPn = ""
+        cNm = ""
+        On Error Resume Next
+        Set child = oProd.Products.Item(i)
+        cPn = child.PartNumber
+        cNm = child.Name
+        Err.Clear
+        On Error GoTo 0
+        If Not child Is Nothing And StrComp(cPn, pn, vbTextCompare) = 0 Then
+            If Len(nm) = 0 Or StrComp(cNm, nm, vbTextCompare) = 0 Then
+                path.Add child
+                FindInstancePath = True
+                Exit Function
+            End If
+        End If
+        Call Pump
+    Next i
+
+    ' ... then deeper
+    For i = 1 To n
+        Set child = Nothing
+        nk = 0
+        On Error Resume Next
+        Set child = oProd.Products.Item(i)
+        nk = child.Products.Count
+        Err.Clear
+        On Error GoTo 0
+        If nk > 0 Then
+            If FindInstancePath(child, pn, nm, path, depth + 1) Then
+                path.Add child
+                FindInstancePath = True
+                Exit Function
+            End If
+        End If
+    Next i
+End Function
 
 
 ' ==============================================================================
@@ -4746,24 +4902,6 @@ Sub SetShowSingle(sel As Selection, oObj As Object, ByVal showMode As Integer)
 End Sub
 
 ' ==============================================================================
-' HELPER: SHOW / HIDE A LIST OF BODIES (by name) IN ONE SetShow CALL
-' ==============================================================================
-Sub SetShowBodyList(oPart As Part, partSel As Selection, bodyNames As Variant, ByVal showMode As Integer)
-    On Error Resume Next
-    Dim i As Integer
-    Dim oBody As Body
-
-    partSel.Clear
-    For i = LBound(bodyNames) To UBound(bodyNames)
-        Set oBody = GetBodyByName(oPart, CStr(bodyNames(i)))
-        If Not oBody Is Nothing Then partSel.Add oBody
-    Next i
-    partSel.VisProperties.SetShow showMode
-    partSel.Clear
-    Err.Clear
-End Sub
-
-' ==============================================================================
 ' HELPER: TRAVERSE TREE (ROWS + LEVELS + FIRST LEVEL, structure only)
 ' Level 1 = direct children of root, Level 2 = grandchildren, etc.
 ' Also fills:
@@ -5136,8 +5274,8 @@ End Sub
 ' HELPER: EVERY BODY OF A PART THAT HAS GEOMETRY - in the order of the tree
 '   names(i)   body name (unique inside a part)
 '   depths(i)  1 = directly below the part (PartBody, "Grundplatte", ...)
-'              2 = taken in by a boolean operation of a depth 1 body (Add,
-'                  Assemble, Remove, Intersect, Union Trim), 3 = ... deeper
+'              2 = taken in by Add or Assemble of a depth 1 body, 3 = ...
+'              (tool bodies of Remove / Intersect / Union Trim are left out)
 '   ops(i)     that operation ("Assemble.1"); "" on depth 1
 ' Returns the number of bodies (0..n-1 in the arrays). Bodies without any
 ' shape are left out. Every body found - also those inside operations, which
@@ -5202,8 +5340,8 @@ End Function
 ' takes in (only boolean operations have a .Body: the body they take in)
 Private Sub ScanBody(ByVal oBody As Object, dObj As Object, dKids As Object, dGeo As Object, _
                      dIsOperand As Object, ByVal depth As Long)
-    Dim nm As String, nm2 As String, opName As String
-    Dim j As Long, nShapes As Long
+    Dim nm As String, nm2 As String, opName As String, tn As String
+    Dim j As Long, nShapes As Long, isTool As Boolean
     Dim shp As Object, ob As Object, kids As Collection
 
     On Error Resume Next
@@ -5233,9 +5371,15 @@ Private Sub ScanBody(ByVal oBody As Object, dObj As Object, dKids As Object, dGe
                 nm2 = ob.Name
                 opName = ""
                 opName = shp.Name
+                tn = TypeName(shp)
                 Err.Clear
+                ' Remove / Intersect / Union Trim only use the body as a tool -
+                ' it is not a piece of the part (Add and Assemble are)
+                isTool = (InStr(1, tn, "Remove", vbTextCompare) > 0 Or _
+                          InStr(1, tn, "Intersect", vbTextCompare) > 0 Or _
+                          InStr(1, tn, "Trim", vbTextCompare) > 0)
                 If Len(nm2) > 0 And nm2 <> nm Then
-                    kids.Add Array(nm2, opName)
+                    kids.Add Array(nm2, opName, isTool)
                     If Not dIsOperand.Exists(nm2) Then dIsOperand.Add nm2, True
                     Call ScanBody(ob, dObj, dKids, dGeo, dIsOperand, depth + 1)
                 End If
@@ -5265,7 +5409,23 @@ Private Sub EmitBody(ByVal nm As String, ByVal depth As Long, ByVal opName As St
     If depth >= 30 Then Exit Sub
     If Not dKids.Exists(nm) Then Exit Sub
     For Each it In dKids(nm)
-        Call EmitBody(CStr(it(0)), depth + 1, CStr(it(1)), dKids, dGeo, dDone, names, depths, ops, n)
+        If it(2) Then
+            Call SkipBody(CStr(it(0)), dKids, dDone, 0)     ' a tool body: not a piece of the part
+        Else
+            Call EmitBody(CStr(it(0)), depth + 1, CStr(it(1)), dKids, dGeo, dDone, names, depths, ops, n)
+        End If
+    Next it
+End Sub
+
+' a tool body and what is inside it are not listed
+Private Sub SkipBody(ByVal nm As String, dKids As Object, dDone As Object, ByVal depth As Long)
+    Dim it As Variant
+
+    If dDone.Exists(nm) Then Exit Sub
+    dDone.Add nm, True
+    If depth >= 30 Or Not dKids.Exists(nm) Then Exit Sub
+    For Each it In dKids(nm)
+        Call SkipBody(CStr(it(0)), dKids, dDone, depth + 1)
     Next it
 End Sub
 

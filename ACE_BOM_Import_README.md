@@ -39,15 +39,24 @@ anywhere and the header row may be any of the first 20 rows. Accepted synonyms:
 `Part Number` / `PartNumber` / `Part No`, `Description` / `Name` / `Designation`,
 `Qty` / `Quantity`, `Level`, `First Level` / `Top Level`.
 
-### The two extraction versions
+### The extraction versions
 
-The assembly extractor offers two versions and the import handles both:
+The assembly extractor offers three versions and the import handles all of them:
 
 | Extraction | Import with | Result in `Input` |
 |---|---|---|
 | `GenerateMasterBOM` — part list | `ImportBOM` | one row per part, as always |
 | `GenerateAssemblyBOM` — assembly structure | `ImportBOM` | assemblies **and** parts, structure visible |
 | `GenerateAssemblyBOM` — assembly structure | `ImportBOM_PartsOnly` | only the parts, the assembly rows are skipped |
+| `GeneratePartBodyBOM` — bodies of one part | `ImportBOM` | one row per body of the CATPart |
+
+`GeneratePartBodyBOM` (or answer `2` at the start question, or run either
+macro on an open CATPart) lists the bodies of one part: one row per body,
+also the bodies inside another body (`PartBody > Assemble.1 > Body.2`, one
+level deeper; tool bodies of Remove / Intersect / Union Trim get no row). The part number of a row is the body name — or, for a body
+pasted with link from a product (`2DP…1\…\2DP000034948.1\PartBody`), the part
+number in that path. A body that takes in other bodies already contains their
+mass, so do not add it and the bodies below it up.
 
 `ImportBOM_PartsOnly` is the one to use when you want the structure sheet for
 reading but only the cost-carrying parts inside the cost model; the number of

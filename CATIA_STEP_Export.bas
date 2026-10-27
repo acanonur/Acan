@@ -81,10 +81,10 @@ Private Const EXPORT_FORMAT As String = "stp"
 Private mFso As Object
 Private mFolder As String            ' the folder of this run
 Private mLogPath As String
-Private mParts As Collection         ' Array(part number, first instance) in tree order
+Private mParts As Collection         ' Array(part number, first instance, named provisionally) in tree order
 Private mQty As Object               ' part number -> instances in the exported scope
 Private mDesc As Object              ' part number -> description
-Private mRows As Collection          ' index lines: Array(pn, desc, qty, body, file, status)
+Private mRows As Collection          ' index lines: Array(pn, body, file, status) - desc and qty at writing
 Private mFileNames As Object         ' file names used (lower case) - kept unique
 Private mPump As Long
 Private mNoPn As Long                ' components named before their part number could be read
@@ -188,7 +188,7 @@ Sub ExportStepFiles()
                  "read - renamed once loaded), " & mNotLoaded & " components not loaded")
     If nParts = 0 Then
         If mNotLoaded > 0 Then
-            failMsg = "CATIA could not load " & scopeName & " - nothing to export." & vbCrLf & _
+            failMsg = "CATIA could not load " & scopeName & ", or it is empty - nothing to export." & vbCrLf & _
                       "Load it in CATIA (Teamcenter) and run the export again."
         Else
             failMsg = "No part was found below " & scopeName & "."
@@ -223,16 +223,20 @@ Sub ExportStepFiles()
             If Len(realDesc) = 0 Then realDesc = oPartDoc.Product.DescriptionRef
             Err.Clear
             On Error GoTo Fail
-            If Len(realPn) > 0 Then
+            If Len(realPn) > 0 And realPn <> pn Then
                 Call LogLine("  part number of " & pn & ": " & realPn)
                 ' its pieces count for the real part number
                 If mQty.Exists(realPn) Then
                     mQty(realPn) = mQty(realPn) + mQty(pn)
                 Else
                     mQty.Add realPn, mQty(pn)
-                    mDesc.Add realPn, realDesc
+                    mDesc.Add realPn, ""
                 End If
                 pn = realPn
+            End If
+            ' (also when the provisional name already was the part number)
+            If Len(realDesc) > 0 And mDesc.Exists(pn) Then
+                If Len(CStr(mDesc(pn))) = 0 Then mDesc(pn) = realDesc
             End If
         End If
 
@@ -282,7 +286,8 @@ Finish:
            IIf(mNotLoaded > 0, "Components CATIA could not load: " & mNotLoaded & _
                "  - their parts are missing (see step_index.csv)" & vbCrLf, "") & _
            "Time: " & Format(Elapsed(startTime) / 60#, "0.0") & " min" & vbCrLf & vbCrLf & _
-           "Folder:" & vbCrLf & mFolder, IIf(nFailed > 0, vbExclamation, vbInformation), "STEP export"
+           "Folder:" & vbCrLf & mFolder, IIf(nFailed > 0 Or mNotLoaded > 0, vbExclamation, vbInformation), _
+           "STEP export"
     Exit Sub
 
 Fail:
@@ -469,7 +474,10 @@ Private Function ExportBody(oPartDoc As PartDocument, ByVal oBody As Object, ByV
         ExportBody = "not exported: nothing was pasted (the body has no solid of its own)"
     Else
         st = ExportDocument(newDoc, fileName)
-        If st = "OK" And Not HasSolid(pth) Then st = "exported, but the file holds no solid - check it"
+        ' (the solid check reads STEP text; an IGES file is not checked)
+        If st = "OK" And LCase$(EXPORT_FORMAT) = "stp" Then
+            If Not HasSolid(pth) Then st = "exported, but the file holds no solid - check it"
+        End If
         ExportBody = st
     End If
     newDoc.Close
@@ -632,7 +640,7 @@ Private Sub NoteNotLoaded(oProd As Product)
     If Len(pn) = 0 Then pn = nm
     mNotLoaded = mNotLoaded + 1
     Call AddRow(pn, "", "", "not exported: CATIA could not load " & nm & _
-                " (a sub-assembly that is not loaded, or no part number) - its parts are missing")
+                " (a sub-assembly that is not loaded or empty, or no part number) - its parts are missing")
     Call LogLine("NOT LOADED: " & nm)
 End Sub
 

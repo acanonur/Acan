@@ -90,9 +90,9 @@ Option Explicit
 '   GeneratePartBodyBOM    BODIES OF ONE PART (no question, straight to 2)
 '                          - one row per body with geometry, in the order of
 '                            the body tree: PartBody, the other bodies, and
-'                            the bodies INSIDE a body (taken in by Add or
-'                            Assemble) one level deeper. A body that is only
-'                            a tool of Remove / Intersect / Union Trim is no
+'                            the bodies INSIDE a body (taken in by Add,
+'                            Assemble or Union Trim) one level deeper. A body
+'                            that is only a tool of Remove / Intersect is no
 '                            piece of the part and gets no row
 '                          - every body measured on its own: mass, volume,
 '                            area, length / width / height, material, density
@@ -252,10 +252,10 @@ Private Const DETECT_MULTIBODY As Boolean = True
 ' them. False = one row per body, like the tree. (The whole-product BOM always
 ' lists every body of a multi-body part, as before.)
 Private Const GROUP_IDENTICAL_BODIES As Boolean = True
-' True = also the bodies that sit INSIDE another body (taken in by Add or
-' Assemble - in the tree below e.g. PartBody > Assemble.1) get a row, one
-' level deeper than that body. Tool bodies of Remove, Intersect and Union
-' Trim never get a row: they are cut away, not pieces of the part.
+' True = also the bodies that sit INSIDE another body (taken in by Add,
+' Assemble or Union Trim - in the tree below e.g. PartBody > Assemble.1) get a
+' row, one level deeper than that body. Tool bodies of Remove and Intersect
+' never get a row: they are cut away, not pieces of the part.
 Private Const LIST_INNER_BODIES As Boolean = True
 
 ' --- "KEINE RUECKMELDUNG" / "NOT RESPONDING" ----------------------------------
@@ -429,7 +429,7 @@ End Sub
 ' ==============================================================================
 ' ENTRY POINT 3: THE BODIES OF ONE PART
 ' One row per body, like the body tree of the CATPart - also the bodies that sit
-' inside another body (Add, Assemble). Works on an open CATPart, or
+' inside another body (Add, Assemble, Union Trim). Works on an open CATPart, or
 ' on one part of the open product (the part selected in the tree, or picked).
 ' ==============================================================================
 Sub GeneratePartBodyBOM()
@@ -1322,7 +1322,7 @@ Private Function ProcessBodies(oInst As Product, oPartDoc As PartDocument, partS
     firstName = FirstLevelLabel(oInst, pn)
     If Not mPartDocs.Exists(pn) Then mPartDocs.Add pn, oPartDoc
 
-    ' every body with geometry - also those inside Add and Assemble
+    ' every body with geometry - also those inside Add, Assemble and Union Trim
     Call SetStatus("BOM: reading the bodies of " & pn & " ...")
     Call NoteBodies(pn, oPart, 1)
     names = mBodyCache(pn)
@@ -1569,7 +1569,7 @@ Private Sub WriteDataRows(ByRef r As Long, ByRef nAssy As Long, ByRef nParts As 
 
             ' multi-body parts: the body names are cached per part number, so a
             ' part that appears on several sheets gets its body rows on every one.
-            ' Bodies inside another body (Add, Assemble) count too.
+            ' Bodies inside another body (Add, Assemble, Union Trim) count too.
             If hasPart And DETECT_MULTIBODY Then
                 If Not mBodyCache.Exists(strPartNum) Then Call NoteBodies(strPartNum, oPart, 2)
                 If IsArray(mBodyCache(strPartNum)) Then
@@ -2257,11 +2257,11 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
     Dim colFb As Collection
     Dim t As Double, sceneOK As Boolean
     Dim partSel As Selection, oBody As Body
-    Dim dShownBodies As Object, dShownCount As Object, colShown As Collection, nVis As Long
+    Dim dShownBodies As Object, dDrawn As Object, colShown As Collection, drawn As String
 
     If mJobRow.Count = 0 Then Exit Sub
     Set dShownBodies = CreateObject("Scripting.Dictionary")   ' part number -> what of it is visible
-    Set dShownCount = CreateObject("Scripting.Dictionary")    ' part number -> visible bodies among that
+    Set dDrawn = CreateObject("Scripting.Dictionary")         ' part number -> its bodies drawn as pieces
 
     If oViewer Is Nothing Then
         For j = 1 To mJobRow.Count
@@ -2327,13 +2327,14 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                         ' what is visible now - only that is hidden and shown again
                         If Not dShownBodies.Exists(pn) Then
                             Set partSel = oPartDoc.Selection
-                            dShownBodies.Add pn, VisiblePartItems(oPart, partSel, nVis)
-                            dShownCount.Add pn, nVis
+                            dShownBodies.Add pn, VisiblePartItems(oPart, partSel, pn, drawn)
+                            dDrawn.Add pn, drawn
                         End If
                         Set colShown = dShownBodies(pn)
-                        ' (one visible body: its picture IS the picture of the part)
+                        ' (the one body that is drawn: its picture IS the picture of the part)
                         picPath = ShotInOwnWindow(oPartDoc, homeWin, shotKey, oPart, colShown, bodyName, _
-                                                  IIf(dShownCount(pn) > 1, "P|" & pn, ""), fullSig)
+                                                  IIf(OnlyDrawnBody(CStr(dDrawn(pn)), bodyName), "", "P|" & pn), _
+                                                  fullSig)
                     End If
                 End If
 
@@ -2434,8 +2435,8 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                         If PartDocOf(oProd, pn, oPart, oPartDoc) Then
                             Set partSel = oPartDoc.Selection
                             If Not dShownBodies.Exists(pn) Then
-                                dShownBodies.Add pn, VisiblePartItems(oPart, partSel, nVis)
-                                dShownCount.Add pn, nVis
+                                dShownBodies.Add pn, VisiblePartItems(oPart, partSel, pn, drawn)
+                                dDrawn.Add pn, drawn
                             End If
                             Set colShown = dShownBodies(pn)
                             Set oBody = GetBodyByName(oPart, bodyName)
@@ -2464,13 +2465,13 @@ Private Sub TakePictures(sel As Selection, oViewer As Viewer, xlSheet As Object)
                     ' component is fine here - hiding works, so the rest of the
                     ' component simply draws nothing, e.g. parts not loaded.)
                     sig = FileSignature(picPath)
-                    ' a body equal to its whole part while other bodies were
-                    ' visible: hiding them had no effect
+                    ' a body equal to its whole part: hiding the rest had no
+                    ' effect - unless it is the one body the part draws
                     If kind = "BODY" And mShotSigs.Exists("P|" & pn) Then
                         If mShotSigs("P|" & pn) = sig Then
-                            nVis = 2
-                            If dShownCount.Exists(pn) Then nVis = dShownCount(pn)
-                            If nVis > 1 Then sig = baseSig
+                            drawn = ""
+                            If dDrawn.Exists(pn) Then drawn = CStr(dDrawn(pn))
+                            If Not OnlyDrawnBody(drawn, bodyName) Then sig = baseSig
                         End If
                     End If
                     If sig = baseSig Then
@@ -2531,7 +2532,7 @@ Private Sub TakeBodyPictures(oPart As Part, partSel As Selection, oViewer As Vie
     Dim j As Long, rowNo As Long, t As Double
     Dim bodyName As String, shotKey As String
     Dim picPath As String, basePath As String, baseSig As String, sig As String
-    Dim oBody As Body, nVis As Long
+    Dim oBody As Body, drawn As String
 
     If mJobRow.Count = 0 Then Exit Sub
     If oViewer Is Nothing Then
@@ -2545,7 +2546,7 @@ Private Sub TakeBodyPictures(oPart As Part, partSel As Selection, oViewer As Vie
     ' --- the scene: nothing of the part visible (every body - also one with
     '     only wireframe in it - and the construction elements) ---
     Set mSceneSel = partSel
-    Set mSceneShow = VisiblePartItems(oPart, partSel, nVis)
+    Set mSceneShow = VisiblePartItems(oPart, partSel, pn, drawn)
     Call SetShowCollection(partSel, mSceneShow, 1)
     Call Settle(100)
 
@@ -2610,21 +2611,6 @@ Private Sub TakeBodyPictures(oPart As Part, partSel As Selection, oViewer As Vie
     Err.Clear
     On Error GoTo 0
 End Sub
-
-' every body of a part, with or without geometry, also those inside operations
-Private Function AllBodiesOf(oPart As Part) As Collection
-    Dim col As Collection, k As Variant
-    Dim names() As String, depths() As Long, ops() As String
-
-    Set col = New Collection
-    Set AllBodiesOf = col
-    If oPart Is Nothing Then Exit Function
-    If Not (mBodyObjPart Is oPart) Then Call CollectBodies(oPart, names, depths, ops)
-    If mBodyObj Is Nothing Then Exit Function
-    For Each k In mBodyObj.Keys
-        col.Add mBodyObj(k)
-    Next k
-End Function
 
 ' what the body pictures hid is shown again
 Private Sub RestoreScene()
@@ -2703,23 +2689,52 @@ End Function
 
 ' what of a part is visible now: its bodies (every one, also those inside
 ' operations or with only wireframe) and its construction elements - what a
-' body picture hides and shows again. nBodies = how many of them are bodies.
-' Something CATIA does not tell about counts as visible.
-Private Function VisiblePartItems(oPart As Part, partSel As Selection, ByRef nBodies As Long) As Collection
-    Dim col As Collection, it As Variant
+' body picture hides and shows again. Something CATIA does not tell about
+' counts as visible.
+' drawn = the visible bodies that are drawn as pieces of their own (listed
+' bodies directly below the part - a body inside Add / Assemble is drawn by
+' its owner), as Chr(1) & name & Chr(1) & name ... & Chr(1)
+Private Function VisiblePartItems(oPart As Part, partSel As Selection, ByVal pn As String, _
+                                  ByRef drawn As String) As Collection
+    Dim col As Collection, it As Variant, k As Variant, dTop As Object
+    Dim names As Variant, tree As Variant, depths As Variant, i As Long
+    Dim names2() As String, depths2() As Long, ops2() As String
 
     Set col = New Collection
-    nBodies = 0
-    For Each it In AllBodiesOf(oPart)
-        If ShowState(partSel, it) <> 0 Then
-            col.Add it
-            nBodies = nBodies + 1
+    Set VisiblePartItems = col
+    drawn = Chr(1)
+    If oPart Is Nothing Then Exit Function
+
+    Set dTop = CreateObject("Scripting.Dictionary")
+    If mBodyCache.Exists(pn) And mBodyTree.Exists(pn) Then
+        names = mBodyCache(pn)
+        If IsArray(names) Then
+            tree = mBodyTree(pn)
+            depths = tree(0)
+            For i = LBound(names) To UBound(names)
+                If CLng(depths(i)) = 1 Then dTop(CStr(names(i))) = True
+            Next i
         End If
-    Next it
+    End If
+
+    If Not (mBodyObjPart Is oPart) Then Call CollectBodies(oPart, names2, depths2, ops2)
+    If Not mBodyObj Is Nothing Then
+        For Each k In mBodyObj.Keys
+            If ShowState(partSel, mBodyObj(k)) <> 0 Then
+                col.Add mBodyObj(k)
+                If dTop.Exists(CStr(k)) Then drawn = drawn & CStr(k) & Chr(1)
+            End If
+        Next k
+    End If
     For Each it In PartClutter(oPart)
         If ShowState(partSel, it) <> 0 Then col.Add it
     Next it
-    Set VisiblePartItems = col
+End Function
+
+' a body picture may look exactly like its whole part only when that body is
+' the one piece of the part that is drawn (see VisiblePartItems)
+Private Function OnlyDrawnBody(ByVal drawn As String, ByVal bodyName As String) As Boolean
+    OnlyDrawnBody = (drawn = Chr(1) & bodyName & Chr(1))
 End Function
 
 
@@ -2737,6 +2752,7 @@ Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKe
                                  ByVal refKey As String, ByVal homeSig As String) As String
     Dim w As Object, v As Viewer, partSel As Selection, oBody As Body
     Dim picPath As String, sig As String, ok As Boolean, isolated As Boolean
+    Dim emptyPath As String, emptySig As String
 
     ShotInOwnWindow = ""
     mShotNo = mShotNo + 1
@@ -2769,8 +2785,17 @@ Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKe
             Exit Function
         End If
         Call SetShowCollection(partSel, colShown, 1)
-        Call SetShowSingle(partSel, oBody, 0)
         isolated = True
+        ' the window with nothing of the part in it - a body that CATIA does
+        ' not draw on its own (inside Add / Assemble) looks exactly like this
+        If Not v Is Nothing Then
+            If SET_ISO_VIEW Then Call SetIsoViewpoint(v)
+            Call Settle(ASSY_SETTLE_MS)
+            emptyPath = mTempDir & "\shot" & mShotNo & "_empty.jpg"
+            If CaptureViewToFile(v, emptyPath) Then emptySig = FileSignature(emptyPath)
+            If mFso.FileExists(emptyPath) Then mFso.DeleteFile emptyPath, True
+        End If
+        Call SetShowSingle(partSel, oBody, 0)
         Err.Clear
     End If
 
@@ -2796,6 +2821,15 @@ Private Function ShotInOwnWindow(oDoc As Object, homeWin As Object, ByVal shotKe
     ' captured the main window - this row is pictured there instead
     If Len(homeSig) > 0 And sig = homeSig Then
         Call LogLine(mSheetName & "  the window of " & shotKey & " was not displayed - main window instead")
+        On Error Resume Next
+        mFso.DeleteFile picPath, True
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+    ' nothing of the body drawn
+    If Len(emptySig) > 0 And sig = emptySig Then
+        Call LogLine(mSheetName & "  " & shotKey & " is not drawn on its own - No Preview")
         On Error Resume Next
         mFso.DeleteFile picPath, True
         Err.Clear
@@ -5274,8 +5308,8 @@ End Sub
 ' HELPER: EVERY BODY OF A PART THAT HAS GEOMETRY - in the order of the tree
 '   names(i)   body name (unique inside a part)
 '   depths(i)  1 = directly below the part (PartBody, "Grundplatte", ...)
-'              2 = taken in by Add or Assemble of a depth 1 body, 3 = ...
-'              (tool bodies of Remove / Intersect / Union Trim are left out)
+'              2 = taken in by Add, Assemble or Union Trim of a depth 1 body,
+'                  3 = ... (tool bodies of Remove / Intersect are left out)
 '   ops(i)     that operation ("Assemble.1"); "" on depth 1
 ' Returns the number of bodies (0..n-1 in the arrays). Bodies without any
 ' shape are left out. Every body found - also those inside operations, which
@@ -5357,7 +5391,9 @@ Private Sub ScanBody(ByVal oBody As Object, dObj As Object, dKids As Object, dGe
     nShapes = oBody.Shapes.Count
     Err.Clear
     dGeo.Add nm, (nShapes > 0)
-    If Not LIST_INNER_BODIES Or depth >= 30 Then Exit Sub
+    ' (always: which bodies sit inside an operation, and which are only tools -
+    '  LIST_INNER_BODIES only decides whether they get rows, in EmitBody)
+    If depth >= 30 Then Exit Sub
 
     For j = 1 To nShapes
         Set shp = Nothing
@@ -5373,11 +5409,10 @@ Private Sub ScanBody(ByVal oBody As Object, dObj As Object, dKids As Object, dGe
                 opName = shp.Name
                 tn = TypeName(shp)
                 Err.Clear
-                ' Remove / Intersect / Union Trim only use the body as a tool -
-                ' it is not a piece of the part (Add and Assemble are)
+                ' Remove and Intersect only use the body as a tool - it is not
+                ' a piece of the part (Add, Assemble and Union Trim keep it)
                 isTool = (InStr(1, tn, "Remove", vbTextCompare) > 0 Or _
-                          InStr(1, tn, "Intersect", vbTextCompare) > 0 Or _
-                          InStr(1, tn, "Trim", vbTextCompare) > 0)
+                          InStr(1, tn, "Intersect", vbTextCompare) > 0)
                 If Len(nm2) > 0 And nm2 <> nm Then
                     kids.Add Array(nm2, opName, isTool)
                     If Not dIsOperand.Exists(nm2) Then dIsOperand.Add nm2, True
@@ -5409,8 +5444,10 @@ Private Sub EmitBody(ByVal nm As String, ByVal depth As Long, ByVal opName As St
     If depth >= 30 Then Exit Sub
     If Not dKids.Exists(nm) Then Exit Sub
     For Each it In dKids(nm)
-        If it(2) Then
-            Call SkipBody(CStr(it(0)), dKids, dDone, 0)     ' a tool body: not a piece of the part
+        If it(2) Or Not LIST_INNER_BODIES Then
+            ' a tool body is not a piece of the part; without LIST_INNER_BODIES
+            ' no body inside an operation gets a row
+            Call SkipBody(CStr(it(0)), dKids, dDone, 0)
         Else
             Call EmitBody(CStr(it(0)), depth + 1, CStr(it(1)), dKids, dGeo, dDone, names, depths, ops, n)
         End If

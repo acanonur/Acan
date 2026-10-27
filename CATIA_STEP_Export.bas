@@ -25,7 +25,14 @@ Option Explicit
 '
 ' WHICH PARTS:
 '   - an open CATPart: that part and its bodies
-'   - an open CATProduct: every part below it, at every level
+'   - an open CATProduct: every part below it, down to the LOWEST level of
+'     the tree. With Teamcenter a sub-assembly whose content is not loaded
+'     yet shows no children, just like a part - so a component counts as a
+'     part only when something says it is one (its CATPart is loaded, it has
+'     a shape, its file is a CATPart / cgr); otherwise its structure is
+'     loaded and the search goes on below it. A "part" that still turns out
+'     to have components once it is loaded is searched as well.
+'     step_index.csv says where in the tree every part was found.
 '   - a component selected in the tree when the macro starts: you are asked
 '     whether only that component (and everything below it) is exported
 '
@@ -81,9 +88,10 @@ Private Const EXPORT_FORMAT As String = "stp"
 Private mFso As Object
 Private mFolder As String            ' the folder of this run
 Private mLogPath As String
-Private mParts As Collection         ' Array(part number, first instance, named provisionally) in tree order
+Private mParts As Collection         ' Array(part number, first instance, named provisionally, place in the tree)
 Private mQty As Object               ' part number -> instances in the exported scope
 Private mDesc As Object              ' part number -> description
+Private mPath As Object              ' part number -> its first place in the tree ("root > sub > ...")
 Private mRows As Collection          ' index lines: Array(pn, body, file, status) - desc and qty at writing
 Private mFileNames As Object         ' file names used (lower case) - kept unique
 Private mPump As Long
@@ -91,6 +99,10 @@ Private mNoPn As Long                ' components named before their part number
 Private mProvOwner As Object         ' provisional name -> the parent it belongs to (kept unique)
 Private mExported As Object          ' part numbers already worked on in this run
 Private mNotLoaded As Long           ' components CATIA could not load - their parts are missing
+Private mNodes As Long               ' components visited by the tree search
+Private mMaxDepth As Long            ' deepest level reached
+Private mStructLoads As Long         ' components whose structure had to be loaded first
+Private mLateAssy As Long            ' "parts" that turned out to be sub-assemblies once loaded
 
 
 ' ==============================================================================
@@ -100,7 +112,7 @@ Sub ExportStepFiles()
     Dim catDoc As Document, rootProd As Product, rootWin As Object
     Dim scopeProd As Product, isPartDoc As Boolean, ans As Long
     Dim rootPN As String, scopeName As String
-    Dim i As Long, it As Variant, pn As String, realPn As String, realDesc As String
+    Dim i As Long, it As Variant, pn As String, realPn As String, realDesc As String, nk As Long
     Dim oInst As Product, oPart As Part, oPartDoc As PartDocument
     Dim nParts As Long, nPartFiles As Long, nBodyFiles As Long, nFailed As Long
     Dim startTime As Double, failMsg As String, statusTxt As String
@@ -112,12 +124,17 @@ Sub ExportStepFiles()
     Set mRows = New Collection
     Set mQty = CreateObject("Scripting.Dictionary")
     Set mDesc = CreateObject("Scripting.Dictionary")
+    Set mPath = CreateObject("Scripting.Dictionary")
     Set mFileNames = CreateObject("Scripting.Dictionary")
     Set mProvOwner = CreateObject("Scripting.Dictionary")
     Set mExported = CreateObject("Scripting.Dictionary")
     mPump = 0
     mNoPn = 0
     mNotLoaded = 0
+    mNodes = 0
+    mMaxDepth = 0
+    mStructLoads = 0
+    mLateAssy = 0
 
     ' --- 1. DOCUMENT -----------------------------------------------------------
     On Error Resume Next
@@ -179,11 +196,14 @@ Sub ExportStepFiles()
     ' --- 4. THE PARTS ----------------------------------------------------------
     Call SetStatus("STEP export: reading the product structure ...")
     If isPartDoc Then
-        Call AddPart(rootProd, "")
+        Call AddPart(rootProd, "", 1)
     Else
-        Call CollectNode(scopeProd, "", 0)     ' (a selected part is one part)
+        ' down to the lowest level of the tree (a selected part is one part)
+        Call CollectNode(scopeProd, "", 0, 1)
     End If
     nParts = mParts.Count
+    Call LogLine("tree searched: " & mNodes & " components, " & mMaxDepth & " levels deep, " & _
+                 mStructLoads & " structures loaded first")
     Call LogLine(nParts & " part numbers to export (" & mNoPn & " named before their part number could be " & _
                  "read - renamed once loaded), " & mNotLoaded & " components not loaded")
     If nParts = 0 Then
@@ -197,18 +217,40 @@ Sub ExportStepFiles()
     End If
 
     ' --- 5. EXPORT -------------------------------------------------------------
-    For i = 1 To mParts.Count
+    ' (a "part" that turns out to be a sub-assembly adds its parts to the list
+    '  while the loop runs - so the list is walked until its end, not a count)
+    i = 0
+    Do While i < mParts.Count
+        i = i + 1
+        nParts = mParts.Count
         it = mParts(i)
         pn = CStr(it(0))
         Set oInst = it(1)
         Call SetStatus("STEP export: part " & i & " of " & nParts & " - " & pn & " (loading ...)")
-        Call LogLine("part " & i & "/" & nParts & "  " & pn)
+        Call LogLine("part " & i & "/" & nParts & "  " & pn & "   in " & CStr(it(3)))
 
         If isPartDoc Then
             Set oPartDoc = catDoc
             Set oPart = oPartDoc.Part
         ElseIf Not LoadPart(oInst, oPart, oPartDoc) Then
             Set oPart = Nothing
+        End If
+
+        ' once loaded it has components of its own: a sub-assembly, not a part -
+        ' the search goes on below it, for every piece of it that was counted
+        nk = 0
+        If Not isPartDoc And oPart Is Nothing Then
+            On Error Resume Next
+            nk = oInst.Products.Count
+            Err.Clear
+            On Error GoTo Fail
+        End If
+        If nk > 0 Then
+            mLateAssy = mLateAssy + 1
+            Call LogLine("  " & pn & " is a sub-assembly (" & nk & " components) - its parts are searched too")
+            Call CollectNode(oInst, CStr(it(3)), 1, CLng(mQty(pn)))
+            Call LogLine("  the list has " & mParts.Count & " part numbers now")
+            GoTo NextPart
         End If
 
         ' named before its part number could be read: now that it is loaded,
@@ -232,6 +274,7 @@ Sub ExportStepFiles()
                     mQty.Add realPn, mQty(pn)
                     mDesc.Add realPn, ""
                 End If
+                If Not mPath.Exists(realPn) Then mPath.Add realPn, CStr(it(3))
                 pn = realPn
             End If
             ' (also when the provisional name already was the part number)
@@ -253,9 +296,12 @@ Sub ExportStepFiles()
             mExported.Add pn, True
             Call ExportPart(i, nParts, pn, oPart, oPartDoc, nPartFiles, nBodyFiles, nFailed)
         End If
+NextPart:
         Call SetStatus("")
         DoEvents
-    Next i
+    Loop
+    nParts = mParts.Count
+    Call LogLine(mLateAssy & " components found to be sub-assemblies only once loaded")
 
 Finish:
     ' --- 6. INDEX, RESTORE, REPORT ---------------------------------------------
@@ -561,39 +607,50 @@ End Function
 ' that still cannot be loaded is listed as not loaded (its parts are missing).
 '   ownerKey  the path of the parent - keeps provisional names apart
 ' ==============================================================================
-Private Sub CollectNode(oProd As Product, ByVal ownerKey As String, ByVal depth As Long)
-    Dim i As Long, n As Long, nk As Long, nm As String
+Private Sub CollectNode(oProd As Product, ByVal ownerKey As String, ByVal depth As Long, _
+                        ByVal mult As Long)
+    Dim i As Long, nk As Long, nm As String, here As String
     Dim child As Product
 
     If depth > 60 Then Exit Sub
+    mNodes = mNodes + 1
+    If depth > mMaxDepth Then mMaxDepth = depth
     nk = ChildCount(oProd)
     If nk = 0 Then
-        Call AddPart(oProd, ownerKey)
+        Call AddPart(oProd, ownerKey, mult)
         Exit Sub
     ElseIf nk < 0 Then
-        Call NoteNotLoaded(oProd)
+        Call NoteNotLoaded(oProd, ownerKey)
         Exit Sub
     End If
 
+    ' the place of the children in the tree: "root > sub-assembly > ..."
     nm = InstanceName(oProd)
+    If Len(ownerKey) > 0 Then here = ownerKey & " > " & nm Else here = nm
     For i = 1 To nk
         Set child = Nothing
         On Error Resume Next
         Set child = oProd.Products.Item(i)
         Err.Clear
         On Error GoTo 0
-        If Not child Is Nothing Then Call CollectNode(child, ownerKey & ">" & nm, depth + 1)
+        If Not child Is Nothing Then Call CollectNode(child, here, depth + 1, mult)
         mPump = mPump + 1
         If mPump Mod 50 = 0 Then DoEvents
-        If mPump Mod 500 = 0 Then Call SetStatus("STEP export: reading the product structure ... " & mPump & " nodes")
+        If mPump Mod 500 = 0 Then Call SetStatus("STEP export: searching the product tree ... " & _
+                                                 mPump & " components, level " & mMaxDepth)
     Next i
 End Sub
 
-' the children of a component; its structure is loaded first when Teamcenter
-' has not loaded it yet. -1 = a component CATIA cannot load: a sub-assembly
-' whose structure does not come, or one with no part number and nothing that
-' says it is a part - design mode on it would load everything below it in one
-' blocking call, so it is left alone
+' the children of a component. Teamcenter loads on demand: a sub-assembly
+' whose content is not loaded yet shows NO children, exactly like a part. So a
+' childless component counts as a part only when something says it is one
+' (its CATPart is in the session, it has a shape, its file is a CATPart / cgr);
+' otherwise its structure is loaded first (visualization mode) and the search
+' goes on below it - down to the lowest level of the tree.
+' -1 = a component CATIA cannot load: a sub-assembly whose structure does not
+' come, or one with no part number and nothing that says it is a part - design
+' mode on it would load everything below it in one blocking call, so it is
+' left alone
 Private Function ChildCount(oProd As Product) As Long
     Dim nk As Long, pn As String
 
@@ -604,7 +661,8 @@ Private Function ChildCount(oProd As Product) As Long
     pn = oProd.PartNumber
     Err.Clear
     If nk = 0 Then
-        If Len(pn) = 0 Or IsUnloadedAssembly(oProd) Then
+        If Len(pn) = 0 Or IsUnloadedAssembly(oProd) Or Not HasPartEvidence(oProd) Then
+            mStructLoads = mStructLoads + 1
             Call SetStatus("STEP export: loading the structure of " & InstanceName(oProd) & " ...")
             Err.Clear
             oProd.ApplyWorkMode 1                 ' visualization: the structure only
@@ -628,7 +686,7 @@ Private Function ChildCount(oProd As Product) As Long
 End Function
 
 ' a component CATIA cannot load: one line in the index, nothing exported
-Private Sub NoteNotLoaded(oProd As Product)
+Private Sub NoteNotLoaded(oProd As Product, ByVal ownerKey As String)
     Dim nm As String, pn As String
 
     nm = InstanceName(oProd)
@@ -638,6 +696,7 @@ Private Sub NoteNotLoaded(oProd As Product)
     Err.Clear
     On Error GoTo 0
     If Len(pn) = 0 Then pn = nm
+    If Not mPath.Exists(pn) Then mPath.Add pn, ownerKey
     mNotLoaded = mNotLoaded + 1
     Call AddRow(pn, "", "", "not exported: CATIA could not load " & nm & _
                 " (a sub-assembly that is not loaded or empty, or no part number) - its parts are missing")
@@ -646,7 +705,7 @@ End Sub
 
 ' notes one part instance: a new part number, or one more piece of a known one.
 ' it(2) of the list = True: named before its part number could be read
-Private Sub AddPart(oProd As Product, ByVal ownerKey As String)
+Private Sub AddPart(oProd As Product, ByVal ownerKey As String, ByVal mult As Long)
     Dim pn As String, desc As String, prov As Boolean
 
     pn = ""
@@ -663,11 +722,12 @@ Private Sub AddPart(oProd As Product, ByVal ownerKey As String)
         mNoPn = mNoPn + 1
     End If
     If mQty.Exists(pn) Then
-        mQty(pn) = mQty(pn) + 1
+        mQty(pn) = mQty(pn) + mult
     Else
-        mQty.Add pn, 1
+        mQty.Add pn, mult
         mDesc.Add pn, desc
-        mParts.Add Array(pn, oProd, prov)
+        mParts.Add Array(pn, oProd, prov, ownerKey)
+        If Not mPath.Exists(pn) Then mPath.Add pn, ownerKey
     End If
 End Sub
 
@@ -1077,7 +1137,7 @@ End Sub
 
 ' step_index.csv - ";" separated, as German Excel opens it with a double click
 Private Sub WriteIndex()
-    Dim f As Integer, it As Variant, desc As String, qty As String
+    Dim f As Integer, it As Variant, desc As String, qty As String, place As String
 
     If Len(mFolder) = 0 Or mRows Is Nothing Then Exit Sub
     On Error Resume Next
@@ -1087,14 +1147,16 @@ Private Sub WriteIndex()
         Err.Clear
         Exit Sub
     End If
-    Print #f, "Part Number;Description;Qty;Body;STEP file;Status"
+    Print #f, "Part Number;Description;Qty;Body;STEP file;Status;Found in (first place in the tree)"
     For Each it In mRows
         desc = ""
         qty = ""
+        place = ""
         If mDesc.Exists(CStr(it(0))) Then desc = CStr(mDesc(CStr(it(0))))
         If mQty.Exists(CStr(it(0))) Then qty = CStr(mQty(CStr(it(0))))
+        If mPath.Exists(CStr(it(0))) Then place = CStr(mPath(CStr(it(0))))
         Print #f, CsvField(it(0)) & ";" & CsvField(desc) & ";" & qty & ";" & CsvField(it(1)) & ";" & _
-                  CsvField(it(2)) & ";" & CsvField(it(3))
+                  CsvField(it(2)) & ";" & CsvField(it(3)) & ";" & CsvField(place)
     Next it
     Close #f
     Err.Clear

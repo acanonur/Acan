@@ -396,6 +396,7 @@ Private mProvOwner As Object     ' provisional instance name -> the parent key i
 Private mSlow As Collection      ' Array(seconds, step) of every slow step
 Private mPump As Long            ' node counter of the tree walks
 Private mNoOwnWindows As Boolean ' a new window was not shown by CATIA - the rest in the main window
+Private mUnitInst As Product      ' the instance (in the product) of the sheet made in a window of its own
 Private mUnitIsPart As Object    ' part numbers on the split level that are PARTS (own sheet, main window)
 
 
@@ -534,6 +535,7 @@ Private Sub RunBOM()
     '     its bodies are listed (the part-body BOM)
     mBodyMode = isPartDoc
     mNoOwnWindows = False
+    Set mUnitInst = Nothing
     If mBodyMode Then
         ' one part: its body tree is the tree of the sheet
         mIncludeSubassemblies = True
@@ -685,7 +687,8 @@ Private Sub RunBOM()
 
     ' --- 6. MAIN WINDOW: geometry only, fixed camera ----------------------------
     Call PrepareWindow(rootWin, rootViewer, rootLayout, rootLayoutSet)
-    compassToggled = ToggleCompass()
+    ' (only for pictures: in a run without pictures the compass is left alone)
+    If mShotParts Or mShotAssy Then compassToggled = ToggleCompass()
 
     If mBodyMode Then
 
@@ -840,14 +843,20 @@ Private Sub RunBOM()
             If ownWindow Then
                 nOwnWin = nOwnWin + 1
                 ' every new window starts with its own compass - hide it there too
-                ' (the main window keeps its own state: compassToggled)
-                If compassToggled Then unitCompass = ToggleCompass()
+                ' (the main window keeps its own state: compassToggled). Only in a
+                ' window the check has seen shown: in one CATIA does not show, the
+                ' command would land in the main window.
+                If compassToggled And Len(homeSig) > 0 Then unitCompass = ToggleCompass()
                 Set unitSel = unitDoc.Selection
                 Set unitRoot = unitDoc.Product
 
+                ' (the first row is named by the instance in the product, e.g.
+                '  "(START_SKELETON)" - the root of the window is the reference)
+                Set mUnitInst = unitInst
                 unitOK = ProcessTree(unitRoot, unitSel, unitViewer, xlSheet, splitLevel, _
                                      CStr(dUnitFirst(unitKey)), CStr(unitKey), CLng(dUnitQty(unitKey)), _
                                      nRows, nAssy, nParts, statusTxt)
+                Set mUnitInst = Nothing
 
                 ' close the component window and go back to the product
                 On Error Resume Next
@@ -883,6 +892,7 @@ UnitCleanup:
             ' (reached from UnitFail below, after the error is cleared)
             On Error Resume Next
             Call LogLine("component " & CStr(unitKey) & " " & statusTxt)
+            Set mUnitInst = Nothing
             If Not unitWin Is Nothing Then unitWin.Close
             Set unitWin = Nothing
             rootWin.Activate
@@ -1943,11 +1953,16 @@ End Function
 ' ==============================================================================
 Private Sub WriteUnitRow(treeRoot As Product, ByVal r As Long, ByVal lvl As Long, _
                          ByVal pn As String, ByVal qty As Long, ByVal firstLevel As String)
-    Dim sDesc As String
+    Dim sDesc As String, nameProd As Product
 
     sDesc = ""
     On Error Resume Next
     sDesc = treeRoot.DescriptionRef
+    Err.Clear
+    ' a sheet made in a window of its own: treeRoot is the root of that
+    ' document, whose Name is the part number - the row shows the instance
+    Set nameProd = treeRoot
+    If Not mUnitInst Is Nothing Then Set nameProd = mUnitInst
     Err.Clear
     On Error GoTo 0
 
@@ -1957,7 +1972,7 @@ Private Sub WriteUnitRow(treeRoot As Product, ByVal r As Long, ByVal lvl As Long
     Call BufSet(r, 5, qty)
     Call BufSet(r, 14, firstLevel)
     Call BufSet(r, 15, "Assembly")
-    Call BufSet(r, 16, TreeRowText(treeRoot, pn, 1))
+    Call BufSet(r, 16, TreeRowText(nameProd, pn, 1))
     mBoldRows.Add r
     mAssyRows.Add Array(r, pn, treeRoot)
 

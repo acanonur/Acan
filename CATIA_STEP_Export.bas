@@ -46,8 +46,9 @@ Option Explicit
 '   - Teamcenter: like the BOM macros, every part is loaded one at a time
 '     (design mode) - a big product takes as long as a BOM run without
 '     pictures. A sub-assembly that is not loaded gets its structure loaded
-'     first; one that still cannot be loaded is listed in step_index.csv
-'     ("its parts are missing") and never loaded in design mode as a whole.
+'     first; if that shows nothing, it is loaded completely (design mode, one
+'     long step) so that no part below it is missed. Only a component CATIA
+'     cannot load at all is listed in step_index.csv ("its parts are missing").
 '     A part whose part number shows only once it is loaded gets its files
 '     under that part number. A part CATIA has only as a visualization (cgr)
 '     cannot be exported: its line in step_index.csv says so.
@@ -103,6 +104,7 @@ Private mNodes As Long               ' components visited by the tree search
 Private mMaxDepth As Long            ' deepest level reached
 Private mStructLoads As Long         ' components whose structure had to be loaded first
 Private mLateAssy As Long            ' "parts" that turned out to be sub-assemblies once loaded
+Private mDesignLoads As Long         ' components loaded completely because their structure did not come
 
 
 ' ==============================================================================
@@ -135,6 +137,7 @@ Sub ExportStepFiles()
     mMaxDepth = 0
     mStructLoads = 0
     mLateAssy = 0
+    mDesignLoads = 0
 
     ' --- 1. DOCUMENT -----------------------------------------------------------
     On Error Resume Next
@@ -203,7 +206,7 @@ Sub ExportStepFiles()
     End If
     nParts = mParts.Count
     Call LogLine("tree searched: " & mNodes & " components, " & mMaxDepth & " levels deep, " & _
-                 mStructLoads & " structures loaded first")
+                 mStructLoads & " structures loaded first, " & mDesignLoads & " components loaded completely")
     Call LogLine(nParts & " part numbers to export (" & mNoPn & " named before their part number could be " & _
                  "read - renamed once loaded), " & mNotLoaded & " components not loaded")
     If nParts = 0 Then
@@ -647,10 +650,9 @@ End Sub
 ' (its CATPart is in the session, it has a shape, its file is a CATPart / cgr);
 ' otherwise its structure is loaded first (visualization mode) and the search
 ' goes on below it - down to the lowest level of the tree.
-' -1 = a component CATIA cannot load: a sub-assembly whose structure does not
-' come, or one with no part number and nothing that says it is a part - design
-' mode on it would load everything below it in one blocking call, so it is
-' left alone
+' A sub-assembly whose structure does not come in visualization mode is
+' loaded completely (design mode) as a last resort, so no part below it is
+' missed. -1 = a component CATIA cannot load even then.
 Private Function ChildCount(oProd As Product) As Long
     Dim nk As Long, pn As String
 
@@ -673,10 +675,29 @@ Private Function ChildCount(oProd As Product) As Long
             pn = oProd.PartNumber
             Err.Clear
             If nk = 0 Then
-                If IsUnloadedAssembly(oProd) Then
-                    nk = -1
-                ElseIf Len(pn) = 0 And Not HasPartEvidence(oProd) Then
-                    nk = -1
+                If IsUnloadedAssembly(oProd) Or (Len(pn) = 0 And Not HasPartEvidence(oProd)) Then
+                    ' still nothing: as a last resort design mode - for a
+                    ' sub-assembly that loads everything below it in one go
+                    ' (each of those parts is loaded for its STEP file anyway),
+                    ' so no part below it is missed
+                    mDesignLoads = mDesignLoads + 1
+                    Call SetStatus("STEP export: loading " & InstanceName(oProd) & " completely (design mode) ...")
+                    Call LogLine("loading " & InstanceName(oProd) & " completely (design mode) - its structure did not come")
+                    Err.Clear
+                    oProd.ApplyWorkMode 2
+                    Err.Clear
+                    nk = 0
+                    nk = oProd.Products.Count
+                    pn = ""
+                    pn = oProd.PartNumber
+                    Err.Clear
+                    If nk = 0 Then
+                        If IsUnloadedAssembly(oProd) Then
+                            nk = -1
+                        ElseIf Len(pn) = 0 And Not HasPartEvidence(oProd) Then
+                            nk = -1
+                        End If
+                    End If
                 End If
             End If
         End If

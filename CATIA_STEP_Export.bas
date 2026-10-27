@@ -39,8 +39,14 @@ Option Explicit
 '   - Teamcenter: like the BOM macros, every part is loaded one at a time
 '     (design mode) - a big product takes as long as a BOM run without
 '     pictures. A sub-assembly that is not loaded gets its structure loaded
-'     first. A part CATIA has only as a visualization (cgr) cannot be
-'     exported: its line in step_index.csv says so.
+'     first; one that still cannot be loaded is listed in step_index.csv
+'     ("its parts are missing") and never loaded in design mode as a whole.
+'     A part whose part number shows only once it is loaded gets its files
+'     under that part number. A part CATIA has only as a visualization (cgr)
+'     cannot be exported: its line in step_index.csv says so.
+'   - a body file is named inside like the file (not "Part1"), its body is
+'     shown even when it is hidden in your part, and it must hold a solid -
+'     otherwise its line in step_index.csv says so.
 '
 ' STEP settings (AP214 or AP203, units, what a part file contains, hidden
 ' elements) are the ones of Tools > Options > General > Compatibility > STEP.
@@ -81,7 +87,10 @@ Private mDesc As Object              ' part number -> description
 Private mRows As Collection          ' index lines: Array(pn, desc, qty, body, file, status)
 Private mFileNames As Object         ' file names used (lower case) - kept unique
 Private mPump As Long
-Private mNoPn As Long                ' components named by their instance (no part number readable)
+Private mNoPn As Long                ' components named before their part number could be read
+Private mProvOwner As Object         ' provisional name -> the parent it belongs to (kept unique)
+Private mExported As Object          ' part numbers already worked on in this run
+Private mNotLoaded As Long           ' components CATIA could not load - their parts are missing
 
 
 ' ==============================================================================
@@ -91,7 +100,7 @@ Sub ExportStepFiles()
     Dim catDoc As Document, rootProd As Product, rootWin As Object
     Dim scopeProd As Product, isPartDoc As Boolean, ans As Long
     Dim rootPN As String, scopeName As String
-    Dim i As Long, it As Variant, pn As String
+    Dim i As Long, it As Variant, pn As String, realPn As String, realDesc As String
     Dim oInst As Product, oPart As Part, oPartDoc As PartDocument
     Dim nParts As Long, nPartFiles As Long, nBodyFiles As Long, nFailed As Long
     Dim startTime As Double, failMsg As String, statusTxt As String
@@ -104,8 +113,11 @@ Sub ExportStepFiles()
     Set mQty = CreateObject("Scripting.Dictionary")
     Set mDesc = CreateObject("Scripting.Dictionary")
     Set mFileNames = CreateObject("Scripting.Dictionary")
+    Set mProvOwner = CreateObject("Scripting.Dictionary")
+    Set mExported = CreateObject("Scripting.Dictionary")
     mPump = 0
     mNoPn = 0
+    mNotLoaded = 0
 
     ' --- 1. DOCUMENT -----------------------------------------------------------
     On Error Resume Next
@@ -167,16 +179,20 @@ Sub ExportStepFiles()
     ' --- 4. THE PARTS ----------------------------------------------------------
     Call SetStatus("STEP export: reading the product structure ...")
     If isPartDoc Then
-        Call AddPart(rootProd)
-    ElseIf ComponentIsPart(scopeProd) Then
-        Call AddPart(scopeProd)                ' the selected component is a part
+        Call AddPart(rootProd, "")
     Else
-        Call CollectParts(scopeProd, 0)
+        Call CollectNode(scopeProd, "", 0)     ' (a selected part is one part)
     End If
     nParts = mParts.Count
-    Call LogLine(nParts & " part numbers to export")
+    Call LogLine(nParts & " part numbers to export (" & mNoPn & " named before their part number could be " & _
+                 "read - renamed once loaded), " & mNotLoaded & " components not loaded")
     If nParts = 0 Then
-        failMsg = "No part was found below " & scopeName & "."
+        If mNotLoaded > 0 Then
+            failMsg = "CATIA could not load " & scopeName & " - nothing to export." & vbCrLf & _
+                      "Load it in CATIA (Teamcenter) and run the export again."
+        Else
+            failMsg = "No part was found below " & scopeName & "."
+        End If
         GoTo Finish
     End If
 
@@ -195,12 +211,42 @@ Sub ExportStepFiles()
             Set oPart = Nothing
         End If
 
-        If oPart Is Nothing Then
+        ' named before its part number could be read: now that it is loaded,
+        ' its real part number and description - the names of the BOM
+        If it(2) And Not oPart Is Nothing Then
+            realPn = ""
+            realDesc = ""
+            On Error Resume Next
+            realPn = oInst.PartNumber
+            If Len(realPn) = 0 Then realPn = oPartDoc.Product.PartNumber
+            realDesc = oInst.DescriptionRef
+            If Len(realDesc) = 0 Then realDesc = oPartDoc.Product.DescriptionRef
+            Err.Clear
+            On Error GoTo Fail
+            If Len(realPn) > 0 Then
+                Call LogLine("  part number of " & pn & ": " & realPn)
+                ' its pieces count for the real part number
+                If mQty.Exists(realPn) Then
+                    mQty(realPn) = mQty(realPn) + mQty(pn)
+                Else
+                    mQty.Add realPn, mQty(pn)
+                    mDesc.Add realPn, realDesc
+                End If
+                pn = realPn
+            End If
+        End If
+
+        If mExported.Exists(pn) Then
+            ' the same part as an earlier entry (found under a provisional name)
+            Call LogLine("  " & pn & " is exported already")
+        ElseIf oPart Is Nothing Then
+            mExported.Add pn, True
             statusTxt = "not exported: CATIA has no CATPart of it (not loaded, or only a visualization)"
             Call AddRow(pn, "", "", statusTxt)
             Call LogLine("  " & statusTxt)
             nFailed = nFailed + 1
         Else
+            mExported.Add pn, True
             Call ExportPart(i, nParts, pn, oPart, oPartDoc, nPartFiles, nBodyFiles, nFailed)
         End If
         Call SetStatus("")
@@ -230,9 +276,11 @@ Finish:
         On Error GoTo 0
     End If
     MsgBox "STEP export finished" & vbCrLf & vbCrLf & _
-           "Part files:   " & nPartFiles & "  (of " & nParts & " part numbers)" & vbCrLf & _
+           "Part files:   " & nPartFiles & "  (of " & mExported.Count & " part numbers)" & vbCrLf & _
            "Body files:   " & nBodyFiles & vbCrLf & _
            "Not exported: " & nFailed & IIf(nFailed > 0, "  - see step_index.csv", "") & vbCrLf & _
+           IIf(mNotLoaded > 0, "Components CATIA could not load: " & mNotLoaded & _
+               "  - their parts are missing (see step_index.csv)" & vbCrLf, "") & _
            "Time: " & Format(Elapsed(startTime) / 60#, "0.0") & " min" & vbCrLf & vbCrLf & _
            "Folder:" & vbCrLf & mFolder, IIf(nFailed > 0, vbExclamation, vbInformation), "STEP export"
     Exit Sub
@@ -287,7 +335,7 @@ Private Sub ExportPart(ByVal no As Long, ByVal nParts As Long, ByVal pn As Strin
         Call SetStatus("STEP export: part " & no & " of " & nParts & " - " & pn & _
                        " - body " & (k + 1) & " of " & n & " (" & names(k) & ")")
         fileName = UniqueFileName(SafeName(pn & "__" & names(k)))
-        statusTxt = ExportBody(oPartDoc, objs(names(k)), fileName, partWin)
+        statusTxt = ExportBody(oPartDoc, objs(names(k)), fileName, BaseFileName(fileName), partWin)
         Call AddRow(pn, names(k), fileName, statusTxt)
         Call LogLine("  " & fileName & ": " & statusTxt & "  (" & Format(Elapsed(t), "0.0") & " s)")
         If statusTxt = "OK" Then nBodyFiles = nBodyFiles + 1 Else nFailed = nFailed + 1
@@ -335,9 +383,10 @@ End Function
 ' none) - the caller closes it after the last body.
 ' ==============================================================================
 Private Function ExportBody(oPartDoc As PartDocument, ByVal oBody As Object, ByVal fileName As String, _
-                            ByRef partWin As Object) As String
+                            ByVal docName As String, ByRef partWin As Object) As String
     Dim srcSel As Object, newDoc As Object, newSel As Object, newPart As Object
-    Dim e As Long, d As String, pth As String
+    Dim newBody As Object, nBefore As Long, nAfter As Long, nShapes As Long
+    Dim e As Long, d As String, pth As String, st As String
 
     ExportBody = "not exported"
     pth = mFolder & "\" & fileName
@@ -376,6 +425,11 @@ Private Function ExportBody(oPartDoc As PartDocument, ByVal oBody As Object, ByV
         Exit Function
     End If
     Set newPart = newDoc.Part
+    ' inside the STEP file the part is named like the file, not "Part1"
+    newDoc.Product.PartNumber = docName
+    Err.Clear
+    nBefore = 0
+    nBefore = newPart.Bodies.Count
     Set newSel = newDoc.Selection
     newSel.Clear
     newSel.Add newPart
@@ -388,11 +442,35 @@ Private Function ExportBody(oPartDoc As PartDocument, ByVal oBody As Object, ByV
     newPart.Update
     Err.Clear
 
+    ' the pasted body: there, with a solid in it, and shown - a hidden body
+    ' (it keeps the look of the source) may not be written to the file
+    nAfter = 0
+    nAfter = newPart.Bodies.Count
+    Set newBody = Nothing
+    nShapes = 0
+    If nAfter > nBefore Then
+        Set newBody = newPart.Bodies.Item(nAfter)
+    ElseIf nAfter > 0 Then
+        Set newBody = newPart.Bodies.Item(1)       ' pasted into the PartBody itself
+    End If
+    If Not newBody Is Nothing Then
+        nShapes = newBody.Shapes.Count
+        newSel.Clear
+        newSel.Add newBody
+        newSel.VisProperties.SetShow 0
+        newSel.Clear
+    End If
+    Err.Clear
+
     ' --- export it, close it without saving ---
     If e <> 0 Then
         ExportBody = "not exported: CATIA could not paste the body (error " & e & " - " & d & ")"
+    ElseIf newBody Is Nothing Or nShapes = 0 Then
+        ExportBody = "not exported: nothing was pasted (the body has no solid of its own)"
     Else
-        ExportBody = ExportDocument(newDoc, fileName)
+        st = ExportDocument(newDoc, fileName)
+        If st = "OK" And Not HasSolid(pth) Then st = "exported, but the file holds no solid - check it"
+        ExportBody = st
     End If
     newDoc.Close
     Err.Clear
@@ -413,6 +491,44 @@ Private Function CopyToClipboard(srcSel As Object, ByVal oBody As Object) As Lon
     CopyToClipboard = e
 End Function
 
+' the STEP file holds a solid (a body file must) - read in pieces, a big
+' file is never held in memory at once
+Private Function HasSolid(ByVal pth As String) As Boolean
+    Const CHUNK As Long = 1048576
+    Dim f As Integer, n As Long, pos As Long, take As Long
+    Dim buf As String, tail As String, txt As String
+
+    HasSolid = False
+    On Error Resume Next
+    f = FreeFile
+    Err.Clear
+    Open pth For Binary Access Read As #f
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    n = LOF(f)
+    pos = 1
+    tail = ""
+    Do While pos <= n
+        take = CHUNK
+        If pos + take - 1 > n Then take = n - pos + 1
+        buf = Space$(take)
+        Get #f, pos, buf
+        txt = UCase$(tail & buf)
+        If InStr(txt, "MANIFOLD_SOLID_BREP") > 0 Or InStr(txt, "BREP_WITH_VOIDS") > 0 Or _
+           InStr(txt, "FACETED_BREP") > 0 Then
+            HasSolid = True
+            Exit Do
+        End If
+        ' (a word cut at the end of a piece is found with the next one)
+        If Len(txt) > 40 Then tail = Right$(txt, 40) Else tail = txt
+        pos = pos + take
+    Loop
+    Close #f
+    Err.Clear
+End Function
+
 ' an older file of the same name out of the way; False = it cannot be replaced
 Private Function FreeTarget(ByVal pth As String) As Boolean
     FreeTarget = True
@@ -430,44 +546,46 @@ End Function
 
 
 ' ==============================================================================
-' THE PARTS BELOW A PRODUCT - every part number once, in the order of the tree
-' A component Teamcenter has not loaded shows no children: its structure is
-' loaded first (visualization mode, like the BOM macros), so a sub-assembly
-' is never taken for a part and loaded completely in one go.
+' THE PARTS BELOW A COMPONENT - every part number once, in the order of the
+' tree. A component Teamcenter has not loaded shows no children: its
+' structure is loaded first (visualization mode, like the BOM macros), so a
+' sub-assembly is never taken for a part and loaded completely in one go. One
+' that still cannot be loaded is listed as not loaded (its parts are missing).
+'   ownerKey  the path of the parent - keeps provisional names apart
 ' ==============================================================================
-Private Sub CollectParts(oProd As Product, ByVal depth As Long)
-    Dim i As Long, n As Long, nk As Long
+Private Sub CollectNode(oProd As Product, ByVal ownerKey As String, ByVal depth As Long)
+    Dim i As Long, n As Long, nk As Long, nm As String
     Dim child As Product
 
     If depth > 60 Then Exit Sub
-    n = 0
-    On Error Resume Next
-    n = oProd.Products.Count
-    Err.Clear
-    On Error GoTo 0
+    nk = ChildCount(oProd)
+    If nk = 0 Then
+        Call AddPart(oProd, ownerKey)
+        Exit Sub
+    ElseIf nk < 0 Then
+        Call NoteNotLoaded(oProd)
+        Exit Sub
+    End If
 
-    For i = 1 To n
+    nm = InstanceName(oProd)
+    For i = 1 To nk
         Set child = Nothing
         On Error Resume Next
         Set child = oProd.Products.Item(i)
         Err.Clear
         On Error GoTo 0
-        If Not child Is Nothing Then
-            nk = ChildCount(child)
-            If nk > 0 Then
-                Call CollectParts(child, depth + 1)
-            Else
-                Call AddPart(child)
-            End If
-        End If
+        If Not child Is Nothing Then Call CollectNode(child, ownerKey & ">" & nm, depth + 1)
         mPump = mPump + 1
         If mPump Mod 50 = 0 Then DoEvents
         If mPump Mod 500 = 0 Then Call SetStatus("STEP export: reading the product structure ... " & mPump & " nodes")
     Next i
 End Sub
 
-' the children of a component - its structure loaded first when Teamcenter
-' has not loaded it yet (nothing says it is a part)
+' the children of a component; its structure is loaded first when Teamcenter
+' has not loaded it yet. -1 = a component CATIA cannot load: a sub-assembly
+' whose structure does not come, or one with no part number and nothing that
+' says it is a part - design mode on it would load everything below it in one
+' blocking call, so it is left alone
 Private Function ChildCount(oProd As Product) As Long
     Dim nk As Long, pn As String
 
@@ -485,21 +603,43 @@ Private Function ChildCount(oProd As Product) As Long
             Err.Clear
             nk = 0
             nk = oProd.Products.Count
+            pn = ""
+            pn = oProd.PartNumber
             Err.Clear
+            If nk = 0 Then
+                If IsUnloadedAssembly(oProd) Then
+                    nk = -1
+                ElseIf Len(pn) = 0 And Not HasPartEvidence(oProd) Then
+                    nk = -1
+                End If
+            End If
         End If
     End If
     On Error GoTo 0
     ChildCount = nk
 End Function
 
-' a selected component that is a part and not an assembly
-Private Function ComponentIsPart(oProd As Product) As Boolean
-    ComponentIsPart = (ChildCount(oProd) = 0)
-End Function
+' a component CATIA cannot load: one line in the index, nothing exported
+Private Sub NoteNotLoaded(oProd As Product)
+    Dim nm As String, pn As String
 
-' notes one part instance: a new part number, or one more piece of a known one
-Private Sub AddPart(oProd As Product)
-    Dim pn As String, desc As String
+    nm = InstanceName(oProd)
+    pn = ""
+    On Error Resume Next
+    pn = oProd.PartNumber
+    Err.Clear
+    On Error GoTo 0
+    If Len(pn) = 0 Then pn = nm
+    mNotLoaded = mNotLoaded + 1
+    Call AddRow(pn, "", "", "not exported: CATIA could not load " & nm & _
+                " (a sub-assembly that is not loaded, or no part number) - its parts are missing")
+    Call LogLine("NOT LOADED: " & nm)
+End Sub
+
+' notes one part instance: a new part number, or one more piece of a known one.
+' it(2) of the list = True: named before its part number could be read
+Private Sub AddPart(oProd As Product, ByVal ownerKey As String)
+    Dim pn As String, desc As String, prov As Boolean
 
     pn = ""
     desc = ""
@@ -508,9 +648,10 @@ Private Sub AddPart(oProd As Product)
     desc = oProd.DescriptionRef
     Err.Clear
     On Error GoTo 0
-    If Len(pn) = 0 Then
+    prov = (Len(pn) = 0)
+    If prov Then
         ' not loaded yet: named by its file or instance until it is loaded
-        pn = ProvisionalName(oProd)
+        pn = ProvisionalName(oProd, ownerKey)
         mNoPn = mNoPn + 1
     End If
     If mQty.Exists(pn) Then
@@ -518,14 +659,15 @@ Private Sub AddPart(oProd As Product)
     Else
         mQty.Add pn, 1
         mDesc.Add pn, desc
-        mParts.Add Array(pn, oProd)
+        mParts.Add Array(pn, oProd, prov)
     End If
 End Sub
 
 ' the name of a component whose part number CATIA cannot read yet: its file,
-' else its instance name
-Private Function ProvisionalName(oProd As Product) As String
-    Dim nm As String, pth As String
+' else its instance name - an instance name is unique only below its own
+' parent, so the same name below another parent gets " ~2", " ~3" ...
+Private Function ProvisionalName(oProd As Product, ByVal ownerKey As String) As String
+    Dim nm As String, pth As String, base As String, k As Long
 
     nm = ""
     On Error Resume Next
@@ -533,11 +675,51 @@ Private Function ProvisionalName(oProd As Product) As String
     pth = CStr(oProd.GetMasterShapeRepresentationPathName)
     Err.Clear
     If Len(pth) > 0 Then nm = BaseFileName(Mid$(pth, InStrRev(Replace(pth, "/", "\"), "\") + 1))
-    If Len(nm) = 0 Then nm = oProd.Name
+    If Len(nm) = 0 Then
+        nm = oProd.Name
+        Err.Clear
+        If Len(nm) = 0 Then nm = "unnamed"
+        base = nm
+        k = 1
+        Do While mProvOwner.Exists(nm)
+            If CStr(mProvOwner(nm)) = ownerKey Then Exit Do
+            k = k + 1
+            nm = base & " ~" & k
+        Loop
+        If Not mProvOwner.Exists(nm) Then mProvOwner.Add nm, ownerKey
+    End If
     Err.Clear
     On Error GoTo 0
     If Len(nm) = 0 Then nm = "unnamed"
     ProvisionalName = nm
+End Function
+
+' something says this component IS a part: its CATPart is in the session, it
+' has a shape, or its file is a CATPart / cgr - nothing is loaded to find out
+Private Function HasPartEvidence(oProd As Product) As Boolean
+    Dim tn As String, pth As String, hasShape As Boolean
+
+    HasPartEvidence = False
+    On Error Resume Next
+    tn = ""
+    tn = TypeName(oProd.ReferenceProduct.Parent)
+    Err.Clear
+    If tn = "PartDocument" Then
+        HasPartEvidence = True
+        Exit Function
+    End If
+    hasShape = False
+    hasShape = oProd.HasAMasterShapeRepresentation
+    If Err.Number = 0 And hasShape Then
+        HasPartEvidence = True
+        Exit Function
+    End If
+    Err.Clear
+    pth = ""
+    pth = LCase$(CStr(oProd.GetMasterShapeRepresentationPathName))
+    Err.Clear
+    If Right$(pth, 8) = ".catpart" Or Right$(pth, 4) = ".cgr" Then HasPartEvidence = True
+    Err.Clear
 End Function
 
 ' the CATPart of a part instance - promoted to design mode, only this part
@@ -878,19 +1060,16 @@ Private Function UniqueFileName(ByVal base As String) As String
     UniqueFileName = cand
 End Function
 
+' one line of the index - description and quantity are looked up when the
+' index is written, so pieces found later under a provisional name count too
 Private Sub AddRow(ByVal pn As String, ByVal bodyName As String, ByVal fileName As String, _
                    ByVal statusTxt As String)
-    Dim desc As String, qty As Long
-    desc = ""
-    qty = 0
-    If mDesc.Exists(pn) Then desc = CStr(mDesc(pn))
-    If mQty.Exists(pn) Then qty = CLng(mQty(pn))
-    mRows.Add Array(pn, desc, qty, bodyName, fileName, statusTxt)
+    mRows.Add Array(pn, bodyName, fileName, statusTxt)
 End Sub
 
 ' step_index.csv - ";" separated, as German Excel opens it with a double click
 Private Sub WriteIndex()
-    Dim f As Integer, it As Variant
+    Dim f As Integer, it As Variant, desc As String, qty As String
 
     If Len(mFolder) = 0 Or mRows Is Nothing Then Exit Sub
     On Error Resume Next
@@ -902,8 +1081,12 @@ Private Sub WriteIndex()
     End If
     Print #f, "Part Number;Description;Qty;Body;STEP file;Status"
     For Each it In mRows
-        Print #f, CsvField(it(0)) & ";" & CsvField(it(1)) & ";" & it(2) & ";" & CsvField(it(3)) & ";" & _
-                  CsvField(it(4)) & ";" & CsvField(it(5))
+        desc = ""
+        qty = ""
+        If mDesc.Exists(CStr(it(0))) Then desc = CStr(mDesc(CStr(it(0))))
+        If mQty.Exists(CStr(it(0))) Then qty = CStr(mQty(CStr(it(0))))
+        Print #f, CsvField(it(0)) & ";" & CsvField(desc) & ";" & qty & ";" & CsvField(it(1)) & ";" & _
+                  CsvField(it(2)) & ";" & CsvField(it(3))
     Next it
     Close #f
     Err.Clear

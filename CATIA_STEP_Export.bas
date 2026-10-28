@@ -116,6 +116,7 @@ Sub ExportStepFiles()
     Dim scopeProd As Product, isPartDoc As Boolean, ans As Long
     Dim rootPN As String, scopeName As String
     Dim i As Long, it As Variant, pn As String, realPn As String, realDesc As String, nk As Long
+    Dim mult As Long
     Dim oInst As Product, oPart As Part, oPartDoc As PartDocument
     Dim nParts As Long, nPartFiles As Long, nBodyFiles As Long, nFailed As Long
     Dim startTime As Double, failMsg As String, statusTxt As String
@@ -234,31 +235,17 @@ Sub ExportStepFiles()
         Call SetStatus("STEP export: part " & i & " of " & nParts & " - " & pn & " (loading ...)")
         Call LogLine("part " & i & "/" & nParts & "  " & pn & "   in " & CStr(it(3)))
 
-        ' a component that is not a CATPart may be a sub-assembly whose content
-        ' was not loaded when the tree was searched (e.g. one with a shape
-        ' representation): its structure first - cheaper than design mode
         nk = 0
-        If Not isPartDoc Then
-            On Error Resume Next
-            If TypeName(oInst.ReferenceProduct.Parent) <> "PartDocument" Then
-                Err.Clear
-                oInst.ApplyWorkMode 1
-                Err.Clear
-                nk = oInst.Products.Count
-            End If
-            Err.Clear
-            On Error GoTo Fail
-        End If
-
         Set oPart = Nothing
         Set oPartDoc = Nothing
         If isPartDoc Then
             Set oPartDoc = catDoc
             Set oPart = oPartDoc.Part
-        ElseIf nk = 0 Then
+        Else
             If Not LoadPart(oInst, oPart, oPartDoc) Then Set oPart = Nothing
-            ' once loaded it has components of its own: a sub-assembly, not a
-            ' part - also when its shape representation is a CATPart
+            ' once loaded it has components of its own: a sub-assembly whose
+            ' content was not loaded when the tree was searched - also when its
+            ' shape representation is a CATPart (LoadPart then found that)
             On Error Resume Next
             nk = oInst.Products.Count
             Err.Clear
@@ -266,11 +253,17 @@ Sub ExportStepFiles()
         End If
 
         ' a sub-assembly: the search goes on below it, for every piece of it
-        ' that was counted, and it is not exported as a part
+        ' that was counted, and it is not exported as a part. Its entry is
+        ' cleared first, so a CATPart inside it with the same part number (a
+        ' Teamcenter item product and its CATPart) gets an entry of its own.
         If nk > 0 Then
             mLateAssy = mLateAssy + 1
             Call LogLine("  " & pn & " is a sub-assembly (" & nk & " components) - its parts are searched too")
-            Call CollectNode(oInst, CStr(it(3)), 1, CLng(mQty(pn)))
+            mult = CLng(mQty(pn))
+            mQty.Remove pn
+            If mDesc.Exists(pn) Then mDesc.Remove pn
+            If mPath.Exists(pn) Then mPath.Remove pn
+            Call CollectNode(oInst, CStr(it(3)), 1, mult)
             Call LogLine("  the list has " & mParts.Count & " part numbers now")
             GoTo NextPart
         End If
@@ -637,7 +630,7 @@ Private Sub CollectNode(oProd As Product, ByVal ownerKey As String, ByVal depth 
     If depth > 60 Then Exit Sub
     mNodes = mNodes + 1
     If depth > mMaxDepth Then mMaxDepth = depth
-    nk = ChildCount(oProd)
+    nk = ChildCount(oProd, ownerKey)
     If nk = 0 Then
         Call AddPart(oProd, ownerKey, mult)
         Exit Sub
@@ -672,7 +665,7 @@ End Sub
 ' A sub-assembly whose structure does not come in visualization mode is
 ' loaded completely (design mode) as a last resort, so no part below it is
 ' missed. -1 = a component CATIA cannot load even then.
-Private Function ChildCount(oProd As Product) As Long
+Private Function ChildCount(oProd As Product, ByVal ownerKey As String) As Long
     Dim nk As Long, pn As String
 
     nk = 0
@@ -682,8 +675,8 @@ Private Function ChildCount(oProd As Product) As Long
     pn = oProd.PartNumber
     Err.Clear
     ' another piece of a component that could not be loaded: not tried again
-    If nk = 0 And Len(pn) > 0 Then
-        If mFailed.Exists(pn) Then
+    If nk = 0 Then
+        If mFailed.Exists(FailKey(oProd, ownerKey)) Then
             On Error GoTo 0
             ChildCount = -1
             Exit Function
@@ -702,7 +695,7 @@ Private Function ChildCount(oProd As Product) As Long
             pn = oProd.PartNumber
             Err.Clear
             If nk = 0 Then
-                If IsUnloadedAssembly(oProd) Or (Len(pn) = 0 And Not HasPartEvidence(oProd)) Then
+                If IsUnloadedAssembly(oProd) Or Not HasPartEvidence(oProd) Then
                     ' still nothing: as a last resort design mode - for a
                     ' sub-assembly that loads everything below it in one go
                     ' (each of those parts is loaded for its STEP file anyway),
@@ -718,12 +711,9 @@ Private Function ChildCount(oProd As Product) As Long
                     pn = ""
                     pn = oProd.PartNumber
                     Err.Clear
+                    ' still no component and nothing that says it is a part
                     If nk = 0 Then
-                        If IsUnloadedAssembly(oProd) Then
-                            nk = -1
-                        ElseIf Len(pn) = 0 And Not HasPartEvidence(oProd) Then
-                            nk = -1
-                        End If
+                        If IsUnloadedAssembly(oProd) Or Not HasPartEvidence(oProd) Then nk = -1
                     End If
                 End If
             End If
@@ -738,13 +728,8 @@ Private Sub NoteNotLoaded(oProd As Product, ByVal ownerKey As String, ByVal mult
     Dim nm As String, pn As String
 
     nm = InstanceName(oProd)
-    pn = ""
-    On Error Resume Next
-    pn = oProd.PartNumber
-    Err.Clear
-    On Error GoTo 0
-    If Len(pn) = 0 Then pn = nm
-    ' one line per part number; its Qty = the pieces that are missing
+    pn = FailKey(oProd, ownerKey)
+    ' one line per component; its Qty = the pieces that are missing
     If mFailed.Exists(pn) Then
         mFailed(pn) = mFailed(pn) + mult
         Exit Sub
@@ -756,6 +741,32 @@ Private Sub NoteNotLoaded(oProd As Product, ByVal ownerKey As String, ByVal mult
                 " (a sub-assembly that is not loaded or empty, or no part number) - its parts are missing")
     Call LogLine("NOT LOADED: " & nm)
 End Sub
+
+' the name a component CATIA cannot load is noted under: its part number, else
+' the name of its file (the same for every piece of it), else its instance
+' name with its place in the tree (an instance name repeats below other
+' parents)
+Private Function FailKey(oProd As Product, ByVal ownerKey As String) As String
+    Dim k As String, pth As String
+
+    k = ""
+    On Error Resume Next
+    k = oProd.PartNumber
+    Err.Clear
+    If Len(k) = 0 Then
+        pth = ""
+        pth = CStr(oProd.GetMasterShapeRepresentationPathName)
+        Err.Clear
+        If Len(pth) > 0 Then k = BaseFileName(Mid$(pth, InStrRev(Replace(pth, "/", "\"), "\") + 1))
+    End If
+    If Len(k) = 0 Then
+        k = InstanceName(oProd)
+        If Len(ownerKey) > 0 Then k = k & "  (in " & ownerKey & ")"
+    End If
+    Err.Clear
+    On Error GoTo 0
+    FailKey = k
+End Function
 
 ' notes one part instance: a new part number, or one more piece of a known one.
 ' it(2) of the list = True: named before its part number could be read

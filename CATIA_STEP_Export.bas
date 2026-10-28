@@ -693,8 +693,11 @@ Private Function CopyBySearch(oInst As Product, ByVal bodyName As String) As Lon
     Next i
     n = 0
     n = sel.Count
-    If n <> 1 Then
-        CopyBySearch = -2                          ' not found (or found twice)
+    nm = ""
+    If n = 1 Then nm = sel.Item(1).Value.Name
+    Err.Clear
+    If n <> 1 Or nm <> bodyName Then
+        CopyBySearch = -2                          ' not found, found twice, or another element left
         sel.Clear
         Err.Clear
         Exit Function
@@ -949,7 +952,48 @@ Private Sub NoteNotLoaded(oProd As Product, ByVal ownerKey As String, ByVal mult
     Call AddRow(pn, "", "", "not exported: CATIA could not load " & nm & _
                 " (a sub-assembly that is not loaded or empty, or no part number) - its parts are missing")
     Call LogLine("NOT LOADED: " & nm)
+    Call LogLine("  " & LoadDetails(oProd))
 End Sub
+
+' what CATIA says about a component it could not load - one log line, so the
+' cause can be read from the log
+Private Function LoadDetails(oProd As Product) As String
+    Dim s As String, v As String, n As Long, b As Boolean
+
+    On Error Resume Next
+    v = "?"
+    v = TypeName(oProd.ReferenceProduct.Parent)
+    Err.Clear
+    s = "its document: " & v
+    v = ""
+    v = oProd.ReferenceProduct.Parent.Name
+    Err.Clear
+    If Len(v) > 0 Then s = s & " " & v
+    n = -1
+    n = oProd.ReferenceProduct.Products.Count
+    Err.Clear
+    If n < 0 Then
+        s = s & ", components of its reference: ?"
+    Else
+        s = s & ", components of its reference: " & n
+    End If
+    b = False
+    b = oProd.HasAMasterShapeRepresentation
+    If Err.Number <> 0 Then
+        s = s & ", shape representation: error " & Err.Number
+    ElseIf b Then
+        s = s & ", shape representation: yes"
+    Else
+        s = s & ", shape representation: no"
+    End If
+    Err.Clear
+    v = ""
+    v = CStr(oProd.GetMasterShapeRepresentationPathName)
+    Err.Clear
+    If Len(v) > 0 Then s = s & " (" & v & ")"
+    On Error GoTo 0
+    LoadDetails = s
+End Function
 
 ' its CATPart loaded as the shape representation of the component (on the
 ' reference or on the instance); True = there is one

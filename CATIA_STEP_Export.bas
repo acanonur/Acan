@@ -42,7 +42,10 @@ Option Explicit
 '     its place in the product.
 '   - a body: copied and pasted "as result" (no link) into a new, empty
 '     CATPart, which is exported and closed again WITHOUT saving. Nothing is
-'     changed in your parts.
+'     changed in your parts. In a product CATIA does not let every body be
+'     copied the same way, so four ways are tried (the selection of the
+'     CATPart, of the product, a search inside the part instance, a
+'     standalone copy of the CATPart); the log says which one worked.
 '   - Teamcenter: like the BOM macros, every part is loaded one at a time
 '     (design mode) - a big product takes as long as a BOM run without
 '     pictures. A sub-assembly that is not loaded gets its structure loaded
@@ -106,6 +109,10 @@ Private mStructLoads As Long         ' components whose structure had to be load
 Private mLateAssy As Long            ' "parts" that turned out to be sub-assemblies once loaded
 Private mDesignLoads As Long         ' components loaded completely because their structure did not come
 Private mFailed As Object            ' part number -> pieces of a component CATIA could not load (tried once)
+Private mRootWin As Object           ' the window the macro was started in
+Private mRootSel As Object           ' the selection of the open document (late bound: Search, Remove)
+Private mCopyWay As Long             ' the way of copying a body that worked last (0 = none yet)
+Private mCopyWin As Object           ' the window of the standalone copy of a CATPart (way 4)
 
 
 ' ==============================================================================
@@ -141,6 +148,8 @@ Sub ExportStepFiles()
     mLateAssy = 0
     mDesignLoads = 0
     Set mFailed = CreateObject("Scripting.Dictionary")
+    mCopyWay = 0
+    Set mCopyWin = Nothing
 
     ' --- 1. DOCUMENT -----------------------------------------------------------
     On Error Resume Next
@@ -158,6 +167,12 @@ Sub ExportStepFiles()
         Exit Sub
     End If
     Set rootProd = catDoc.Product
+    Set mRootWin = rootWin
+    Set mRootSel = Nothing
+    On Error Resume Next
+    Set mRootSel = catDoc.Selection
+    Err.Clear
+    On Error GoTo 0
     rootPN = ""
     On Error Resume Next
     rootPN = rootProd.PartNumber
@@ -309,7 +324,7 @@ Sub ExportStepFiles()
             nFailed = nFailed + 1
         Else
             mExported.Add pn, True
-            Call ExportPart(i, nParts, pn, oPart, oPartDoc, nPartFiles, nBodyFiles, nFailed)
+            Call ExportPart(i, nParts, pn, oInst, oPart, oPartDoc, nPartFiles, nBodyFiles, nFailed)
         End If
 NextPart:
         Call SetStatus("")
@@ -371,12 +386,12 @@ End Sub
 ' ==============================================================================
 ' ONE PART: its STEP file, then one file per body
 ' ==============================================================================
-Private Sub ExportPart(ByVal no As Long, ByVal nParts As Long, ByVal pn As String, _
+Private Sub ExportPart(ByVal no As Long, ByVal nParts As Long, ByVal pn As String, oInst As Product, _
                        oPart As Part, oPartDoc As PartDocument, ByRef nPartFiles As Long, _
                        ByRef nBodyFiles As Long, ByRef nFailed As Long)
     Dim fileName As String, statusTxt As String
     Dim names() As String, objs As Object, n As Long, k As Long
-    Dim partWin As Object, t As Double
+    Dim copyDoc As Object, t As Double
 
     ' --- the part ---
     t = Timer
@@ -395,26 +410,29 @@ Private Sub ExportPart(ByVal no As Long, ByVal nParts As Long, ByVal pn As Strin
     If n = 1 And Not EXPORT_SINGLE_BODY Then Exit Sub
     Call LogLine("  " & n & " bodies")
 
-    Set partWin = Nothing
+    Set copyDoc = Nothing
     For k = 0 To n - 1
         t = Timer
         Call SetStatus("STEP export: part " & no & " of " & nParts & " - " & pn & _
                        " - body " & (k + 1) & " of " & n & " (" & names(k) & ")")
         fileName = UniqueFileName(SafeName(pn & "__" & names(k)))
-        statusTxt = ExportBody(oPartDoc, objs(names(k)), fileName, BaseFileName(fileName), partWin)
+        statusTxt = ExportBody(oPartDoc, oInst, objs(names(k)), names(k), fileName, BaseFileName(fileName), copyDoc)
         Call AddRow(pn, names(k), fileName, statusTxt)
         Call LogLine("  " & fileName & ": " & statusTxt & "  (" & Format(Elapsed(t), "0.0") & " s)")
         If statusTxt = "OK" Then nBodyFiles = nBodyFiles + 1 Else nFailed = nFailed + 1
         DoEvents
     Next k
 
-    ' a window the body copies needed is closed again
-    If Not partWin Is Nothing Then
+    ' a standalone copy of the CATPart the body copies needed is closed again,
+    ' without saving
+    If Not copyDoc Is Nothing Then
         On Error Resume Next
-        partWin.Close
+        copyDoc.Close
         Err.Clear
         On Error GoTo 0
+        Set mCopyWin = Nothing
     End If
+    Call ActivateMain
 End Sub
 
 ' a whole document into one STEP file; "OK" or why not
@@ -444,13 +462,14 @@ End Function
 
 ' ==============================================================================
 ' ONE BODY: copied "as result" into a new, empty CATPart, exported, and that
-' CATPart closed again without saving. partWin: a window of the source part,
-' opened when copying needs one (a part loaded only inside the product has
-' none) - the caller closes it after the last body.
+' CATPart closed again without saving. The copy is made in one of four ways
+' (CopyBody); copyDoc: a standalone copy of the source CATPart when the 4th
+' way was needed - the caller closes it after the last body.
 ' ==============================================================================
-Private Function ExportBody(oPartDoc As PartDocument, ByVal oBody As Object, ByVal fileName As String, _
-                            ByVal docName As String, ByRef partWin As Object) As String
-    Dim srcSel As Object, newDoc As Object, newSel As Object, newPart As Object
+Private Function ExportBody(oPartDoc As PartDocument, oInst As Product, ByVal oBody As Object, _
+                            ByVal bodyName As String, ByVal fileName As String, ByVal docName As String, _
+                            ByRef copyDoc As Object) As String
+    Dim newDoc As Object, newSel As Object, newPart As Object
     Dim newBody As Object, nBefore As Long, nAfter As Long, nShapes As Long
     Dim e As Long, d As String, pth As String, st As String
 
@@ -463,20 +482,9 @@ Private Function ExportBody(oPartDoc As PartDocument, ByVal oBody As Object, ByV
 
     On Error Resume Next
     ' --- copy the body ---
-    Set srcSel = oPartDoc.Selection
-    e = CopyToClipboard(srcSel, oBody)
-    If e <> 0 And partWin Is Nothing Then
-        ' copying needs the part in a window of its own
-        Err.Clear
-        Set partWin = oPartDoc.NewWindow
-        If Not partWin Is Nothing Then partWin.Activate
-        Err.Clear
-        Call Pause(300)
-        Set srcSel = oPartDoc.Selection
-        e = CopyToClipboard(srcSel, oBody)
-    End If
+    e = CopyBody(oPartDoc, oInst, oBody, bodyName, copyDoc)
     If e <> 0 Then
-        ExportBody = "not exported: CATIA could not copy the body (error " & e & ")"
+        ExportBody = "not exported: CATIA could not copy the body in any of the 4 ways (last error " & e & ")"
         Err.Clear
         Exit Function
     End If
@@ -546,19 +554,212 @@ Private Function ExportBody(oPartDoc As PartDocument, ByVal oBody As Object, ByV
     On Error GoTo 0
 End Function
 
-' the body alone in the selection, copied; 0 = done, else the error
-Private Function CopyToClipboard(srcSel As Object, ByVal oBody As Object) As Long
-    Dim e As Long
+' ==============================================================================
+' COPYING A BODY - four ways, tried one after the other; the way that worked
+' is tried first for the next body (mCopyWay) and named once in the log.
+'   1  the selection of the CATPart itself (works when it is the open document)
+'   2  the selection of the open product, the body added through the product
+'   3  the part instance selected in the product, its bodies searched there,
+'      only the body of that name kept
+'   4  a standalone copy of the CATPart (made from its file, closed again
+'      without saving): there the body is the body of the open document
+' 0 = copied, else the error of the last way tried
+' ==============================================================================
+Private Function CopyBody(oPartDoc As PartDocument, oInst As Product, ByVal oBody As Object, _
+                          ByVal bodyName As String, ByRef copyDoc As Object) As Long
+    Dim order As Variant, k As Long, way As Long, e As Long
+
+    If mCopyWay > 0 Then
+        order = Array(mCopyWay, 1, 2, 3, 4)
+    Else
+        order = Array(1, 2, 3, 4)
+    End If
+    e = -1
+    For k = LBound(order) To UBound(order)
+        way = CLng(order(k))
+        If k = LBound(order) Or way <> mCopyWay Then
+            e = TryCopy(way, oPartDoc, oInst, oBody, bodyName, copyDoc)
+            If e = 0 Then
+                If way <> mCopyWay Then Call LogLine("  bodies are copied " & CopyWayName(way))
+                mCopyWay = way
+                CopyBody = 0
+                Exit Function
+            End If
+        End If
+    Next k
+    CopyBody = e
+End Function
+
+Private Function CopyWayName(ByVal way As Long) As String
+    Select Case way
+        Case 1
+            CopyWayName = "through the selection of the CATPart"
+        Case 2
+            CopyWayName = "through the selection of the product"
+        Case 3
+            CopyWayName = "by a search inside the part instance"
+        Case Else
+            CopyWayName = "from a standalone copy of the CATPart"
+    End Select
+End Function
+
+Private Function TryCopy(ByVal way As Long, oPartDoc As PartDocument, oInst As Product, _
+                         ByVal oBody As Object, ByVal bodyName As String, ByRef copyDoc As Object) As Long
+    Dim sel As Object, e As Long
+
+    e = -1
+    On Error Resume Next
+    Select Case way
+        Case 1
+            Set sel = oPartDoc.Selection
+            e = CopySelected(sel, oBody)
+        Case 2
+            If Not mRootSel Is Nothing Then
+                Call ActivateMain
+                e = CopySelected(mRootSel, oBody)
+            End If
+        Case 3
+            e = CopyBySearch(oInst, bodyName)
+        Case 4
+            e = CopyFromStandalone(oPartDoc, bodyName, copyDoc)
+    End Select
+    Err.Clear
+    On Error GoTo 0
+    TryCopy = e
+End Function
+
+' one object alone in a selection, copied; 0 = done, else the error
+Private Function CopySelected(sel As Object, ByVal oObj As Object) As Long
+    Dim e As Long, n As Long
     On Error Resume Next
     Err.Clear
-    srcSel.Clear
-    srcSel.Add oBody
-    If Err.Number = 0 Then srcSel.Copy
+    sel.Clear
+    sel.Add oObj
     e = Err.Number
-    srcSel.Clear
+    If e = 0 Then
+        n = 0
+        n = sel.Count
+        If n < 1 Then e = -2                       ' nothing was selected
+    End If
+    If e = 0 Then
+        sel.Copy
+        e = Err.Number
+    End If
+    sel.Clear
     Err.Clear
-    CopyToClipboard = e
+    CopySelected = e
 End Function
+
+' way 3: the part instance selected in the product, all its bodies searched
+' there (in their place in the product), all but the one of that name removed
+Private Function CopyBySearch(oInst As Product, ByVal bodyName As String) As Long
+    Dim sel As Object, i As Long, n As Long, nm As String, e As Long
+
+    CopyBySearch = -1
+    If mRootSel Is Nothing Or oInst Is Nothing Then Exit Function
+    Call ActivateMain
+    Set sel = mRootSel
+    On Error Resume Next
+    Err.Clear
+    sel.Clear
+    sel.Add oInst
+    If Err.Number <> 0 Then
+        CopyBySearch = Err.Number
+        sel.Clear
+        Err.Clear
+        Exit Function
+    End If
+    sel.Search "CATPrtSearch.BodyFeature,sel"
+    If Err.Number <> 0 Then
+        CopyBySearch = Err.Number
+        sel.Clear
+        Err.Clear
+        Exit Function
+    End If
+    n = 0
+    n = sel.Count
+    For i = n To 1 Step -1
+        nm = ""
+        nm = sel.Item(i).Value.Name
+        Err.Clear
+        If nm <> bodyName Then
+            sel.Remove i
+            If Err.Number <> 0 Then
+                Err.Clear
+                sel.Remove2 i
+            End If
+            Err.Clear
+        End If
+    Next i
+    n = 0
+    n = sel.Count
+    If n <> 1 Then
+        CopyBySearch = -2                          ' not found (or found twice)
+        sel.Clear
+        Err.Clear
+        Exit Function
+    End If
+    Err.Clear
+    sel.Copy
+    e = Err.Number
+    sel.Clear
+    Err.Clear
+    CopyBySearch = e
+End Function
+
+' way 4: a standalone copy of the CATPart, made once per part from its file;
+' the body of that name copied there
+Private Function CopyFromStandalone(oPartDoc As PartDocument, ByVal bodyName As String, _
+                                    ByRef copyDoc As Object) As Long
+    Dim pth As String, oBody As Object, names() As String, objs As Object
+
+    CopyFromStandalone = -1
+    On Error Resume Next
+    If copyDoc Is Nothing Then
+        pth = ""
+        pth = oPartDoc.FullName
+        Err.Clear
+        If Len(pth) = 0 Then Exit Function
+        If Not mFso.FileExists(pth) Then
+            CopyFromStandalone = -3
+            Exit Function
+        End If
+        Set copyDoc = CATIA.Documents.NewFrom(pth)
+        If copyDoc Is Nothing Then
+            CopyFromStandalone = Err.Number
+            Err.Clear
+            Exit Function
+        End If
+        Set mCopyWin = CATIA.ActiveWindow
+        Err.Clear
+    ElseIf Not mCopyWin Is Nothing Then
+        mCopyWin.Activate
+        Err.Clear
+    End If
+    Set oBody = Nothing
+    Set oBody = copyDoc.Part.Bodies.Item(bodyName)
+    Err.Clear
+    If oBody Is Nothing Then
+        ' a body inside an operation: from the list of the copy
+        Set objs = CreateObject("Scripting.Dictionary")
+        Call ListBodies(copyDoc.Part, names, objs)
+        If objs.Exists(bodyName) Then Set oBody = objs(bodyName)
+        Err.Clear
+    End If
+    If oBody Is Nothing Then
+        CopyFromStandalone = -2
+        Exit Function
+    End If
+    CopyFromStandalone = CopySelected(copyDoc.Selection, oBody)
+    Err.Clear
+End Function
+
+' back to the window the macro was started in
+Private Sub ActivateMain()
+    On Error Resume Next
+    If Not mRootWin Is Nothing Then mRootWin.Activate
+    Err.Clear
+End Sub
 
 ' the STEP file holds a solid (a body file must) - read in pieces, a big
 ' file is never held in memory at once
@@ -715,6 +916,14 @@ Private Function ChildCount(oProd As Product, ByVal ownerKey As String) As Long
                     If nk = 0 Then
                         If IsUnloadedAssembly(oProd) Or Not HasPartEvidence(oProd) Then nk = -1
                     End If
+                    ' last chance: its geometry as a shape representation - a
+                    ' CATPart there makes it a part after all
+                    If nk = -1 Then
+                        If HasShapePart(oProd) Then
+                            Call LogLine("  " & InstanceName(oProd) & ": its CATPart was found as its shape representation")
+                            nk = 0
+                        End If
+                    End If
                 End If
             End If
         End If
@@ -741,6 +950,24 @@ Private Sub NoteNotLoaded(oProd As Product, ByVal ownerKey As String, ByVal mult
                 " (a sub-assembly that is not loaded or empty, or no part number) - its parts are missing")
     Call LogLine("NOT LOADED: " & nm)
 End Sub
+
+' its CATPart loaded as the shape representation of the component (on the
+' reference or on the instance); True = there is one
+Private Function HasShapePart(oProd As Product) As Boolean
+    Dim d As Object
+
+    HasShapePart = False
+    On Error Resume Next
+    Set d = Nothing
+    Set d = oProd.ReferenceProduct.GetMasterShapeRepresentation(True)
+    Err.Clear
+    If d Is Nothing Then
+        Set d = oProd.GetMasterShapeRepresentation(True)
+        Err.Clear
+    End If
+    If Not d Is Nothing Then HasShapePart = (TypeName(d) = "PartDocument")
+    Err.Clear
+End Function
 
 ' the name a component CATIA cannot load is noted under: its part number, else
 ' the name of its file (the same for every piece of it), else its instance
